@@ -571,11 +571,23 @@ def _resolve_model_dir() -> Path:
     return (repo_root / "artifacts/parakeet-tdt-0.6b-v2").resolve()
 
 
+def _resolve_model_names() -> tuple[str, str]:
+    suffix = os.environ.get("PARAKEET_COREML_MODEL_SUFFIX", "int4")
+    encoder_name = os.environ.get("PARAKEET_COREML_ENCODER_MODEL", f"encoder-model-{suffix}.mlpackage")
+    decoder_name = os.environ.get("PARAKEET_COREML_DECODER_MODEL", f"decoder_joint-model-{suffix}.mlpackage")
+    return encoder_name, decoder_name
+
+
 def _get_engine() -> ParakeetCoreMLRNNT:
     global _ENGINE
     if _ENGINE is None:
         model_dir = _resolve_model_dir()
-        _ENGINE = ParakeetCoreMLRNNT(model_dir=model_dir)
+        encoder_name, decoder_name = _resolve_model_names()
+        _ENGINE = ParakeetCoreMLRNNT(
+            model_dir=model_dir,
+            encoder_model_name=encoder_name,
+            decoder_model_name=decoder_name,
+        )
     return _ENGINE
 
 

@@ -124,17 +124,73 @@ if [[ ${#mlpackages[@]} -eq 0 ]]; then
   exit 1
 fi
 
-echo "[4/5] Compressing CoreML model(s) (int4 kmeans)"
+COMPRESS_SUFFIX="${COMPRESS_SUFFIX:-int4}"
+COMPRESS_ALGORITHM="${COMPRESS_ALGORITHM:-palettize}"
+COMPRESS_MODE="${COMPRESS_MODE:-kmeans}"
+COMPRESS_GROUP_SIZE="${COMPRESS_GROUP_SIZE:-32}"
+COMPRESS_BLOCK_SIZE="${COMPRESS_BLOCK_SIZE:-32}"
+COMPRESS_GRANULARITY="${COMPRESS_GRANULARITY:-auto}"
+COMPRESS_ENABLE_PER_CHANNEL_SCALE="${COMPRESS_ENABLE_PER_CHANNEL_SCALE:-0}"
+COMPRESS_WEIGHT_THRESHOLD="${COMPRESS_WEIGHT_THRESHOLD:-2048}"
+ENCODER_NBITS="${ENCODER_NBITS:-4}"
+DECODER_NBITS="${DECODER_NBITS:-4}"
+ENCODER_ALGORITHM="${ENCODER_ALGORITHM:-${COMPRESS_ALGORITHM}}"
+DECODER_ALGORITHM="${DECODER_ALGORITHM:-${COMPRESS_ALGORITHM}}"
+ENCODER_MODE="${ENCODER_MODE:-${COMPRESS_MODE}}"
+DECODER_MODE="${DECODER_MODE:-${COMPRESS_MODE}}"
+ENCODER_GROUP_SIZE="${ENCODER_GROUP_SIZE:-${COMPRESS_GROUP_SIZE}}"
+DECODER_GROUP_SIZE="${DECODER_GROUP_SIZE:-${COMPRESS_GROUP_SIZE}}"
+ENCODER_BLOCK_SIZE="${ENCODER_BLOCK_SIZE:-${COMPRESS_BLOCK_SIZE}}"
+DECODER_BLOCK_SIZE="${DECODER_BLOCK_SIZE:-${COMPRESS_BLOCK_SIZE}}"
+ENCODER_GRANULARITY="${ENCODER_GRANULARITY:-${COMPRESS_GRANULARITY}}"
+DECODER_GRANULARITY="${DECODER_GRANULARITY:-${COMPRESS_GRANULARITY}}"
+ENCODER_ENABLE_PER_CHANNEL_SCALE="${ENCODER_ENABLE_PER_CHANNEL_SCALE:-${COMPRESS_ENABLE_PER_CHANNEL_SCALE}}"
+DECODER_ENABLE_PER_CHANNEL_SCALE="${DECODER_ENABLE_PER_CHANNEL_SCALE:-${COMPRESS_ENABLE_PER_CHANNEL_SCALE}}"
+ENCODER_WEIGHT_THRESHOLD="${ENCODER_WEIGHT_THRESHOLD:-${COMPRESS_WEIGHT_THRESHOLD}}"
+DECODER_WEIGHT_THRESHOLD="${DECODER_WEIGHT_THRESHOLD:-${COMPRESS_WEIGHT_THRESHOLD}}"
+
+echo "[4/5] Compressing CoreML model(s) (profile=${COMPRESS_SUFFIX})"
 compressed_mlpackages=()
 for model_path in "${mlpackages[@]}"; do
-  output_compressed="${model_path%.mlpackage}-int4.mlpackage"
+  model_file="$(basename "${model_path}")"
+  nbits="${ENCODER_NBITS}"
+  algorithm="${ENCODER_ALGORITHM}"
+  mode="${ENCODER_MODE}"
+  group_size="${ENCODER_GROUP_SIZE}"
+  block_size="${ENCODER_BLOCK_SIZE}"
+  granularity="${ENCODER_GRANULARITY}"
+  enable_per_channel_scale="${ENCODER_ENABLE_PER_CHANNEL_SCALE}"
+  weight_threshold="${ENCODER_WEIGHT_THRESHOLD}"
+  if [[ "${model_file}" == *decoder_joint-model* ]]; then
+    nbits="${DECODER_NBITS}"
+    algorithm="${DECODER_ALGORITHM}"
+    mode="${DECODER_MODE}"
+    group_size="${DECODER_GROUP_SIZE}"
+    block_size="${DECODER_BLOCK_SIZE}"
+    granularity="${DECODER_GRANULARITY}"
+    enable_per_channel_scale="${DECODER_ENABLE_PER_CHANNEL_SCALE}"
+    weight_threshold="${DECODER_WEIGHT_THRESHOLD}"
+  fi
+
+  output_compressed="${model_path%.mlpackage}-${COMPRESS_SUFFIX}.mlpackage"
   echo "  - compress ${model_path}"
-  if "${PYTHON_BIN}" scripts/compress_coreml.py \
+  compress_cmd=(
+    "${PYTHON_BIN}" scripts/compress_coreml.py
     --model "${model_path}" \
     --output "${output_compressed}" \
-    --nbits 4 \
-    --mode kmeans \
-    --group-size 32; then
+    --nbits "${nbits}" \
+    --algorithm "${algorithm}" \
+    --mode "${mode}" \
+    --group-size "${group_size}" \
+    --block-size "${block_size}" \
+    --granularity "${granularity}" \
+    --weight-threshold "${weight_threshold}"
+  )
+  enable_per_channel_scale_norm="$(printf '%s' "${enable_per_channel_scale}" | tr '[:upper:]' '[:lower:]')"
+  if [[ "${enable_per_channel_scale}" == "1" || "${enable_per_channel_scale_norm}" == "true" ]]; then
+    compress_cmd+=(--enable-per-channel-scale)
+  fi
+  if "${compress_cmd[@]}"; then
     compressed_mlpackages+=( "${output_compressed}" )
   else
     echo "  - warning: compression failed for ${model_path}, keeping uncompressed model"
@@ -165,9 +221,9 @@ done
 
 if [[ -n "${encoder_candidate}" && -n "${decoder_candidate}" ]]; then
   encoder_base="$(basename "${encoder_candidate}" .mlpackage)"
-  encoder_base="${encoder_base%-int4}"
+  encoder_base="${encoder_base%-${COMPRESS_SUFFIX}}"
   decoder_base="$(basename "${decoder_candidate}" .mlpackage)"
-  decoder_base="${decoder_base%-int4}"
+  decoder_base="${decoder_base%-${COMPRESS_SUFFIX}}"
 
   encoder_manifest="${ARTIFACT_DIR}/${encoder_base}-manifest.json"
   decoder_manifest="${ARTIFACT_DIR}/${decoder_base}-manifest.json"
@@ -197,7 +253,7 @@ else
     model_file="$(basename "${candidate_model}")"
     if [[ "${model_file}" == *encoder* ]]; then
       base_name="${model_file%.mlpackage}"
-      base_name="${base_name%-int4}"
+      base_name="${base_name%-${COMPRESS_SUFFIX}}"
       manifest_file="${ARTIFACT_DIR}/${base_name}-manifest.json"
       if [[ -f "${manifest_file}" ]]; then
         echo "  - benchmark ${candidate_model}"
