@@ -70,6 +70,7 @@ def compress_with_optimize_api_palettize_mixed(
     enable_per_channel_scale: bool,
     weight_threshold: int,
     high_element_ratio: float,
+    fp16_element_ratio: float,
     score_mode: str,
     sample_size: int,
 ):
@@ -122,14 +123,26 @@ def compress_with_optimize_api_palettize_mixed(
         )
 
     stats.sort(key=lambda x: x[2], reverse=True)
+    target_fp16_elements = int(max(0.0, min(1.0, fp16_element_ratio)) * total_elements)
     target_high_elements = int(max(0.0, min(1.0, high_element_ratio)) * total_elements)
-    selected_names = set()
-    running = 0
+
+    fp16_names = set()
+    fp16_running = 0
     for name, numel, _ in stats:
-        if running >= target_high_elements:
+        if fp16_running >= target_fp16_elements:
             break
-        selected_names.add(name)
-        running += numel
+        fp16_names.add(name)
+        fp16_running += numel
+
+    high_names = set()
+    high_running = 0
+    for name, numel, _ in stats:
+        if name in fp16_names:
+            continue
+        if high_running >= target_high_elements:
+            break
+        high_names.add(name)
+        high_running += numel
 
     low_cfg = cto.coreml.OpPalettizerConfig(
         mode=mode,
@@ -147,15 +160,21 @@ def compress_with_optimize_api_palettize_mixed(
         enable_per_channel_scale=enable_per_channel_scale,
         weight_threshold=weight_threshold,
     )
-    op_name_configs = {name: high_cfg for name in selected_names}
+    op_name_configs = {name: high_cfg for name in high_names}
+    for name in fp16_names:
+        op_name_configs[name] = None
     cfg = cto.coreml.OptimizationConfig(global_config=low_cfg, op_name_configs=op_name_configs)
 
-    achieved_ratio = (running / total_elements) if total_elements > 0 else 0.0
+    achieved_high_ratio = (high_running / total_elements) if total_elements > 0 else 0.0
+    achieved_fp16_ratio = (fp16_running / total_elements) if total_elements > 0 else 0.0
     print(
         "Mixed palettization selection: "
-        f"{len(selected_names)}/{len(stats)} weights high-bit, "
+        f"{len(high_names)}/{len(stats)} weights high-bit, "
+        f"{len(fp16_names)}/{len(stats)} weights fp16-skip, "
         f"target_high_element_ratio={high_element_ratio:.3f}, "
-        f"achieved_high_element_ratio={achieved_ratio:.3f}, "
+        f"achieved_high_element_ratio={achieved_high_ratio:.3f}, "
+        f"target_fp16_element_ratio={fp16_element_ratio:.3f}, "
+        f"achieved_fp16_element_ratio={achieved_fp16_ratio:.3f}, "
         f"low_nbits={low_nbits}, high_nbits={high_nbits}, score={score_mode}"
     )
     return cto.coreml.palettize_weights(model, config=cfg)
@@ -214,6 +233,7 @@ def compress(
     weight_threshold: int,
     mixed_high_nbits: int,
     mixed_high_element_ratio: float,
+    mixed_fp16_element_ratio: float,
     mixed_score_mode: str,
     mixed_sample_size: int,
 ):
@@ -261,6 +281,7 @@ def compress(
                     enable_per_channel_scale=enable_per_channel_scale,
                     weight_threshold=weight_threshold,
                     high_element_ratio=mixed_high_element_ratio,
+                    fp16_element_ratio=mixed_fp16_element_ratio,
                     score_mode=mixed_score_mode,
                     sample_size=mixed_sample_size,
                 )
@@ -342,6 +363,12 @@ def parse_args() -> argparse.Namespace:
         help="Target fraction of weight elements assigned to high-bit for palettize_mixed.",
     )
     parser.add_argument(
+        "--mixed-fp16-element-ratio",
+        type=float,
+        default=0.0,
+        help="Target fraction of weight elements to keep uncompressed fp16 for palettize_mixed.",
+    )
+    parser.add_argument(
         "--mixed-score-mode",
         default="outlier_ratio",
         choices=["outlier_ratio", "range_ratio", "std_ratio"],
@@ -375,6 +402,7 @@ def main() -> None:
         weight_threshold=args.weight_threshold,
         mixed_high_nbits=args.mixed_high_nbits,
         mixed_high_element_ratio=args.mixed_high_element_ratio,
+        mixed_fp16_element_ratio=args.mixed_fp16_element_ratio,
         mixed_score_mode=args.mixed_score_mode,
         mixed_sample_size=args.mixed_sample_size,
     )

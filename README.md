@@ -65,6 +65,13 @@ source configs/parakeet-coreml-v6-mixed68.env
 bash scripts/run_conversion.sh
 ```
 
+Fourth profile, OD-MBP approximation with fp16 escape tensors (adds `odmbp-approx`):
+
+```bash
+source configs/parakeet-coreml-v7-odmbp-approx.env
+bash scripts/run_conversion.sh
+```
+
 If you need to regenerate both ONNX and TorchScript artifacts:
 
 ```bash
@@ -218,6 +225,15 @@ bash scripts/run_openbench_streaming_eval.sh \
   --run-name parakeet-coreml-streaming-timit-mix68
 ```
 
+To benchmark the OD-MBP approximation profile:
+
+```bash
+source configs/parakeet-coreml-v7-odmbp-approx.env
+bash scripts/run_openbench_streaming_eval.sh \
+  --dataset timit \
+  --run-name parakeet-coreml-streaming-timit-odmbp-approx
+```
+
 Note:
 - `--python-transcriber` keeps the model loaded in-process (recommended for speed).
 - `--transcribe-cmd` is still supported for shell-command integration.
@@ -249,6 +265,7 @@ If OpenBench dependency import fails on macOS due `texterrors_align`:
 - `configs/parakeet-coreml-v5-hiacc.env`: mixed precision profile (`encoder=int8`, `decoder=int4`) to trade model size for accuracy.
 - `configs/parakeet-coreml-v5-odmbp-lite.env`: OD-MBP-inspired profile (`encoder=linear-int8`, `decoder=kmeans-int4`) for lower WER at larger size.
 - `configs/parakeet-coreml-v6-mixed68.env`: mixed encoder palettization profile (`encoder=6/8-bit by outlier score`, `decoder=int4`) targeting Argmax-like model size.
+- `configs/parakeet-coreml-v7-odmbp-approx.env`: OD-MBP approximation (`encoder=6/8-bit mixed + small fp16 outlier tensor escape`, `decoder=int4`).
 - `Sources/RealtimeTranscriptionCore/`: LocalAgreement stabilizer, VAD, ring buffer, CTC decoder, streaming inference engine.
 - `Sources/transcribe-cli/`: CLI demo that shows text stabilization behavior.
 - `docs/runtime-integration.md`: minimal Swift wiring for CoreML model + decoder + streaming engine.
