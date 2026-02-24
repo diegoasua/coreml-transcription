@@ -1,0 +1,11 @@
+coremltools>=8.0
+numpy>=1.26
+onnx>=1.16
+onnxscript>=0.1.0
+onnxruntime>=1.20
+PyYAML>=6.0
+torch>=2.2
+nemo_toolkit[asr]>=2.2.0
+jiwer>=3.0
+datasets>=2.19
+soundfile>=0.12
