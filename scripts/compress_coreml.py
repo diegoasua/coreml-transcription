@@ -6,6 +6,8 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import numpy as np
+
 
 def compress_with_optimize_api_palettize(
     model,
@@ -27,6 +29,135 @@ def compress_with_optimize_api_palettize(
         weight_threshold=weight_threshold,
     )
     cfg = cto.coreml.OptimizationConfig(global_config=op_cfg)
+    return cto.coreml.palettize_weights(model, config=cfg)
+
+
+def _sample_abs_values(arr: np.ndarray, sample_size: int) -> np.ndarray:
+    flat = np.abs(arr.reshape(-1).astype(np.float32, copy=False))
+    if flat.size <= sample_size:
+        return flat
+    step = max(1, flat.size // sample_size)
+    sampled = flat[::step]
+    if sampled.size > sample_size:
+        sampled = sampled[:sample_size]
+    return sampled
+
+
+def _mixed_score(abs_values: np.ndarray, score_mode: str) -> float:
+    eps = 1e-8
+    if abs_values.size == 0:
+        return 0.0
+    if score_mode == "outlier_ratio":
+        q99 = float(np.quantile(abs_values, 0.99))
+        q999 = float(np.quantile(abs_values, 0.999))
+        return q999 / (q99 + eps)
+    if score_mode == "range_ratio":
+        q95 = float(np.quantile(abs_values, 0.95))
+        vmax = float(np.max(abs_values))
+        return vmax / (q95 + eps)
+    if score_mode == "std_ratio":
+        return float(np.std(abs_values) / (np.mean(abs_values) + eps))
+    raise ValueError(f"Unsupported mixed score mode: {score_mode}")
+
+
+def compress_with_optimize_api_palettize_mixed(
+    model,
+    low_nbits: int,
+    high_nbits: int,
+    mode: str,
+    group_size: int,
+    granularity: str,
+    enable_per_channel_scale: bool,
+    weight_threshold: int,
+    high_element_ratio: float,
+    score_mode: str,
+    sample_size: int,
+):
+    import coremltools.optimize as cto  # type: ignore
+
+    if high_nbits <= low_nbits:
+        return compress_with_optimize_api_palettize(
+            model=model,
+            nbits=low_nbits,
+            mode=mode,
+            group_size=group_size,
+            granularity=granularity,
+            enable_per_channel_scale=enable_per_channel_scale,
+            weight_threshold=weight_threshold,
+        )
+
+    metadata = cto.coreml.get_weights_metadata(model, weight_threshold=weight_threshold)
+    if not metadata:
+        return compress_with_optimize_api_palettize(
+            model=model,
+            nbits=low_nbits,
+            mode=mode,
+            group_size=group_size,
+            granularity=granularity,
+            enable_per_channel_scale=enable_per_channel_scale,
+            weight_threshold=weight_threshold,
+        )
+
+    stats = []
+    total_elements = 0
+    for name, info in metadata.items():
+        vals = np.asarray(info.val)
+        numel = int(vals.size)
+        if numel <= 0:
+            continue
+        total_elements += numel
+        abs_sample = _sample_abs_values(vals, sample_size=sample_size)
+        score = _mixed_score(abs_sample, score_mode=score_mode)
+        stats.append((name, numel, score))
+
+    if not stats or total_elements <= 0:
+        return compress_with_optimize_api_palettize(
+            model=model,
+            nbits=low_nbits,
+            mode=mode,
+            group_size=group_size,
+            granularity=granularity,
+            enable_per_channel_scale=enable_per_channel_scale,
+            weight_threshold=weight_threshold,
+        )
+
+    stats.sort(key=lambda x: x[2], reverse=True)
+    target_high_elements = int(max(0.0, min(1.0, high_element_ratio)) * total_elements)
+    selected_names = set()
+    running = 0
+    for name, numel, _ in stats:
+        if running >= target_high_elements:
+            break
+        selected_names.add(name)
+        running += numel
+
+    low_cfg = cto.coreml.OpPalettizerConfig(
+        mode=mode,
+        nbits=low_nbits,
+        granularity=granularity,
+        group_size=group_size,
+        enable_per_channel_scale=enable_per_channel_scale,
+        weight_threshold=weight_threshold,
+    )
+    high_cfg = cto.coreml.OpPalettizerConfig(
+        mode=mode,
+        nbits=high_nbits,
+        granularity=granularity,
+        group_size=group_size,
+        enable_per_channel_scale=enable_per_channel_scale,
+        weight_threshold=weight_threshold,
+    )
+    op_name_configs = {name: high_cfg for name in selected_names}
+    cfg = cto.coreml.OptimizationConfig(global_config=low_cfg, op_name_configs=op_name_configs)
+
+    achieved_ratio = (running / total_elements) if total_elements > 0 else 0.0
+    print(
+        "Mixed palettization selection: "
+        f"{len(selected_names)}/{len(stats)} weights high-bit, "
+        f"target_high_element_ratio={high_element_ratio:.3f}, "
+        f"achieved_high_element_ratio={achieved_ratio:.3f}, "
+        f"low_nbits={low_nbits}, high_nbits={high_nbits}, score={score_mode}"
+    )
     return cto.coreml.palettize_weights(model, config=cfg)
 
 
@@ -81,6 +212,10 @@ def compress(
     granularity: str,
     enable_per_channel_scale: bool,
     weight_threshold: int,
+    mixed_high_nbits: int,
+    mixed_high_element_ratio: float,
+    mixed_score_mode: str,
+    mixed_sample_size: int,
 ):
     import coremltools as ct  # type: ignore
 
@@ -90,7 +225,7 @@ def compress(
 
     compressed = None
 
-    if algorithm == "palettize":
+    if algorithm in {"palettize", "palettize_mixed"}:
         if mode not in {"kmeans", "uniform"}:
             raise ValueError(f"Unsupported palettize mode: {mode}")
         granularities = ["per_grouped_channel", "per_tensor"] if granularity == "auto" else [granularity]
@@ -115,6 +250,20 @@ def compress(
                     enable_per_channel_scale=enable_per_channel_scale,
                     weight_threshold=weight_threshold,
                 )
+            elif algorithm == "palettize_mixed":
+                compressed = compress_with_optimize_api_palettize_mixed(
+                    model=model,
+                    low_nbits=nbits,
+                    high_nbits=mixed_high_nbits,
+                    mode=mode,
+                    group_size=group_size,
+                    granularity=granularity_item,
+                    enable_per_channel_scale=enable_per_channel_scale,
+                    weight_threshold=weight_threshold,
+                    high_element_ratio=mixed_high_element_ratio,
+                    score_mode=mixed_score_mode,
+                    sample_size=mixed_sample_size,
+                )
             else:
                 compressed = compress_with_optimize_api_linear(
                     model=model,
@@ -130,7 +279,7 @@ def compress(
 
     # Legacy API generally applies to neuralnetwork specs; skip it for mlProgram.
     # It only supports LUT-style palettization.
-    if compressed is None and algorithm == "palettize" and model_type != "mlProgram":
+    if compressed is None and algorithm in {"palettize", "palettize_mixed"} and model_type != "mlProgram":
         try:
             compressed = compress_with_legacy_api(model=model, nbits=nbits, mode=mode)
         except Exception as exc:
@@ -150,7 +299,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", type=Path, required=True, help="Input CoreML model path.")
     parser.add_argument("--output", type=Path, required=True, help="Output compressed CoreML model path.")
     parser.add_argument("--nbits", type=int, default=4, choices=[2, 3, 4, 6, 8])
-    parser.add_argument("--algorithm", default="palettize", choices=["palettize", "linear"])
+    parser.add_argument("--algorithm", default="palettize", choices=["palettize", "palettize_mixed", "linear"])
     parser.add_argument(
         "--mode",
         default=None,
@@ -179,6 +328,31 @@ def parse_args() -> argparse.Namespace:
         default=2048,
         help="Skip compression for small weight tensors below this element count.",
     )
+    parser.add_argument(
+        "--mixed-high-nbits",
+        type=int,
+        default=8,
+        choices=[2, 3, 4, 6, 8],
+        help="High-bit setting for --algorithm palettize_mixed.",
+    )
+    parser.add_argument(
+        "--mixed-high-element-ratio",
+        type=float,
+        default=0.5,
+        help="Target fraction of weight elements assigned to high-bit for palettize_mixed.",
+    )
+    parser.add_argument(
+        "--mixed-score-mode",
+        default="outlier_ratio",
+        choices=["outlier_ratio", "range_ratio", "std_ratio"],
+        help="Outlier scoring heuristic for palettize_mixed.",
+    )
+    parser.add_argument(
+        "--mixed-sample-size",
+        type=int,
+        default=200000,
+        help="Per-weight sample size for outlier scoring in palettize_mixed.",
+    )
     return parser.parse_args()
 
 
@@ -199,6 +373,10 @@ def main() -> None:
         granularity=args.granularity,
         enable_per_channel_scale=args.enable_per_channel_scale,
         weight_threshold=args.weight_threshold,
+        mixed_high_nbits=args.mixed_high_nbits,
+        mixed_high_element_ratio=args.mixed_high_element_ratio,
+        mixed_score_mode=args.mixed_score_mode,
+        mixed_sample_size=args.mixed_sample_size,
     )
     print(f"Compression complete: {output_path}")
 

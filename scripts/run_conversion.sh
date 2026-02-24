@@ -132,6 +132,10 @@ COMPRESS_BLOCK_SIZE="${COMPRESS_BLOCK_SIZE:-32}"
 COMPRESS_GRANULARITY="${COMPRESS_GRANULARITY:-auto}"
 COMPRESS_ENABLE_PER_CHANNEL_SCALE="${COMPRESS_ENABLE_PER_CHANNEL_SCALE:-0}"
 COMPRESS_WEIGHT_THRESHOLD="${COMPRESS_WEIGHT_THRESHOLD:-2048}"
+COMPRESS_MIXED_HIGH_NBITS="${COMPRESS_MIXED_HIGH_NBITS:-8}"
+COMPRESS_MIXED_HIGH_ELEMENT_RATIO="${COMPRESS_MIXED_HIGH_ELEMENT_RATIO:-0.5}"
+COMPRESS_MIXED_SCORE_MODE="${COMPRESS_MIXED_SCORE_MODE:-outlier_ratio}"
+COMPRESS_MIXED_SAMPLE_SIZE="${COMPRESS_MIXED_SAMPLE_SIZE:-200000}"
 ENCODER_NBITS="${ENCODER_NBITS:-4}"
 DECODER_NBITS="${DECODER_NBITS:-4}"
 ENCODER_ALGORITHM="${ENCODER_ALGORITHM:-${COMPRESS_ALGORITHM}}"
@@ -148,6 +152,14 @@ ENCODER_ENABLE_PER_CHANNEL_SCALE="${ENCODER_ENABLE_PER_CHANNEL_SCALE:-${COMPRESS
 DECODER_ENABLE_PER_CHANNEL_SCALE="${DECODER_ENABLE_PER_CHANNEL_SCALE:-${COMPRESS_ENABLE_PER_CHANNEL_SCALE}}"
 ENCODER_WEIGHT_THRESHOLD="${ENCODER_WEIGHT_THRESHOLD:-${COMPRESS_WEIGHT_THRESHOLD}}"
 DECODER_WEIGHT_THRESHOLD="${DECODER_WEIGHT_THRESHOLD:-${COMPRESS_WEIGHT_THRESHOLD}}"
+ENCODER_MIXED_HIGH_NBITS="${ENCODER_MIXED_HIGH_NBITS:-${COMPRESS_MIXED_HIGH_NBITS}}"
+DECODER_MIXED_HIGH_NBITS="${DECODER_MIXED_HIGH_NBITS:-${COMPRESS_MIXED_HIGH_NBITS}}"
+ENCODER_MIXED_HIGH_ELEMENT_RATIO="${ENCODER_MIXED_HIGH_ELEMENT_RATIO:-${COMPRESS_MIXED_HIGH_ELEMENT_RATIO}}"
+DECODER_MIXED_HIGH_ELEMENT_RATIO="${DECODER_MIXED_HIGH_ELEMENT_RATIO:-${COMPRESS_MIXED_HIGH_ELEMENT_RATIO}}"
+ENCODER_MIXED_SCORE_MODE="${ENCODER_MIXED_SCORE_MODE:-${COMPRESS_MIXED_SCORE_MODE}}"
+DECODER_MIXED_SCORE_MODE="${DECODER_MIXED_SCORE_MODE:-${COMPRESS_MIXED_SCORE_MODE}}"
+ENCODER_MIXED_SAMPLE_SIZE="${ENCODER_MIXED_SAMPLE_SIZE:-${COMPRESS_MIXED_SAMPLE_SIZE}}"
+DECODER_MIXED_SAMPLE_SIZE="${DECODER_MIXED_SAMPLE_SIZE:-${COMPRESS_MIXED_SAMPLE_SIZE}}"
 
 echo "[4/5] Compressing CoreML model(s) (profile=${COMPRESS_SUFFIX})"
 compressed_mlpackages=()
@@ -161,6 +173,10 @@ for model_path in "${mlpackages[@]}"; do
   granularity="${ENCODER_GRANULARITY}"
   enable_per_channel_scale="${ENCODER_ENABLE_PER_CHANNEL_SCALE}"
   weight_threshold="${ENCODER_WEIGHT_THRESHOLD}"
+  mixed_high_nbits="${ENCODER_MIXED_HIGH_NBITS}"
+  mixed_high_element_ratio="${ENCODER_MIXED_HIGH_ELEMENT_RATIO}"
+  mixed_score_mode="${ENCODER_MIXED_SCORE_MODE}"
+  mixed_sample_size="${ENCODER_MIXED_SAMPLE_SIZE}"
   if [[ "${model_file}" == *decoder_joint-model* ]]; then
     nbits="${DECODER_NBITS}"
     algorithm="${DECODER_ALGORITHM}"
@@ -170,6 +186,10 @@ for model_path in "${mlpackages[@]}"; do
     granularity="${DECODER_GRANULARITY}"
     enable_per_channel_scale="${DECODER_ENABLE_PER_CHANNEL_SCALE}"
     weight_threshold="${DECODER_WEIGHT_THRESHOLD}"
+    mixed_high_nbits="${DECODER_MIXED_HIGH_NBITS}"
+    mixed_high_element_ratio="${DECODER_MIXED_HIGH_ELEMENT_RATIO}"
+    mixed_score_mode="${DECODER_MIXED_SCORE_MODE}"
+    mixed_sample_size="${DECODER_MIXED_SAMPLE_SIZE}"
   fi
 
   output_compressed="${model_path%.mlpackage}-${COMPRESS_SUFFIX}.mlpackage"
@@ -184,7 +204,11 @@ for model_path in "${mlpackages[@]}"; do
     --group-size "${group_size}" \
     --block-size "${block_size}" \
     --granularity "${granularity}" \
-    --weight-threshold "${weight_threshold}"
+    --weight-threshold "${weight_threshold}" \
+    --mixed-high-nbits "${mixed_high_nbits}" \
+    --mixed-high-element-ratio "${mixed_high_element_ratio}" \
+    --mixed-score-mode "${mixed_score_mode}" \
+    --mixed-sample-size "${mixed_sample_size}"
   )
   enable_per_channel_scale_norm="$(printf '%s' "${enable_per_channel_scale}" | tr '[:upper:]' '[:lower:]')"
   if [[ "${enable_per_channel_scale}" == "1" || "${enable_per_channel_scale_norm}" == "true" ]]; then
