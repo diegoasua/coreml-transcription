@@ -37,6 +37,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--run-name", type=str, default="custom-transcription")
     parser.add_argument("--output-dir", type=Path, default=repo_root / "artifacts/openbench-runs")
     parser.add_argument(
+        "--pipeline-kind",
+        choices=("transcription", "streaming"),
+        default="transcription",
+        help="OpenBench pipeline type to run.",
+    )
+    parser.add_argument(
         "--command-cwd",
         type=Path,
         default=repo_root,
@@ -70,12 +76,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--keep-audio", action="store_true")
     parser.add_argument("--temp-audio-dir", type=Path, default=repo_root / "artifacts/openbench-temp-audio")
 
-    parser.add_argument(
-        "--metrics",
-        nargs="+",
-        default=["wer"],
-        help="OpenBench metric names (default: wer).",
-    )
+    parser.add_argument("--metrics", nargs="+", default=None, help="OpenBench metric names.")
     parser.add_argument("--use-wandb", action="store_true")
     return parser.parse_args()
 
@@ -146,11 +147,15 @@ def main() -> None:
         import soundfile as sf  # type: ignore
         from pydantic import Field
 
-        from openbench.dataset import DatasetConfig, DatasetRegistry, TranscriptionSample
+        from openbench.dataset import DatasetConfig, DatasetRegistry, StreamingSample, TranscriptionSample
         from openbench.metric import MetricOptions
         from openbench.pipeline.base import Pipeline, register_pipeline
+        from openbench.pipeline.streaming_transcription.common import (
+            StreamingTranscriptionConfig,
+            StreamingTranscriptionOutput,
+        )
         from openbench.pipeline.transcription.common import TranscriptionConfig, TranscriptionOutput
-        from openbench.pipeline_prediction import Transcript
+        from openbench.pipeline_prediction import StreamingTranscript, Transcript
         from openbench.runner import BenchmarkConfig, BenchmarkRunner, WandbConfig
         from openbench.types import PipelineType
     except Exception as exc:  # pragma: no cover
@@ -161,6 +166,88 @@ def main() -> None:
             "uv run python ../../scripts/run_openbench_custom_transcription.py ...\n"
             f"Import error: {exc}"
         ) from exc
+
+    def _coerce_str_list(values: Any) -> list[str]:
+        if values is None:
+            return []
+        return [str(v) for v in list(values)]
+
+    def _coerce_float_list(values: Any) -> list[float]:
+        if values is None:
+            return []
+        out: list[float] = []
+        for v in list(values):
+            try:
+                out.append(float(v))
+            except Exception:
+                continue
+        return out
+
+    def _normalize_streaming_payload(payload: dict[str, Any], normalize_mode: str) -> dict[str, Any]:
+        transcript = _normalize_text(str(payload.get("transcript", "")), normalize_mode)
+        interim_results = _coerce_str_list(payload.get("interim_results") or payload.get("interim_transcripts"))
+        interim_results = [_normalize_text(t, normalize_mode) for t in interim_results]
+        audio_cursor = _coerce_float_list(payload.get("audio_cursor"))
+
+        confirmed_interim_results = _coerce_str_list(
+            payload.get("confirmed_interim_results") or payload.get("confirmed_interim_transcripts")
+        )
+        confirmed_interim_results = [_normalize_text(t, normalize_mode) for t in confirmed_interim_results]
+        confirmed_audio_cursor = _coerce_float_list(payload.get("confirmed_audio_cursor"))
+
+        # Keep cursors and result lists aligned.
+        n_interim = min(len(audio_cursor), len(interim_results))
+        n_confirmed = min(len(confirmed_audio_cursor), len(confirmed_interim_results))
+
+        model_ts_h = payload.get("model_timestamps_hypothesis")
+        model_ts_c = payload.get("model_timestamps_confirmed")
+
+        if isinstance(model_ts_h, list):
+            model_ts_h = model_ts_h[:n_interim]
+        else:
+            model_ts_h = None
+
+        if isinstance(model_ts_c, list):
+            model_ts_c = model_ts_c[:n_confirmed]
+        else:
+            model_ts_c = None
+
+        # OpenBench streaming latency metrics call jiwer.process_words on consecutive
+        # interim strings; empty entries crash that path. Filter empties while keeping
+        # cursor/timestamp alignment.
+        filtered_interim_results: list[str] = []
+        filtered_audio_cursor: list[float] = []
+        filtered_model_ts_h = [] if isinstance(model_ts_h, list) else None
+        for idx in range(n_interim):
+            text = interim_results[idx].strip()
+            if not text:
+                continue
+            filtered_interim_results.append(text)
+            filtered_audio_cursor.append(audio_cursor[idx])
+            if isinstance(filtered_model_ts_h, list):
+                filtered_model_ts_h.append(model_ts_h[idx] if idx < len(model_ts_h) else [])
+
+        filtered_confirmed_results: list[str] = []
+        filtered_confirmed_cursor: list[float] = []
+        filtered_model_ts_c = [] if isinstance(model_ts_c, list) else None
+        for idx in range(n_confirmed):
+            text = confirmed_interim_results[idx].strip()
+            if not text:
+                continue
+            filtered_confirmed_results.append(text)
+            filtered_confirmed_cursor.append(confirmed_audio_cursor[idx])
+            if isinstance(filtered_model_ts_c, list):
+                filtered_model_ts_c.append(model_ts_c[idx] if idx < len(model_ts_c) else [])
+
+        return {
+            "transcript": transcript,
+            "audio_cursor": filtered_audio_cursor or None,
+            "interim_results": filtered_interim_results or None,
+            "confirmed_audio_cursor": filtered_confirmed_cursor or None,
+            "confirmed_interim_results": filtered_confirmed_results or None,
+            "model_timestamps_hypothesis": filtered_model_ts_h,
+            "model_timestamps_confirmed": filtered_model_ts_c,
+        }
 
     class CommandTranscriptionConfig(TranscriptionConfig):
         python_transcriber: str | None = Field(
@@ -178,90 +265,181 @@ def main() -> None:
         temp_audio_dir: str = Field("artifacts/openbench-temp-audio", description="Directory for temporary audio files.")
         command_cwd: str = Field(".", description="Working directory for command execution.")
 
+    class CommandStreamingConfig(StreamingTranscriptionConfig):
+        python_transcriber: str | None = Field(
+            None,
+            description=(
+                "Path to python transcriber module that exports "
+                "stream_transcribe_file(audio_path, language=None, keywords=None) -> dict."
+            ),
+        )
+        command_template: str = Field(..., description="Shell command template with {audio_path} placeholder.")
+        stdout_json_key: str | None = Field(None, description="If set, parse stdout JSON and read this key.")
+        timeout_sec: float = Field(180.0, description="Per-sample inference timeout.")
+        normalize: str = Field("none", description="Optional output normalization: none|basic.")
+        keep_audio: bool = Field(False, description="Keep temp audio files after inference.")
+        temp_audio_dir: str = Field("artifacts/openbench-temp-audio", description="Directory for temporary audio files.")
+        command_cwd: str = Field(".", description="Working directory for command execution.")
+        endpoint_url: str = Field("local://custom-streaming", description="Unused placeholder for OpenBench schema.")
+
+    def _build_backend(
+        *,
+        python_transcriber: str | None,
+        command_template: str,
+        timeout_sec: float,
+        stdout_json_key: str | None,
+        normalize_mode: str,
+        command_cwd: Path,
+        expect_streaming: bool,
+    ) -> Callable[[CommandInput], Any]:
+        command_cwd.mkdir(parents=True, exist_ok=True)
+
+        if python_transcriber:
+            transcriber_path = Path(python_transcriber)
+            if not transcriber_path.is_absolute():
+                transcriber_path = (command_cwd / transcriber_path).resolve()
+            if not transcriber_path.exists():
+                raise RuntimeError(f"Python transcriber module not found: {transcriber_path}")
+
+            module_name = f"openbench_custom_transcriber_{abs(hash(str(transcriber_path)))}"
+            spec = importlib.util.spec_from_file_location(module_name, transcriber_path)
+            if spec is None or spec.loader is None:
+                raise RuntimeError(f"Could not load python transcriber module: {transcriber_path}")
+            module = importlib.util.module_from_spec(spec)
+            # Ensure decorators/types that inspect sys.modules (e.g. dataclass)
+            # can resolve the module during execution.
+            sys.modules[module_name] = module
+            spec.loader.exec_module(module)
+            warmup_fn = getattr(module, "warmup", None)
+            if callable(warmup_fn):
+                warmup_fn()
+
+            if expect_streaming:
+                stream_fn = getattr(module, "stream_transcribe_file", None)
+                if callable(stream_fn):
+
+                    def _run_python_streaming(payload: CommandInput) -> dict[str, Any]:
+                        out = stream_fn(
+                            str(payload.audio_path),
+                            language=payload.language,
+                            keywords=payload.keywords,
+                        )
+                        if not isinstance(out, dict):
+                            raise RuntimeError("stream_transcribe_file must return a dict payload.")
+                        return _normalize_streaming_payload(out, normalize_mode)
+
+                    return _run_python_streaming
+
+                transcribe_fn = getattr(module, "transcribe_file", None)
+                if transcribe_fn is None or not callable(transcribe_fn):
+                    raise RuntimeError(
+                        f"Transcriber module '{transcriber_path}' must export callable "
+                        "stream_transcribe_file(...) -> dict or transcribe_file(...) -> str"
+                    )
+
+                def _run_python_streaming_fallback(payload: CommandInput) -> dict[str, Any]:
+                    text = str(
+                        transcribe_fn(
+                            str(payload.audio_path),
+                            language=payload.language,
+                            keywords=payload.keywords,
+                        )
+                    )
+                    text = _normalize_text(text, normalize_mode)
+                    return {
+                        "transcript": text,
+                        "audio_cursor": None,
+                        "interim_results": None,
+                        "confirmed_audio_cursor": None,
+                        "confirmed_interim_results": None,
+                        "model_timestamps_hypothesis": None,
+                        "model_timestamps_confirmed": None,
+                    }
+
+                return _run_python_streaming_fallback
+
+            transcribe_fn = getattr(module, "transcribe_file", None)
+            if transcribe_fn is None or not callable(transcribe_fn):
+                raise RuntimeError(
+                    f"Transcriber module '{transcriber_path}' must export callable "
+                    "transcribe_file(audio_path, language=None, keywords=None) -> str"
+                )
+
+            def _run_python(payload: CommandInput) -> str:
+                text = transcribe_fn(
+                    str(payload.audio_path),
+                    language=payload.language,
+                    keywords=payload.keywords,
+                )
+                return _normalize_text(str(text), normalize_mode)
+
+            return _run_python
+
+        def _run_command(payload: CommandInput) -> str:
+            format_kwargs = {
+                "audio_path": shlex.quote(str(payload.audio_path)),
+                "language": shlex.quote(payload.language or ""),
+                "keywords_csv": shlex.quote(",".join(payload.keywords or [])),
+                "keywords_json": shlex.quote(json.dumps(payload.keywords or [])),
+                "command_cwd": shlex.quote(str(command_cwd)),
+            }
+            cmd = command_template.format(**format_kwargs)
+            completed = subprocess.run(
+                cmd,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout_sec,
+                check=False,
+                cwd=command_cwd,
+            )
+            if completed.returncode != 0:
+                err = completed.stderr.strip() or completed.stdout.strip()
+                raise RuntimeError(f"Command failed (code={completed.returncode}): {err[:400]}")
+
+            raw_out = completed.stdout.strip()
+            if stdout_json_key:
+                try:
+                    payload_json = json.loads(raw_out)
+                    return str(payload_json.get(stdout_json_key, ""))
+                except Exception as exc:
+                    raise RuntimeError("stdout was not valid JSON for configured --stdout-json-key") from exc
+            return raw_out
+
+        if expect_streaming:
+
+            def _run_streaming(payload: CommandInput) -> dict[str, Any]:
+                raw = _run_command(payload)
+                try:
+                    payload_json = json.loads(raw)
+                except Exception as exc:
+                    raise RuntimeError("Streaming command must output JSON payload.") from exc
+                if not isinstance(payload_json, dict):
+                    raise RuntimeError("Streaming command output JSON must be an object.")
+                return _normalize_streaming_payload(payload_json, normalize_mode)
+
+            return _run_streaming
+
+        def _run_transcription(payload: CommandInput) -> str:
+            return _normalize_text(_run_command(payload), normalize_mode)
+
+        return _run_transcription
+
     @register_pipeline
     class CommandTranscriptionPipeline(Pipeline):
         _config_class = CommandTranscriptionConfig
         pipeline_type = PipelineType.TRANSCRIPTION
 
         def build_pipeline(self) -> Callable[[CommandInput], str]:
-            python_transcriber = self.config.python_transcriber
-            command_template = self.config.command_template
-            timeout_sec = float(self.config.timeout_sec)
-            stdout_json_key = self.config.stdout_json_key
-            normalize_mode = self.config.normalize
-            command_cwd = Path(self.config.command_cwd)
-            command_cwd.mkdir(parents=True, exist_ok=True)
-
-            if python_transcriber:
-                transcriber_path = Path(python_transcriber)
-                if not transcriber_path.is_absolute():
-                    transcriber_path = (command_cwd / transcriber_path).resolve()
-                if not transcriber_path.exists():
-                    raise RuntimeError(f"Python transcriber module not found: {transcriber_path}")
-
-                module_name = f"openbench_custom_transcriber_{abs(hash(str(transcriber_path)))}"
-                spec = importlib.util.spec_from_file_location(module_name, transcriber_path)
-                if spec is None or spec.loader is None:
-                    raise RuntimeError(f"Could not load python transcriber module: {transcriber_path}")
-                module = importlib.util.module_from_spec(spec)
-                # Ensure decorators/types that inspect sys.modules (e.g. dataclass)
-                # can resolve the module during execution.
-                sys.modules[module_name] = module
-                spec.loader.exec_module(module)
-                transcribe_fn = getattr(module, "transcribe_file", None)
-                if transcribe_fn is None or not callable(transcribe_fn):
-                    raise RuntimeError(
-                        f"Transcriber module '{transcriber_path}' must export callable "
-                        "transcribe_file(audio_path, language=None, keywords=None) -> str"
-                    )
-                warmup_fn = getattr(module, "warmup", None)
-                if callable(warmup_fn):
-                    warmup_fn()
-
-                def _run_python(payload: CommandInput) -> str:
-                    text = transcribe_fn(
-                        str(payload.audio_path),
-                        language=payload.language,
-                        keywords=payload.keywords,
-                    )
-                    return _normalize_text(str(text), normalize_mode)
-
-                return _run_python
-
-            def _run(payload: CommandInput) -> str:
-                format_kwargs = {
-                    "audio_path": shlex.quote(str(payload.audio_path)),
-                    "language": shlex.quote(payload.language or ""),
-                    "keywords_csv": shlex.quote(",".join(payload.keywords or [])),
-                    "keywords_json": shlex.quote(json.dumps(payload.keywords or [])),
-                    "command_cwd": shlex.quote(str(command_cwd)),
-                }
-                cmd = command_template.format(**format_kwargs)
-                completed = subprocess.run(
-                    cmd,
-                    shell=True,
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout_sec,
-                    check=False,
-                    cwd=command_cwd,
-                )
-                if completed.returncode != 0:
-                    err = completed.stderr.strip() or completed.stdout.strip()
-                    raise RuntimeError(f"Command failed (code={completed.returncode}): {err[:400]}")
-
-                raw_out = completed.stdout.strip()
-                if stdout_json_key:
-                    try:
-                        payload_json = json.loads(raw_out)
-                        text = str(payload_json.get(stdout_json_key, ""))
-                    except Exception as exc:
-                        raise RuntimeError("stdout was not valid JSON for configured --stdout-json-key") from exc
-                else:
-                    text = raw_out
-                return _normalize_text(text, normalize_mode)
-
-            return _run
+            return _build_backend(
+                python_transcriber=self.config.python_transcriber,
+                command_template=self.config.command_template,
+                timeout_sec=float(self.config.timeout_sec),
+                stdout_json_key=self.config.stdout_json_key,
+                normalize_mode=self.config.normalize,
+                command_cwd=Path(self.config.command_cwd),
+                expect_streaming=False,
+            )
 
         def parse_input(self, input_sample: TranscriptionSample) -> CommandInput:
             out_dir = Path(self.config.temp_audio_dir)
@@ -299,6 +477,64 @@ def main() -> None:
                 if not self.config.keep_audio:
                     parsed_input.audio_path.unlink(missing_ok=True)
 
+    @register_pipeline
+    class CommandStreamingPipeline(Pipeline):
+        _config_class = CommandStreamingConfig
+        pipeline_type = PipelineType.STREAMING_TRANSCRIPTION
+
+        def build_pipeline(self) -> Callable[[CommandInput], dict[str, Any]]:
+            return _build_backend(
+                python_transcriber=self.config.python_transcriber,
+                command_template=self.config.command_template,
+                timeout_sec=float(self.config.timeout_sec),
+                stdout_json_key=self.config.stdout_json_key,
+                normalize_mode=self.config.normalize,
+                command_cwd=Path(self.config.command_cwd),
+                expect_streaming=True,
+            )
+
+        def parse_input(self, input_sample: StreamingSample) -> CommandInput:
+            out_dir = Path(self.config.temp_audio_dir)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            audio_path = out_dir / f"{input_sample.audio_name}.wav"
+            sf.write(str(audio_path), input_sample.waveform, input_sample.sample_rate)
+            return CommandInput(
+                audio_path=audio_path,
+                language=getattr(input_sample, "language", None),
+                keywords=getattr(input_sample, "dictionary", None),
+            )
+
+        def parse_output(self, output: dict[str, Any]) -> StreamingTranscriptionOutput:
+            normalized = _normalize_streaming_payload(output, self.config.normalize)
+            prediction = StreamingTranscript(
+                transcript=normalized["transcript"],
+                audio_cursor=normalized["audio_cursor"],
+                interim_results=normalized["interim_results"],
+                confirmed_audio_cursor=normalized["confirmed_audio_cursor"],
+                confirmed_interim_results=normalized["confirmed_interim_results"],
+                model_timestamps_hypothesis=normalized["model_timestamps_hypothesis"],
+                model_timestamps_confirmed=normalized["model_timestamps_confirmed"],
+            )
+            return StreamingTranscriptionOutput(prediction=prediction)
+
+        def __call__(self, input_sample: StreamingSample) -> StreamingTranscriptionOutput:
+            parsed_input = self.parse_input(input_sample)
+            try:
+                start = time.perf_counter()
+                output = self.pipeline(parsed_input)
+                end = time.perf_counter()
+                parsed_output = self.parse_output(output)
+                if parsed_output.prediction_time is None:
+                    parsed_output.prediction_time = end - start
+                return parsed_output
+            finally:
+                if not self.config.keep_audio:
+                    parsed_input.audio_path.unlink(missing_ok=True)
+
+    selected_pipeline_type = (
+        PipelineType.STREAMING_TRANSCRIPTION if args.pipeline_kind == "streaming" else PipelineType.TRANSCRIPTION
+    )
+
     # Resolve dataset config.
     if args.dataset_id:
         dataset_cfg = DatasetConfig(
@@ -312,6 +548,7 @@ def main() -> None:
         if not DatasetRegistry.has_alias(args.dataset):
             available = ", ".join(DatasetRegistry.list_aliases()[:25])
             raise SystemExit(f"Unknown dataset alias: {args.dataset}. Example aliases: {available} ...")
+        DatasetRegistry.validate_alias_pipeline_compatibility(args.dataset, selected_pipeline_type)
         base_cfg = DatasetRegistry.get_alias_config(args.dataset)
         update_kwargs: dict[str, Any] = {}
         if args.subset is not None:
@@ -323,8 +560,15 @@ def main() -> None:
         dataset_cfg = base_cfg.model_copy(update=update_kwargs)
         dataset_name = args.dataset
 
+    default_metrics = (
+        ["wer", "streaming_latency", "confirmed_streaming_latency"]
+        if args.pipeline_kind == "streaming"
+        else ["wer"]
+    )
+    metrics = args.metrics or default_metrics
+
     metric_map = {}
-    for metric_name in args.metrics:
+    for metric_name in metrics:
         try:
             metric_option = MetricOptions(metric_name)
         except ValueError as exc:
@@ -335,19 +579,34 @@ def main() -> None:
     run_dir = args.output_dir / args.run_name
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    pipeline = CommandTranscriptionPipeline(
-        CommandTranscriptionConfig(
-            out_dir=str(run_dir),
-            python_transcriber=str(args.python_transcriber) if args.python_transcriber else None,
-            command_template=args.transcribe_cmd or "",
-            stdout_json_key=args.stdout_json_key,
-            timeout_sec=args.timeout_sec,
-            normalize=args.normalize,
-            keep_audio=args.keep_audio,
-            temp_audio_dir=str(args.temp_audio_dir),
-            command_cwd=str(args.command_cwd),
+    if args.pipeline_kind == "streaming":
+        pipeline = CommandStreamingPipeline(
+            CommandStreamingConfig(
+                out_dir=str(run_dir),
+                python_transcriber=str(args.python_transcriber) if args.python_transcriber else None,
+                command_template=args.transcribe_cmd or "",
+                stdout_json_key=args.stdout_json_key,
+                timeout_sec=args.timeout_sec,
+                normalize=args.normalize,
+                keep_audio=args.keep_audio,
+                temp_audio_dir=str(args.temp_audio_dir),
+                command_cwd=str(args.command_cwd),
+            )
         )
-    )
+    else:
+        pipeline = CommandTranscriptionPipeline(
+            CommandTranscriptionConfig(
+                out_dir=str(run_dir),
+                python_transcriber=str(args.python_transcriber) if args.python_transcriber else None,
+                command_template=args.transcribe_cmd or "",
+                stdout_json_key=args.stdout_json_key,
+                timeout_sec=args.timeout_sec,
+                normalize=args.normalize,
+                keep_audio=args.keep_audio,
+                temp_audio_dir=str(args.temp_audio_dir),
+                command_cwd=str(args.command_cwd),
+            )
+        )
     benchmark_config = BenchmarkConfig(
         wandb_config=WandbConfig(
             project_name="openbench-custom-local",
@@ -379,6 +638,8 @@ def main() -> None:
     summary = {
         "run_name": args.run_name,
         "run_dir": str(run_dir),
+        "pipeline_kind": args.pipeline_kind,
+        "metrics": metrics,
         "dataset_name": dataset_name,
         "dataset_config": dataset_cfg.model_dump(),
         "num_samples": len(result.sample_results),

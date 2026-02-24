@@ -3,6 +3,7 @@
 
 Exports:
   transcribe_file(audio_path, language=None, keywords=None) -> str
+  stream_transcribe_file(audio_path, language=None, keywords=None) -> dict
 
 Can also run as CLI:
   python scripts/parakeet_coreml_rnnt_transcriber.py --audio path.wav
@@ -44,6 +45,21 @@ def _text_from_sentencepiece_pieces(pieces: list[str]) -> str:
     text = "".join(pieces).replace("▁", " ")
     text = " ".join(text.split())
     return text.strip()
+
+
+def _longest_common_prefix_tokens(token_lists: list[list[str]]) -> list[str]:
+    if not token_lists:
+        return []
+    prefix = list(token_lists[0])
+    for tokens in token_lists[1:]:
+        i = 0
+        limit = min(len(prefix), len(tokens))
+        while i < limit and prefix[i] == tokens[i]:
+            i += 1
+        prefix = prefix[:i]
+        if not prefix:
+            break
+    return prefix
 
 
 @dataclass
@@ -402,13 +418,7 @@ class ParakeetCoreMLRNNT:
         out_state2 = np.asarray(decoder_feed["input_states_2"], dtype=np.float32)
         return output_token_ids, out_state1, out_state2, prev_token
 
-    def transcribe_file(self, audio_path: str) -> str:
-        import soundfile as sf
-
-        audio, sr = sf.read(audio_path, dtype="float32", always_2d=False)
-        if isinstance(audio, np.ndarray) and audio.ndim == 2:
-            audio = np.mean(audio, axis=1)
-        features = self._extract_features(np.asarray(audio, dtype=np.float32), int(sr))
+    def _transcribe_features(self, features: np.ndarray) -> str:
         total_frames = int(features.shape[-1])
         if total_frames <= 0:
             return ""
@@ -447,6 +457,108 @@ class ParakeetCoreMLRNNT:
         pieces = [self.vocab[idx] for idx in all_tokens if 0 <= idx < len(self.vocab)]
         return _text_from_sentencepiece_pieces(pieces)
 
+    def transcribe_file(self, audio_path: str) -> str:
+        import soundfile as sf
+
+        audio, sr = sf.read(audio_path, dtype="float32", always_2d=False)
+        if isinstance(audio, np.ndarray) and audio.ndim == 2:
+            audio = np.mean(audio, axis=1)
+        features = self._extract_features(np.asarray(audio, dtype=np.float32), int(sr))
+        return self._transcribe_features(features)
+
+    def stream_transcribe_file(
+        self,
+        audio_path: str,
+        stream_step_sec: float | None = None,
+        agreement_window: int | None = None,
+    ) -> dict[str, Any]:
+        import soundfile as sf
+
+        audio, sr = sf.read(audio_path, dtype="float32", always_2d=False)
+        if isinstance(audio, np.ndarray) and audio.ndim == 2:
+            audio = np.mean(audio, axis=1)
+        features = self._extract_features(np.asarray(audio, dtype=np.float32), int(sr))
+
+        total_frames = int(features.shape[-1])
+        if total_frames <= 0:
+            return {
+                "transcript": "",
+                "audio_cursor": [],
+                "interim_results": [],
+                "confirmed_audio_cursor": [],
+                "confirmed_interim_results": [],
+                "model_timestamps_hypothesis": None,
+                "model_timestamps_confirmed": None,
+            }
+
+        if stream_step_sec is None:
+            stream_step_sec = float(
+                os.environ.get("PARAKEET_STREAM_STEP_SEC")
+                or os.environ.get("PARAKEET_STREAM_REALTIME_RESOLUTION")
+                or "0.25"
+            )
+        stream_step_sec = max(0.05, float(stream_step_sec))
+
+        if agreement_window is None:
+            agreement_window = int(os.environ.get("PARAKEET_STREAM_AGREEMENT_WINDOW", "2"))
+        agreement_window = max(1, int(agreement_window))
+
+        frame_hop_sec = 0.01
+        step_frames = max(1, int(round(stream_step_sec / frame_hop_sec)))
+        total_audio_sec = float(total_frames * frame_hop_sec)
+
+        interim_results: list[str] = []
+        audio_cursor: list[float] = []
+        confirmed_interim_results: list[str] = []
+        confirmed_audio_cursor: list[float] = []
+        rolling_hypotheses: list[list[str]] = []
+        confirmed_tokens: list[str] = []
+
+        end_frame = 0
+        while end_frame < total_frames:
+            end_frame = min(total_frames, end_frame + step_frames)
+            prefix_features = features[:, :, :end_frame]
+            hypothesis_text = self._transcribe_features(prefix_features)
+            hypothesis_tokens = hypothesis_text.split()
+            rolling_hypotheses.append(hypothesis_tokens)
+            if len(rolling_hypotheses) > agreement_window:
+                rolling_hypotheses = rolling_hypotheses[-agreement_window:]
+
+            cursor_sec = min(total_audio_sec, float(end_frame * frame_hop_sec))
+            if hypothesis_text and (not interim_results or interim_results[-1] != hypothesis_text):
+                interim_results.append(hypothesis_text)
+                audio_cursor.append(cursor_sec)
+
+            candidate_tokens = _longest_common_prefix_tokens(rolling_hypotheses)
+            # Keep confirmed text monotonic.
+            if len(candidate_tokens) < len(confirmed_tokens):
+                candidate_tokens = confirmed_tokens
+            elif confirmed_tokens and candidate_tokens[: len(confirmed_tokens)] != confirmed_tokens:
+                candidate_tokens = confirmed_tokens
+
+            candidate_text = " ".join(candidate_tokens).strip()
+            current_confirmed = " ".join(confirmed_tokens).strip()
+            if candidate_text and candidate_text != current_confirmed:
+                confirmed_tokens = candidate_tokens
+                confirmed_interim_results.append(candidate_text)
+                confirmed_audio_cursor.append(cursor_sec)
+
+        final_text = interim_results[-1] if interim_results else self._transcribe_features(features)
+        if final_text:
+            if not confirmed_interim_results or confirmed_interim_results[-1] != final_text:
+                confirmed_interim_results.append(final_text)
+                confirmed_audio_cursor.append(total_audio_sec)
+
+        return {
+            "transcript": final_text,
+            "audio_cursor": audio_cursor,
+            "interim_results": interim_results,
+            "confirmed_audio_cursor": confirmed_audio_cursor,
+            "confirmed_interim_results": confirmed_interim_results,
+            "model_timestamps_hypothesis": None,
+            "model_timestamps_confirmed": None,
+        }
+
 
 _ENGINE: ParakeetCoreMLRNNT | None = None
 
@@ -471,6 +583,16 @@ def transcribe_file(audio_path: str, language: str | None = None, keywords: list
     # language/keywords are accepted for OpenBench interface compatibility.
     del language, keywords
     return _get_engine().transcribe_file(audio_path)
+
+
+def stream_transcribe_file(
+    audio_path: str,
+    language: str | None = None,
+    keywords: list[str] | None = None,
+) -> dict[str, Any]:
+    # language/keywords are accepted for OpenBench interface compatibility.
+    del language, keywords
+    return _get_engine().stream_transcribe_file(audio_path)
 
 
 def warmup() -> None:

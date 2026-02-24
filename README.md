@@ -37,6 +37,13 @@ If ONNX files are already exported and you want to rerun conversion/compression 
 SKIP_EXPORT=1 PYTHON_BIN=python3.11 bash scripts/run_conversion.sh
 ```
 
+Locked baseline (matches `parakeet-coreml-ls200-v5`):
+
+```bash
+source configs/parakeet-coreml-v5.env
+bash scripts/run_conversion.sh
+```
+
 If you need to regenerate both ONNX and TorchScript artifacts:
 
 ```bash
@@ -142,6 +149,27 @@ bash scripts/run_openbench_eval.sh \
   --run-name parakeet-coreml-ls200
 ```
 
+### 10) Native OpenBench real-time streaming run
+
+Run OpenBench streaming metrics (`wer`, `streaming_latency`, `confirmed_streaming_latency`)
+using the local CoreML transcriber:
+
+```bash
+source configs/parakeet-coreml-v5.env
+bash scripts/run_openbench_streaming_eval.sh \
+  --dataset timit-debug \
+  --run-name parakeet-coreml-streaming-debug
+```
+
+Scale up to the full benchmark:
+
+```bash
+source configs/parakeet-coreml-v5.env
+bash scripts/run_openbench_streaming_eval.sh \
+  --dataset timit \
+  --run-name parakeet-coreml-streaming-timit
+```
+
 Note:
 - `--python-transcriber` keeps the model loaded in-process (recommended for speed).
 - `--transcribe-cmd` is still supported for shell-command integration.
@@ -165,9 +193,11 @@ If OpenBench dependency import fails on macOS due `texterrors_align`:
 - `scripts/benchmark_rnnt_components.py`: encoder + decoder-loop benchmark with end-to-end RTF estimate.
 - `scripts/benchmark_transcripts.py`: quick WER/RTF calculator from JSONL logs.
 - `scripts/eval_openbench_dataset.py`: standardized dataset evaluation harness (HF OpenBench datasets + local transcriber command).
-- `scripts/run_openbench_custom_transcription.py`: OpenBench-native benchmark runner with a custom local transcription command pipeline.
-- `scripts/parakeet_coreml_rnnt_transcriber.py`: local CoreML Parakeet RNNT/TDT transcriber module (`transcribe_file(...)`).
+- `scripts/run_openbench_custom_transcription.py`: OpenBench-native benchmark runner with custom local pipeline support for both `transcription` and `streaming_transcription`.
+- `scripts/parakeet_coreml_rnnt_transcriber.py`: local CoreML Parakeet RNNT/TDT module (`transcribe_file(...)`, `stream_transcribe_file(...)`).
 - `scripts/run_openbench_eval.sh`: convenience wrapper to run OpenBench `uv sync` + custom benchmark script.
+- `scripts/run_openbench_streaming_eval.sh`: convenience wrapper for OpenBench streaming transcription metrics.
+- `configs/parakeet-coreml-v5.env`: locked conversion/runtime/benchmark environment settings for the current baseline.
 - `Sources/RealtimeTranscriptionCore/`: LocalAgreement stabilizer, VAD, ring buffer, CTC decoder, streaming inference engine.
 - `Sources/transcribe-cli/`: CLI demo that shows text stabilization behavior.
 - `docs/runtime-integration.md`: minimal Swift wiring for CoreML model + decoder + streaming engine.
