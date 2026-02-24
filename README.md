@@ -44,6 +44,12 @@ source configs/parakeet-coreml-v5.env
 bash scripts/run_conversion.sh
 ```
 
+FP16 baseline (no compression, for accuracy ceiling checks):
+
+```bash
+source configs/parakeet-coreml-fp16-baseline.env
+```
+
 High-accuracy mixed profile (keeps baseline artifacts, adds `mix84`):
 
 ```bash
@@ -234,6 +240,20 @@ bash scripts/run_openbench_streaming_eval.sh \
   --run-name parakeet-coreml-streaming-timit-odmbp-approx
 ```
 
+To benchmark FP16 baseline:
+
+```bash
+source configs/parakeet-coreml-fp16-baseline.env
+bash scripts/run_openbench_eval.sh \
+  --dataset librispeech-200 \
+  --python-transcriber scripts/parakeet_coreml_rnnt_transcriber.py \
+  --run-name parakeet-coreml-ls200-fp16
+
+bash scripts/run_openbench_streaming_eval.sh \
+  --dataset timit \
+  --run-name parakeet-coreml-streaming-timit-fp16
+```
+
 Note:
 - `--python-transcriber` keeps the model loaded in-process (recommended for speed).
 - `--transcribe-cmd` is still supported for shell-command integration.
@@ -262,6 +282,7 @@ If OpenBench dependency import fails on macOS due `texterrors_align`:
 - `scripts/run_openbench_eval.sh`: convenience wrapper to run OpenBench `uv sync` + custom benchmark script.
 - `scripts/run_openbench_streaming_eval.sh`: convenience wrapper for OpenBench streaming transcription metrics.
 - `configs/parakeet-coreml-v5.env`: locked conversion/runtime/benchmark environment settings for the current baseline.
+- `configs/parakeet-coreml-fp16-baseline.env`: uncompressed fp16 runtime routing for accuracy ceiling measurement.
 - `configs/parakeet-coreml-v5-hiacc.env`: mixed precision profile (`encoder=int8`, `decoder=int4`) to trade model size for accuracy.
 - `configs/parakeet-coreml-v5-odmbp-lite.env`: OD-MBP-inspired profile (`encoder=linear-int8`, `decoder=kmeans-int4`) for lower WER at larger size.
 - `configs/parakeet-coreml-v6-mixed68.env`: mixed encoder palettization profile (`encoder=6/8-bit by outlier score`, `decoder=int4`) targeting Argmax-like model size.
