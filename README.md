@@ -44,6 +44,20 @@ source configs/parakeet-coreml-v5.env
 bash scripts/run_conversion.sh
 ```
 
+High-accuracy mixed profile (keeps baseline artifacts, adds `mix84`):
+
+```bash
+source configs/parakeet-coreml-v5-hiacc.env
+bash scripts/run_conversion.sh
+```
+
+OD-MBP-inspired profile (higher-fidelity encoder, adds `odmbp-lite`):
+
+```bash
+source configs/parakeet-coreml-v5-odmbp-lite.env
+bash scripts/run_conversion.sh
+```
+
 If you need to regenerate both ONNX and TorchScript artifacts:
 
 ```bash
@@ -170,6 +184,24 @@ bash scripts/run_openbench_streaming_eval.sh \
   --run-name parakeet-coreml-streaming-timit
 ```
 
+To benchmark the high-accuracy `mix84` profile:
+
+```bash
+source configs/parakeet-coreml-v5-hiacc.env
+bash scripts/run_openbench_streaming_eval.sh \
+  --dataset timit \
+  --run-name parakeet-coreml-streaming-timit-mix84
+```
+
+To benchmark the OD-MBP-inspired `odmbp-lite` profile:
+
+```bash
+source configs/parakeet-coreml-v5-odmbp-lite.env
+bash scripts/run_openbench_streaming_eval.sh \
+  --dataset timit \
+  --run-name parakeet-coreml-streaming-timit-odmbp-lite
+```
+
 Note:
 - `--python-transcriber` keeps the model loaded in-process (recommended for speed).
 - `--transcribe-cmd` is still supported for shell-command integration.
@@ -198,6 +230,8 @@ If OpenBench dependency import fails on macOS due `texterrors_align`:
 - `scripts/run_openbench_eval.sh`: convenience wrapper to run OpenBench `uv sync` + custom benchmark script.
 - `scripts/run_openbench_streaming_eval.sh`: convenience wrapper for OpenBench streaming transcription metrics.
 - `configs/parakeet-coreml-v5.env`: locked conversion/runtime/benchmark environment settings for the current baseline.
+- `configs/parakeet-coreml-v5-hiacc.env`: mixed precision profile (`encoder=int8`, `decoder=int4`) to trade model size for accuracy.
+- `configs/parakeet-coreml-v5-odmbp-lite.env`: OD-MBP-inspired profile (`encoder=linear-int8`, `decoder=kmeans-int4`) for lower WER at larger size.
 - `Sources/RealtimeTranscriptionCore/`: LocalAgreement stabilizer, VAD, ring buffer, CTC decoder, streaming inference engine.
 - `Sources/transcribe-cli/`: CLI demo that shows text stabilization behavior.
 - `docs/runtime-integration.md`: minimal Swift wiring for CoreML model + decoder + streaming engine.
