@@ -19,4 +19,3 @@ if [[ -n "${NUM_SAMPLES}" ]]; then
 fi
 
 bash scripts/run_openbench_eval.sh "${ARGS[@]}" "$@"
-

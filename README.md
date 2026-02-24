@@ -204,6 +204,9 @@ bash scripts/run_openbench_streaming_eval.sh \
   --run-name parakeet-coreml-streaming-timit
 ```
 
+If you have access to the stitched OpenBench dataset used in published tables,
+swap `--dataset timit` for `--dataset timit-stitched` (`argmaxinc/timit_stitched`).
+
 To benchmark the high-accuracy `mix84` profile:
 
 ```bash

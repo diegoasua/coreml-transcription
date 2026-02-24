@@ -619,7 +619,18 @@ def main() -> None:
     )
 
     runner = BenchmarkRunner(config=benchmark_config, pipelines=[pipeline])
-    result = runner.run()
+    try:
+        result = runner.run()
+    except Exception as exc:
+        msg = str(exc)
+        if "argmaxinc/timit_stitched" in msg or args.dataset == "timit-stitched":
+            raise SystemExit(
+                "Failed to load dataset alias 'timit-stitched' (argmaxinc/timit_stitched).\n"
+                "That dataset may be private/unavailable in this environment.\n"
+                "Use public fallback dataset alias instead:\n"
+                "  --dataset timit"
+            ) from exc
+        raise
 
     total_audio = sum(sample.audio_duration for sample in result.sample_results)
     total_pred = sum(sample.prediction_time for sample in result.sample_results)
