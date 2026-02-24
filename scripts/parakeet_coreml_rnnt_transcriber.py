@@ -62,11 +62,50 @@ def _longest_common_prefix_tokens(token_lists: list[list[str]]) -> list[str]:
     return prefix
 
 
+def _merge_text_by_overlap(chunks: list[str]) -> str:
+    merged: list[str] = []
+    for text in chunks:
+        tokens = text.split()
+        if not tokens:
+            continue
+        if not merged:
+            merged.extend(tokens)
+            continue
+        max_overlap = min(len(merged), len(tokens), 64)
+        overlap = 0
+        for candidate in range(max_overlap, 0, -1):
+            if merged[-candidate:] == tokens[:candidate]:
+                overlap = candidate
+                break
+        merged.extend(tokens[overlap:])
+    return " ".join(merged).strip()
+
+
 @dataclass
 class _InputSpec:
     name: str
     shape: list[int]
     dtype: Any
+
+
+@dataclass
+class _BeamHypothesis:
+    score: float
+    tokens: list[int]
+    state1: np.ndarray
+    state2: np.ndarray
+    prev_token: int
+    last_frame: int
+
+
+def _log_softmax(logits: np.ndarray) -> np.ndarray:
+    values = np.asarray(logits, dtype=np.float64).reshape(-1)
+    if values.size == 0:
+        return np.asarray([], dtype=np.float32)
+    max_v = np.max(values)
+    shifted = values - max_v
+    denom = np.log(np.sum(np.exp(shifted)))
+    return (shifted - denom).astype(np.float32, copy=False)
 
 
 def _array_dtype_to_numpy(data_type_code: int):
@@ -145,11 +184,44 @@ class ParakeetCoreMLRNNT:
 
         # RNNT setup: vocab + blank (+ duration bins in TDT head)
         self.blank_id = len(self.vocab)
-        self.duration_values = [0, 1, 2, 3, 4]
+        durations_env = os.environ.get("PARAKEET_TDT_DURATIONS", "").strip()
+        if durations_env:
+            parsed_durations = [int(piece.strip()) for piece in durations_env.split(",") if piece.strip()]
+            if not parsed_durations:
+                raise ValueError("PARAKEET_TDT_DURATIONS is set but empty after parsing.")
+            self.duration_values = parsed_durations
+        else:
+            self.duration_values = [0, 1, 2, 3, 4]
+
+        self.max_symbols_per_step = max(1, int(os.environ.get("PARAKEET_RNNT_MAX_SYMBOLS_PER_STEP", "10")))
+        self.beam_width = max(1, int(os.environ.get("PARAKEET_RNNT_BEAM_WIDTH", "1")))
+        self.duration_beam_width = max(
+            1,
+            int(os.environ.get("PARAKEET_RNNT_DURATION_BEAM_WIDTH", str(self.beam_width))),
+        )
+        self.max_tokens_per_chunk = max(0, int(os.environ.get("PARAKEET_RNNT_MAX_TOKENS_PER_CHUNK", "0")))
+        self.encoder_left_context_frames = max(
+            0,
+            int(os.environ.get("PARAKEET_ENCODER_LEFT_CONTEXT_FRAMES", "0")),
+        )
+
+        self._zero_duration_idx: int | None = None
+        self._min_non_zero_duration_idx: int | None = None
+        for idx, duration in enumerate(self.duration_values):
+            if duration == 0 and self._zero_duration_idx is None:
+                self._zero_duration_idx = idx
+            if duration > 0 and (
+                self._min_non_zero_duration_idx is None
+                or duration < self.duration_values[self._min_non_zero_duration_idx]
+            ):
+                self._min_non_zero_duration_idx = idx
 
         self._decoder_encoder_input_name = self._pick_decoder_encoder_input_name()
         self._decoder_logits_output_name = None
         self._decoder_state_map: dict[str, str] = {}
+        self._state_input_names = sorted([name for name in self.decoder_inputs_by_name if name.startswith("input_states")])
+        if len(self._state_input_names) < 2:
+            raise RuntimeError("Decoder model must expose at least two state inputs (input_states_*).")
 
         self._encoder_audio_input_name = "audio_signal" if "audio_signal" in self.encoder_inputs_by_name else next(
             iter(self.encoder_inputs_by_name.keys())
@@ -231,15 +303,24 @@ class ParakeetCoreMLRNNT:
         return adjusted
 
     def _extract_features(self, audio: np.ndarray, sr: int) -> np.ndarray:
+        audio = self._prepare_audio(audio, sr)
+        return self._extract_features_prepared(audio)
+
+    def _prepare_audio(self, audio: np.ndarray, sr: int) -> np.ndarray:
         import librosa
 
+        arr = np.asarray(audio)
+        if arr.ndim > 1:
+            arr = np.mean(arr, axis=1)
+        arr = np.asarray(arr, dtype=np.float32)
         if sr != self.sample_rate:
-            audio = librosa.resample(audio, orig_sr=sr, target_sr=self.sample_rate)
-        if audio.ndim > 1:
-            audio = np.mean(audio, axis=1)
-        audio = np.asarray(audio, dtype=np.float32)
-        if audio.size == 0:
-            audio = np.zeros(1600, dtype=np.float32)
+            arr = librosa.resample(arr, orig_sr=sr, target_sr=self.sample_rate)
+        if arr.size == 0:
+            arr = np.zeros(1600, dtype=np.float32)
+        return np.asarray(arr, dtype=np.float32)
+
+    def _extract_features_prepared(self, audio: np.ndarray) -> np.ndarray:
+        import librosa
 
         if self._nemo_preprocessor is not None:
             try:
@@ -343,6 +424,246 @@ class ParakeetCoreMLRNNT:
                 used.add(match_name)
                 self._decoder_state_map[in_name] = match_name
 
+    def _chunk_max_tokens(self, enc_steps: int) -> int:
+        if self.max_tokens_per_chunk > 0:
+            return self.max_tokens_per_chunk
+        return max(256, enc_steps * 4)
+
+    def _topk_indices(self, values: np.ndarray, k: int) -> list[int]:
+        arr = np.asarray(values).reshape(-1)
+        if arr.size == 0 or k <= 0:
+            return []
+        count = min(k, int(arr.size))
+        if count == int(arr.size):
+            order = np.argsort(arr)[::-1]
+        else:
+            part = np.argpartition(arr, -count)[-count:]
+            order = part[np.argsort(arr[part])[::-1]]
+        return [int(idx) for idx in order]
+
+    def _duration_from_index(self, duration_idx: int) -> int:
+        if 0 <= duration_idx < len(self.duration_values):
+            return int(self.duration_values[duration_idx])
+        return 1
+
+    def _decoder_step(
+        self,
+        decoder_encoder_input: np.ndarray,
+        t_idx: int,
+        prev_token: int,
+        state1: np.ndarray,
+        state2: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        state_name_1, state_name_2 = self._state_input_names[:2]
+        decoder_feed: dict[str, Any] = {
+            self._decoder_encoder_input_name: decoder_encoder_input,
+            "targets": np.array([[prev_token]], dtype=np.int32),
+            "target_length": np.array([1], dtype=np.int32),
+            state_name_1: np.asarray(state1, dtype=np.float32),
+            state_name_2: np.asarray(state2, dtype=np.float32),
+        }
+        decoder_outputs = self.decoder.predict(decoder_feed)
+        self._infer_decoder_output_roles(decoder_outputs, decoder_feed)
+
+        logits = np.asarray(decoder_outputs[self._decoder_logits_output_name])  # type: ignore[index]
+        step_logits = self._extract_step_logits(logits, t_idx)
+
+        token_vocab_size = self.blank_id + 1
+        token_logits = np.asarray(step_logits[:token_vocab_size], dtype=np.float32)
+        duration_logits = np.asarray(step_logits[token_vocab_size:], dtype=np.float32)
+
+        token_logp = _log_softmax(token_logits)
+        duration_logp = _log_softmax(duration_logits) if duration_logits.size > 0 else np.zeros(1, dtype=np.float32)
+
+        out_state_name_1 = self._decoder_state_map.get(state_name_1)
+        out_state_name_2 = self._decoder_state_map.get(state_name_2)
+        if out_state_name_1 is None or out_state_name_2 is None:
+            raise RuntimeError("Failed to resolve decoder output state mappings.")
+
+        next_state1 = np.asarray(decoder_outputs[out_state_name_1], dtype=np.float32)
+        next_state2 = np.asarray(decoder_outputs[out_state_name_2], dtype=np.float32)
+        return token_logp, duration_logp, next_state1, next_state2
+
+    def _merge_beam_duplicates(self, hyps: list[_BeamHypothesis], beam: int) -> list[_BeamHypothesis]:
+        dedup: dict[tuple[tuple[int, ...], int, int], _BeamHypothesis] = {}
+        for hyp in hyps:
+            key = (tuple(hyp.tokens), hyp.last_frame, hyp.prev_token)
+            best = dedup.get(key)
+            if best is None or hyp.score > best.score:
+                dedup[key] = hyp
+        merged = sorted(dedup.values(), key=lambda h: h.score, reverse=True)
+        return merged[: max(beam * 2, beam)]
+
+    def _decode_chunk_greedy(
+        self,
+        decoder_encoder_input: np.ndarray,
+        enc_steps: int,
+        state1: np.ndarray,
+        state2: np.ndarray,
+        prev_token: int,
+    ) -> tuple[list[int], np.ndarray, np.ndarray, int]:
+        t = 0
+        max_tokens = self._chunk_max_tokens(enc_steps)
+        output_token_ids: list[int] = []
+
+        while t < enc_steps and len(output_token_ids) < max_tokens:
+            symbols_added = 0
+            need_loop = True
+            skip = 1
+
+            while need_loop and symbols_added < self.max_symbols_per_step and len(output_token_ids) < max_tokens:
+                token_logp, duration_logp, next_state1, next_state2 = self._decoder_step(
+                    decoder_encoder_input=decoder_encoder_input,
+                    t_idx=t,
+                    prev_token=prev_token,
+                    state1=state1,
+                    state2=state2,
+                )
+
+                token_id = int(np.argmax(token_logp))
+                duration_idx = int(np.argmax(duration_logp))
+                skip = self._duration_from_index(duration_idx)
+
+                # Match NeMo loop-label behavior for TDT:
+                # blank tokens should not advance by zero duration.
+                if token_id == self.blank_id and skip == 0:
+                    if self._min_non_zero_duration_idx is not None:
+                        duration_idx = self._min_non_zero_duration_idx
+                        skip = self._duration_from_index(duration_idx)
+                    if skip == 0:
+                        skip = 1
+
+                if token_id != self.blank_id:
+                    output_token_ids.append(token_id)
+                    state1 = next_state1
+                    state2 = next_state2
+                    prev_token = token_id
+
+                symbols_added += 1
+                t += skip
+                need_loop = skip == 0
+
+            if symbols_added >= self.max_symbols_per_step:
+                t += 1
+
+        return output_token_ids, np.asarray(state1, dtype=np.float32), np.asarray(state2, dtype=np.float32), prev_token
+
+    def _decode_chunk_beam(
+        self,
+        decoder_encoder_input: np.ndarray,
+        enc_steps: int,
+        state1: np.ndarray,
+        state2: np.ndarray,
+        prev_token: int,
+    ) -> tuple[list[int], np.ndarray, np.ndarray, int]:
+        beam = max(1, self.beam_width)
+        token_beam_k = max(1, min(beam, self.blank_id))
+        duration_beam_k = max(1, min(self.duration_beam_width, len(self.duration_values)))
+        max_tokens = self._chunk_max_tokens(enc_steps)
+
+        kept_hyps: list[_BeamHypothesis] = [
+            _BeamHypothesis(
+                score=0.0,
+                tokens=[],
+                state1=np.asarray(state1, dtype=np.float32),
+                state2=np.asarray(state2, dtype=np.float32),
+                prev_token=prev_token,
+                last_frame=0,
+            )
+        ]
+
+        for time_idx in range(enc_steps):
+            hyps = [hyp for hyp in kept_hyps if hyp.last_frame == time_idx]
+            kept_hyps = [hyp for hyp in kept_hyps if hyp.last_frame > time_idx]
+
+            while hyps:
+                max_hyp = max(hyps, key=lambda h: h.score)
+                hyps.remove(max_hyp)
+
+                token_logp, duration_logp, next_state1, next_state2 = self._decoder_step(
+                    decoder_encoder_input=decoder_encoder_input,
+                    t_idx=time_idx,
+                    prev_token=max_hyp.prev_token,
+                    state1=max_hyp.state1,
+                    state2=max_hyp.state2,
+                )
+
+                token_topk = self._topk_indices(token_logp[: self.blank_id], token_beam_k)
+                duration_topk = self._topk_indices(duration_logp, duration_beam_k)
+                if not duration_topk:
+                    duration_topk = [0]
+
+                non_blank_candidates: list[tuple[float, int, int]] = []
+                for d_idx in duration_topk:
+                    d_score = float(duration_logp[d_idx])
+                    for token_idx in token_topk:
+                        score = float(token_logp[token_idx]) + d_score
+                        non_blank_candidates.append((score, token_idx, d_idx))
+                non_blank_candidates.sort(key=lambda item: item[0], reverse=True)
+
+                for score, token_idx, duration_idx in non_blank_candidates[:token_beam_k]:
+                    if len(max_hyp.tokens) >= max_tokens:
+                        continue
+                    duration = self._duration_from_index(duration_idx)
+                    new_hyp = _BeamHypothesis(
+                        score=max_hyp.score + score,
+                        tokens=max_hyp.tokens + [token_idx],
+                        state1=np.asarray(next_state1, dtype=np.float32),
+                        state2=np.asarray(next_state2, dtype=np.float32),
+                        prev_token=token_idx,
+                        last_frame=max_hyp.last_frame + duration,
+                    )
+                    if duration == 0:
+                        hyps.append(new_hyp)
+                    else:
+                        kept_hyps.append(new_hyp)
+
+                for duration_idx in duration_topk:
+                    duration = self._duration_from_index(duration_idx)
+                    if duration == 0:
+                        if self._zero_duration_idx is not None and duration_idx == self._zero_duration_idx:
+                            if len(duration_topk) == 1 and self._min_non_zero_duration_idx is not None:
+                                duration_idx = self._min_non_zero_duration_idx
+                                duration = self._duration_from_index(duration_idx)
+                            else:
+                                continue
+                        else:
+                            continue
+
+                    blank_score = float(token_logp[self.blank_id]) + float(duration_logp[duration_idx])
+                    kept_hyps.append(
+                        _BeamHypothesis(
+                            score=max_hyp.score + blank_score,
+                            tokens=list(max_hyp.tokens),
+                            state1=max_hyp.state1,
+                            state2=max_hyp.state2,
+                            prev_token=max_hyp.prev_token,
+                            last_frame=max_hyp.last_frame + duration,
+                        )
+                    )
+
+                kept_hyps = self._merge_beam_duplicates(kept_hyps, beam)
+
+                if hyps:
+                    hyps_max = max(h.score for h in hyps)
+                    kept_most_prob = [hyp for hyp in kept_hyps if hyp.score > hyps_max]
+                    if len(kept_most_prob) >= beam:
+                        kept_hyps = sorted(kept_most_prob, key=lambda h: h.score, reverse=True)[:beam]
+                        break
+                else:
+                    kept_hyps = sorted(kept_hyps, key=lambda h: h.score, reverse=True)[:beam]
+
+        if not kept_hyps:
+            return [], np.asarray(state1, dtype=np.float32), np.asarray(state2, dtype=np.float32), prev_token
+
+        best_hyp = max(kept_hyps, key=lambda h: h.score)
+        return (
+            list(best_hyp.tokens),
+            np.asarray(best_hyp.state1, dtype=np.float32),
+            np.asarray(best_hyp.state2, dtype=np.float32),
+            int(best_hyp.prev_token),
+        )
+
     def _decode_chunk(
         self,
         encoder_tensor: np.ndarray,
@@ -353,85 +674,32 @@ class ParakeetCoreMLRNNT:
     ) -> tuple[list[int], np.ndarray, np.ndarray, int]:
         enc_steps = max(0, min(enc_steps, int(self.decoder_inputs_by_name[self._decoder_encoder_input_name].shape[-1])))
         if enc_steps == 0:
-            return [], state1, state2, prev_token
+            return [], np.asarray(state1, dtype=np.float32), np.asarray(state2, dtype=np.float32), int(prev_token)
 
         decoder_encoder_input = self._prepare_decoder_encoder_tensor(encoder_tensor)
-
-        decoder_feed: dict[str, Any] = {
-            self._decoder_encoder_input_name: decoder_encoder_input,
-            "targets": np.zeros((1, 1), dtype=np.int32),
-            "target_length": np.array([1], dtype=np.int32),
-            "input_states_1": np.asarray(state1, dtype=np.float32),
-            "input_states_2": np.asarray(state2, dtype=np.float32),
-        }
-
-        t = 0
-        symbols_at_t = 0
-        max_symbols_per_t = 10
-        max_tokens = max(256, enc_steps * 4)
-        output_token_ids: list[int] = []
-
-        while t < enc_steps and len(output_token_ids) < max_tokens:
-            decoder_feed["targets"] = np.array([[prev_token]], dtype=np.int32)
-            decoder_feed["target_length"] = np.array([1], dtype=np.int32)
-            decoder_outputs = self.decoder.predict(decoder_feed)
-            self._infer_decoder_output_roles(decoder_outputs, decoder_feed)
-
-            logits = np.asarray(decoder_outputs[self._decoder_logits_output_name])  # type: ignore[index]
-            step_logits = self._extract_step_logits(logits, t)
-
-            token_vocab_size = self.blank_id + 1
-            token_logits = step_logits[:token_vocab_size]
-            duration_logits = step_logits[token_vocab_size:]
-
-            token_id = int(np.argmax(token_logits))
-            duration = 1
-            if duration_logits.size > 0:
-                d_idx = int(np.argmax(duration_logits))
-                if d_idx < len(self.duration_values):
-                    duration = int(self.duration_values[d_idx])
-
-            next_states = {in_name: np.asarray(decoder_outputs[out_name]) for in_name, out_name in self._decoder_state_map.items()}
-
-            if token_id == self.blank_id:
-                # In RNNT, blank advances time without consuming a label;
-                # predictor state must remain unchanged.
-                t += max(1, duration)
-                symbols_at_t = 0
-            else:
-                output_token_ids.append(token_id)
-                # Update predictor state only when a non-blank symbol is consumed.
-                for in_name, state_value in next_states.items():
-                    decoder_feed[in_name] = state_value
-                prev_token = token_id
-                # TDT duration may advance encoder time on label emissions.
-                if duration > 0:
-                    t += duration
-                    symbols_at_t = 0
-                    continue
-                symbols_at_t += 1
-                if symbols_at_t >= max_symbols_per_t:
-                    t += 1
-                    symbols_at_t = 0
-
-        out_state1 = np.asarray(decoder_feed["input_states_1"], dtype=np.float32)
-        out_state2 = np.asarray(decoder_feed["input_states_2"], dtype=np.float32)
-        return output_token_ids, out_state1, out_state2, prev_token
+        if self.beam_width > 1:
+            return self._decode_chunk_beam(decoder_encoder_input, enc_steps, state1, state2, prev_token)
+        return self._decode_chunk_greedy(decoder_encoder_input, enc_steps, state1, state2, prev_token)
 
     def _transcribe_features(self, features: np.ndarray) -> str:
         total_frames = int(features.shape[-1])
         if total_frames <= 0:
             return ""
 
-        state1_shape = self.decoder_inputs_by_name["input_states_1"].shape
-        state2_shape = self.decoder_inputs_by_name["input_states_2"].shape
+        state1_shape = self.decoder_inputs_by_name[self._state_input_names[0]].shape
+        state2_shape = self.decoder_inputs_by_name[self._state_input_names[1]].shape
         state1 = np.zeros(state1_shape, dtype=np.float32)
         state2 = np.zeros(state2_shape, dtype=np.float32)
         prev_token = self.blank_id
 
+        left_ctx = min(self.encoder_left_context_frames, max(0, self._encoder_frame_count - 1))
+        hop_frames = max(1, self._encoder_frame_count - left_ctx)
+
         all_tokens: list[int] = []
-        for start in range(0, total_frames, self._encoder_frame_count):
-            feat_chunk, actual_frames = self._slice_or_pad_features(features, start)
+        for center_start in range(0, total_frames, hop_frames):
+            # Optional left context to reduce encoder boundary loss on long-form audio.
+            input_start = max(0, center_start - left_ctx)
+            feat_chunk, actual_frames = self._slice_or_pad_features(features, input_start)
             if actual_frames <= 0:
                 continue
 
@@ -444,6 +712,24 @@ class ParakeetCoreMLRNNT:
             encoder_tensor, encoder_len = self._pick_encoder_outputs(encoder_outputs)
             if encoder_len is None:
                 encoder_len = int(encoder_tensor.shape[-1])
+
+            # Decode only the non-overlapping center span; keep left context as encoder-only context.
+            if left_ctx > 0 and encoder_len > 0 and actual_frames > 0:
+                left_in = center_start - input_start
+                center_in = min(hop_frames, total_frames - center_start)
+
+                scale = float(encoder_len) / float(actual_frames)
+                left_out = int(round(left_in * scale))
+                center_out = int(round(center_in * scale))
+
+                left_out = max(0, min(left_out, encoder_len))
+                if center_start + center_in >= total_frames:
+                    end_out = encoder_len
+                else:
+                    end_out = max(left_out, min(encoder_len, left_out + max(1, center_out)))
+
+                encoder_tensor = np.asarray(encoder_tensor)[..., left_out:end_out]
+                encoder_len = int(max(0, end_out - left_out))
 
             chunk_tokens, state1, state2, prev_token = self._decode_chunk(
                 encoder_tensor=encoder_tensor,
@@ -461,10 +747,35 @@ class ParakeetCoreMLRNNT:
         import soundfile as sf
 
         audio, sr = sf.read(audio_path, dtype="float32", always_2d=False)
-        if isinstance(audio, np.ndarray) and audio.ndim == 2:
-            audio = np.mean(audio, axis=1)
-        features = self._extract_features(np.asarray(audio, dtype=np.float32), int(sr))
-        return self._transcribe_features(features)
+        prepared_audio = self._prepare_audio(np.asarray(audio, dtype=np.float32), int(sr))
+
+        segment_sec = float(os.environ.get("PARAKEET_LONGFORM_SEGMENT_SEC", "0"))
+        overlap_sec = float(os.environ.get("PARAKEET_LONGFORM_OVERLAP_SEC", "0"))
+        if segment_sec <= 0:
+            features = self._extract_features_prepared(prepared_audio)
+            return self._transcribe_features(features)
+
+        segment_samples = max(1, int(round(segment_sec * self.sample_rate)))
+        overlap_samples = int(round(max(0.0, overlap_sec) * self.sample_rate))
+        if overlap_samples >= segment_samples:
+            overlap_samples = max(0, segment_samples // 4)
+        step_samples = max(1, segment_samples - overlap_samples)
+
+        chunk_texts: list[str] = []
+        start = 0
+        total = int(prepared_audio.shape[0])
+        while start < total:
+            end = min(total, start + segment_samples)
+            segment_audio = prepared_audio[start:end]
+            features = self._extract_features_prepared(segment_audio)
+            chunk_text = self._transcribe_features(features)
+            if chunk_text:
+                chunk_texts.append(chunk_text)
+            if end >= total:
+                break
+            start += step_samples
+
+        return _merge_text_by_overlap(chunk_texts)
 
     def stream_transcribe_file(
         self,

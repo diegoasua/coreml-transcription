@@ -8,4 +8,5 @@ torch>=2.2
 nemo_toolkit[asr]>=2.2.0
 jiwer>=3.0
 datasets>=2.19
+evaluate>=0.4
 soundfile>=0.12

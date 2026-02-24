@@ -157,6 +157,26 @@ Notes:
   - `hypothesis.jsonl`
   - `summary.json` (WER/RTF)
 
+### 8b) Independent HF-style benchmark (no OpenBench runtime)
+
+If you want a second harness independent of OpenBench internals, use:
+
+```bash
+bash scripts/run_hf_open_asr_eval.sh \
+  --run-name parakeet-coreml-earnings22-hf \
+  --python-transcriber scripts/parakeet_coreml_rnnt_transcriber.py
+```
+
+Defaults are aligned with Hugging Face ESB test-only datasets:
+- `--dataset-path hf-audio/esb-datasets-test-only-sorted`
+- auto-resolve a config containing `earnings22`
+- `--split test`
+- `--normalizer open_asr`
+
+Outputs are written to:
+- `artifacts/hf-asr-eval/<run-name>/summary.json`
+- `artifacts/hf-asr-eval/<run-name>/predictions.jsonl`
+
 ### 9) Native OpenBench run (custom local pipeline)
 
 If you cloned OpenBench at `external/OpenBench`, run this from repo root:
@@ -257,10 +277,102 @@ bash scripts/run_openbench_streaming_eval.sh \
   --run-name parakeet-coreml-streaming-timit-fp16
 ```
 
+To run the same model with decoder beam search (quality-focused):
+
+```bash
+source configs/parakeet-coreml-decoder-beam2.env
+bash scripts/run_openbench_streaming_eval.sh \
+  --dataset timit \
+  --run-name parakeet-coreml-streaming-timit-beam2
+```
+
+To measure a NeMo (PyTorch) reference ceiling on the same OpenBench setup:
+
+```bash
+OPENBENCH_PYTHON=python3.11 \
+OPENBENCH_REBUILD_TEXTERRORS=0 \
+bash scripts/run_openbench_eval.sh \
+  --dataset timit \
+  --num-samples 20 \
+  --pipeline-kind transcription \
+  --python-transcriber scripts/parakeet_nemo_transcriber.py \
+  --metrics wer \
+  --run-name parakeet-nemo-ref-smoke20
+```
+
+To run the English comparison matrix (default dataset: `earnings22`;
+profiles: `fp16`, `odmbp-approx`, `odmbp-approx-beam2`):
+
+```bash
+OPENBENCH_PYTHON=python3.11 \
+OPENBENCH_REBUILD_TEXTERRORS=0 \
+bash scripts/run_openbench_matrix_english.sh
+```
+
+Optional quick smoke mode:
+
+```bash
+NUM_SAMPLES=20 \
+OPENBENCH_PYTHON=python3.11 \
+OPENBENCH_REBUILD_TEXTERRORS=0 \
+bash scripts/run_openbench_matrix_english.sh
+```
+
+Outputs:
+- `artifacts/openbench-runs/parakeet-coreml-english-matrix-manifest.tsv`
+- `artifacts/openbench-runs/parakeet-coreml-english-matrix-summary.json`
+- `artifacts/openbench-runs/parakeet-coreml-english-matrix-summary.csv`
+
+Run names include mode suffixes automatically:
+- `...-noseg` when `ENABLE_LONGFORM_SEGMENTED=0`
+- `...-seg` when `ENABLE_LONGFORM_SEGMENTED=1`
+
+For longform datasets (for example `earnings22`), you can enable segmentation
+to avoid relying on one continuous decoder state over hour-long files:
+
+```bash
+source configs/parakeet-coreml-longform-segmented.env
+```
+
+Or via matrix script flag:
+
+```bash
+ENABLE_LONGFORM_SEGMENTED=1 \
+OPENBENCH_PYTHON=python3.11 \
+OPENBENCH_REBUILD_TEXTERRORS=0 \
+bash scripts/run_openbench_matrix_english.sh
+```
+
+You can tune:
+- `PARAKEET_LONGFORM_SEGMENT_SEC` (default suggested: `30`)
+- `PARAKEET_LONGFORM_OVERLAP_SEC` (default suggested: `3`)
+
+Optional long-form boundary tuning (fixed-shape encoder):
+
+```bash
+source configs/parakeet-coreml-decoder-longform-context.env
+```
+
+This sets `PARAKEET_ENCODER_LEFT_CONTEXT_FRAMES` (default in that profile: `240`)
+to preserve encoder context across chunk boundaries.
+
+Optional: include AMI SDM in the same matrix:
+
+```bash
+DATASETS_CSV=earnings22,ami-sdm-openbench \
+OPENBENCH_PYTHON=python3.11 \
+OPENBENCH_REBUILD_TEXTERRORS=0 \
+bash scripts/run_openbench_matrix_english.sh
+```
+
 Note:
 - `--python-transcriber` keeps the model loaded in-process (recommended for speed).
 - `--transcribe-cmd` is still supported for shell-command integration.
 - Commands run from project root by default (`--command-cwd`).
+- Decoder quality/speed knobs (CoreML RNNT transcriber):
+  - `PARAKEET_RNNT_BEAM_WIDTH` (default `1`, greedy). Try `2` or `4` for lower WER.
+  - `PARAKEET_RNNT_DURATION_BEAM_WIDTH` (default matches beam width).
+  - `PARAKEET_RNNT_MAX_SYMBOLS_PER_STEP` (default `10`).
 
 If OpenBench dependency import fails on macOS due `texterrors_align`:
 - The runner auto-falls back to a safe stub for `texterrors` (keyword metrics disabled, WER unaffected).
@@ -284,8 +396,12 @@ If OpenBench dependency import fails on macOS due `texterrors_align`:
 - `scripts/parakeet_coreml_rnnt_transcriber.py`: local CoreML Parakeet RNNT/TDT module (`transcribe_file(...)`, `stream_transcribe_file(...)`).
 - `scripts/run_openbench_eval.sh`: convenience wrapper to run OpenBench `uv sync` + custom benchmark script.
 - `scripts/run_openbench_streaming_eval.sh`: convenience wrapper for OpenBench streaming transcription metrics.
+- `scripts/run_openbench_matrix_english.sh`: matrix runner for English transcription benchmarks (`earnings22`, `ami-sdm-openbench`) across selected profiles.
+- `scripts/build_openbench_matrix_report.py`: consolidates matrix run outputs into one JSON/CSV report.
 - `configs/parakeet-coreml-v5.env`: locked conversion/runtime/benchmark environment settings for the current baseline.
 - `configs/parakeet-coreml-fp16-baseline.env`: uncompressed fp16 runtime routing for accuracy ceiling measurement.
+- `configs/parakeet-coreml-decoder-beam2.env`: decoder beam overlay (`beam=2`) for quality-focused runs.
+- `configs/parakeet-coreml-decoder-longform-context.env`: long-form boundary overlay (`PARAKEET_ENCODER_LEFT_CONTEXT_FRAMES=240`).
 - `configs/parakeet-coreml-v5-hiacc.env`: mixed precision profile (`encoder=int8`, `decoder=int4`) to trade model size for accuracy.
 - `configs/parakeet-coreml-v5-odmbp-lite.env`: OD-MBP-inspired profile (`encoder=linear-int8`, `decoder=kmeans-int4`) for lower WER at larger size.
 - `configs/parakeet-coreml-v6-mixed68.env`: mixed encoder palettization profile (`encoder=6/8-bit by outlier score`, `decoder=int4`) targeting Argmax-like model size.
