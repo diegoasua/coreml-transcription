@@ -52,18 +52,29 @@ public final class ParakeetCoreMLRNNTTranscriptionModel: TranscriptionModel {
     private let vocab: [String]
     private let blankID: Int
 
+    private let encoderInputSpecs: [String: ModelInputSpec]
+    private let decoderInputSpecs: [String: ModelInputSpec]
     private let encoderAudioInputName: String
     private let encoderLengthInputName: String?
+    private let encoderLengthDataType: MLMultiArrayDataType?
+    private let encoderAudioDataType: MLMultiArrayDataType
     private let encoderFrameCount: Int
 
     private let decoderEncoderInputName: String
     private let decoderStateInputNames: [String]
     private var decoderLogitsOutputName: String?
     private var decoderStateOutputByInputName: [String: String]
+    private let decoderEncoderInputShape: [Int]
+    private let decoderEncoderInputDataType: MLMultiArrayDataType
     private let decoderFrameCount: Int
 
     private var state1: MLMultiArray
     private var state2: MLMultiArray
+    private var encoderAudioBuffer: MLMultiArray
+    private var encoderLengthBuffer: MLMultiArray?
+    private var decoderEncoderBuffer: MLMultiArray
+    private var decoderTargetsBuffer: MLMultiArray
+    private var decoderTargetLengthBuffer: MLMultiArray
     private var previousToken: Int
     private var emittedTokenIDs: [Int]
     private let debugLoggingEnabled: Bool
@@ -96,14 +107,18 @@ public final class ParakeetCoreMLRNNTTranscriptionModel: TranscriptionModel {
         self.blankID = vocab.count
 
         let encoderInputs = Self.inputSpecs(model: encoder)
+        let decoderInputs = Self.inputSpecs(model: decoder)
+        self.encoderInputSpecs = encoderInputs
+        self.decoderInputSpecs = decoderInputs
         guard let audioInput = encoderInputs["audio_signal"] ?? encoderInputs.values.first else {
             throw ParakeetCoreMLRNNTError.invalidModelIO("Could not find encoder input.")
         }
         self.encoderAudioInputName = audioInput.name
+        self.encoderAudioDataType = .float32
         self.encoderLengthInputName = encoderInputs["length"]?.name
+        self.encoderLengthDataType = self.encoderLengthInputName.flatMap { encoderInputs[$0]?.dataType }
         self.encoderFrameCount = max(1, audioInput.shape.last ?? 1200)
 
-        let decoderInputs = Self.inputSpecs(model: decoder)
         if let encoderInput = decoderInputs["encoder_outputs"] {
             self.decoderEncoderInputName = encoderInput.name
         } else if let inferred = decoderInputs.values.first(where: { $0.name.lowercased().contains("encoder") }) {
@@ -120,6 +135,8 @@ public final class ParakeetCoreMLRNNTTranscriptionModel: TranscriptionModel {
             throw ParakeetCoreMLRNNTError.invalidModelIO("Decoder is missing input_states_* tensors.")
         }
         self.decoderFrameCount = max(1, decoderInputs[decoderEncoderInputName]?.shape.last ?? 300)
+        self.decoderEncoderInputShape = decoderInputs[decoderEncoderInputName]?.shape ?? [1, 1024, decoderFrameCount]
+        self.decoderEncoderInputDataType = .float32
 
         self.state1 = try Self.makeArray(
             shape: decoderInputs[decoderStateInputNames[0]]?.shape ?? [2, 1, 640],
@@ -129,6 +146,28 @@ public final class ParakeetCoreMLRNNTTranscriptionModel: TranscriptionModel {
             shape: decoderInputs[decoderStateInputNames[1]]?.shape ?? [2, 1, 640],
             dataType: decoderInputs[decoderStateInputNames[1]]?.dataType ?? .float32
         )
+        self.encoderAudioBuffer = try Self.makeArray(
+            shape: [1, config.melBins, encoderFrameCount],
+            dataType: encoderAudioDataType
+        )
+        if let lengthType = encoderLengthDataType {
+            self.encoderLengthBuffer = try Self.makeArray(shape: [1], dataType: lengthType)
+        } else {
+            self.encoderLengthBuffer = nil
+        }
+        self.decoderEncoderBuffer = try Self.makeArray(
+            shape: decoderEncoderInputShape,
+            dataType: decoderEncoderInputDataType
+        )
+        self.decoderTargetsBuffer = try Self.makeArray(
+            shape: decoderInputs["targets"]?.shape ?? [1, 1],
+            dataType: decoderInputs["targets"]?.dataType ?? .int32
+        )
+        self.decoderTargetLengthBuffer = try Self.makeArray(
+            shape: decoderInputs["target_length"]?.shape ?? [1],
+            dataType: decoderInputs["target_length"]?.dataType ?? .int32
+        )
+        try Self.setScalarInt(decoderTargetLengthBuffer, value: 1)
         self.previousToken = blankID
 
         self.featureExtractor = MelFeatureExtractor(
@@ -171,23 +210,27 @@ public final class ParakeetCoreMLRNNTTranscriptionModel: TranscriptionModel {
             fputs("[ParakeetSwift] feature frames=\(frameCount) clamped=\(clampedFrames) first10=[\(preview)]\n", stderr)
         }
 
-        let encoderAudio = try Self.makeArray(shape: [1, config.melBins, encoderFrameCount], dataType: .float32)
-        try Self.fill(array: encoderAudio, with: 0)
-        try Self.copyFeatureMatrixToEncoderInput(
+        try Self.fill(array: encoderAudioBuffer, with: 0)
+        try Self.copyFeatureWindowToEncoderInput(
             featureMatrix: featureMatrix,
             melBins: config.melBins,
-            sourceFrames: frameCount,
-            destination: encoderAudio,
-            destinationFrames: encoderFrameCount,
+            totalFrames: frameCount,
+            startFrame: 0,
+            sourceFrames: clampedFrames,
+            destination: encoderAudioBuffer,
             copyFrames: clampedFrames
         )
 
-        var encoderFeed: [String: Any] = [encoderAudioInputName: encoderAudio]
+        var encoderFeed: [String: Any] = [encoderAudioInputName: encoderAudioBuffer]
         if let lengthName = encoderLengthInputName {
-            let lengthType = Self.inputSpecs(model: encoder)[lengthName]?.dataType ?? .int32
-            let lengthArray = try Self.makeArray(shape: [1], dataType: lengthType)
-            try Self.setScalarInt(lengthArray, value: clampedFrames)
-            encoderFeed[lengthName] = lengthArray
+            if let lengthArray = encoderLengthBuffer {
+                try Self.setScalarInt(lengthArray, value: clampedFrames)
+                encoderFeed[lengthName] = lengthArray
+            } else if let lengthType = encoderLengthDataType {
+                let lengthArray = try Self.makeArray(shape: [1], dataType: lengthType)
+                try Self.setScalarInt(lengthArray, value: clampedFrames)
+                encoderFeed[lengthName] = lengthArray
+            }
         }
 
         let encoderProvider = try MLDictionaryFeatureProvider(dictionary: encoderFeed)
@@ -201,16 +244,20 @@ public final class ParakeetCoreMLRNNTTranscriptionModel: TranscriptionModel {
             return Self.decodePieces(from: emittedTokenIDs, vocab: vocab)
         }
 
-        let decoderEncoderInput = try Self.makeArray(
-            shape: Self.inputSpecs(model: decoder)[decoderEncoderInputName]?.shape ?? [1, 1024, decoderFrameCount],
-            dataType: .float32
+        try Self.fill(array: decoderEncoderBuffer, with: 0)
+        let copiedFrames = try Self.copyTensorWindowToDecoderInput(
+            source: encoderTensor,
+            sourceStartFrame: 0,
+            sourceFrameCount: steps,
+            destination: decoderEncoderBuffer
         )
-        try Self.fill(array: decoderEncoderInput, with: 0)
-        try Self.copyOverlapping(source: encoderTensor, destination: decoderEncoderInput)
+        if copiedFrames <= 0 {
+            return Self.decodePieces(from: emittedTokenIDs, vocab: vocab)
+        }
 
         let chunkTokenIDs = try decodeChunk(
-            decoderEncoderInput: decoderEncoderInput,
-            encoderSteps: steps
+            decoderEncoderInput: decoderEncoderBuffer,
+            encoderSteps: copiedFrames
         )
         emittedTokenIDs.append(contentsOf: chunkTokenIDs)
         return Self.decodePieces(from: emittedTokenIDs, vocab: vocab)
@@ -244,64 +291,70 @@ public final class ParakeetCoreMLRNNTTranscriptionModel: TranscriptionModel {
             let actualFrames = max(0, min(encoderFrameCount, totalFrames - inputStart))
             if actualFrames <= 0 { continue }
 
-            let encoderAudio = try Self.makeArray(shape: [1, config.melBins, encoderFrameCount], dataType: .float32)
-            try Self.fill(array: encoderAudio, with: 0)
+            try Self.fill(array: encoderAudioBuffer, with: 0)
             try Self.copyFeatureWindowToEncoderInput(
                 featureMatrix: featureMatrix,
                 melBins: config.melBins,
                 totalFrames: totalFrames,
                 startFrame: inputStart,
                 sourceFrames: actualFrames,
-                destination: encoderAudio,
+                destination: encoderAudioBuffer,
                 copyFrames: actualFrames
             )
 
-            var encoderFeed: [String: Any] = [encoderAudioInputName: encoderAudio]
+            var encoderFeed: [String: Any] = [encoderAudioInputName: encoderAudioBuffer]
             if let lengthName = encoderLengthInputName {
-                let lengthType = Self.inputSpecs(model: encoder)[lengthName]?.dataType ?? .int32
-                let lengthArray = try Self.makeArray(shape: [1], dataType: lengthType)
-                try Self.setScalarInt(lengthArray, value: actualFrames)
-                encoderFeed[lengthName] = lengthArray
+                if let lengthArray = encoderLengthBuffer {
+                    try Self.setScalarInt(lengthArray, value: actualFrames)
+                    encoderFeed[lengthName] = lengthArray
+                } else if let lengthType = encoderLengthDataType {
+                    let lengthArray = try Self.makeArray(shape: [1], dataType: lengthType)
+                    try Self.setScalarInt(lengthArray, value: actualFrames)
+                    encoderFeed[lengthName] = lengthArray
+                }
             }
 
             let encoderProvider = try MLDictionaryFeatureProvider(dictionary: encoderFeed)
             let encoderOutput = try encoder.prediction(from: encoderProvider)
             let (rawEncoderTensor, rawEncoderLength) = try Self.pickEncoderTensorAndLength(from: encoderOutput, debug: false)
-            var encoderTensor = rawEncoderTensor
-            var encoderSteps = max(0, min(rawEncoderLength ?? actualFrames, decoderFrameCount))
+            let rawSteps = max(0, min(rawEncoderLength ?? actualFrames, decoderFrameCount))
+            if rawSteps <= 0 { continue }
+            var sourceStartOut = 0
+            var sourceCopyFrames = rawSteps
 
-            if (leftCtx > 0 || rightCtx > 0), encoderSteps > 0, actualFrames > 0 {
+            if (leftCtx > 0 || rightCtx > 0), actualFrames > 0 {
                 let leftIn = centerStart - inputStart
                 let centerIn = min(hopFrames, totalFrames - centerStart)
-                let scale = Double(encoderSteps) / Double(actualFrames)
+                let scale = Double(rawSteps) / Double(actualFrames)
                 var leftOut = Int((Double(leftIn) * scale).rounded())
                 var centerOut = Int((Double(centerIn) * scale).rounded())
 
-                leftOut = max(0, min(leftOut, encoderSteps))
+                leftOut = max(0, min(leftOut, rawSteps))
                 centerOut = max(1, centerOut)
 
                 let endOut: Int
                 if centerStart + centerIn >= totalFrames {
-                    endOut = encoderSteps
+                    endOut = rawSteps
                 } else {
-                    endOut = max(leftOut, min(encoderSteps, leftOut + centerOut))
+                    endOut = max(leftOut, min(rawSteps, leftOut + centerOut))
                 }
-
-                encoderTensor = try Self.slice3DTensor(rawEncoderTensor, startFrame: leftOut, endFrame: endOut)
-                encoderSteps = max(0, endOut - leftOut)
+                sourceStartOut = leftOut
+                sourceCopyFrames = max(0, endOut - leftOut)
             }
 
+            if sourceCopyFrames <= 0 { continue }
+
+            try Self.fill(array: decoderEncoderBuffer, with: 0)
+            let encoderSteps = try Self.copyTensorWindowToDecoderInput(
+                source: rawEncoderTensor,
+                sourceStartFrame: sourceStartOut,
+                sourceFrameCount: sourceCopyFrames,
+                destination: decoderEncoderBuffer
+            )
             if encoderSteps <= 0 { continue }
 
-            let decoderEncoderInput = try Self.makeArray(
-                shape: Self.inputSpecs(model: decoder)[decoderEncoderInputName]?.shape ?? [1, 1024, decoderFrameCount],
-                dataType: .float32
-            )
-            try Self.fill(array: decoderEncoderInput, with: 0)
-            try Self.copyOverlapping(source: encoderTensor, destination: decoderEncoderInput)
-
             let chunkTokenIDs = try decodeChunk(
-                decoderEncoderInput: decoderEncoderInput,
+                decoderEncoderInput: decoderEncoderBuffer,
                 encoderSteps: encoderSteps
             )
             allTokenIDs.append(contentsOf: chunkTokenIDs)
@@ -321,18 +374,18 @@ public final class ParakeetCoreMLRNNTTranscriptionModel: TranscriptionModel {
     private func decodeChunk(decoderEncoderInput: MLMultiArray, encoderSteps: Int) throws -> [Int] {
         let targetInputName = "targets"
         let targetLengthName = "target_length"
-        guard Self.inputSpecs(model: decoder)[targetInputName] != nil else {
+        guard decoderInputSpecs[targetInputName] != nil else {
             throw ParakeetCoreMLRNNTError.missingRequiredInput(targetInputName)
         }
-        guard Self.inputSpecs(model: decoder)[targetLengthName] != nil else {
+        guard decoderInputSpecs[targetLengthName] != nil else {
             throw ParakeetCoreMLRNNTError.missingRequiredInput(targetLengthName)
         }
 
         let maxTokens = maxTokensForChunk(encoderSteps: encoderSteps)
         var tokenIDs: [Int] = []
         tokenIDs.reserveCapacity(min(maxTokens, encoderSteps * 4))
-        let targets = try Self.makeArray(shape: [1, 1], dataType: .int32)
-        let targetLength = try Self.makeArray(shape: [1], dataType: .int32)
+        let targets = decoderTargetsBuffer
+        let targetLength = decoderTargetLengthBuffer
         try Self.setScalarInt(targetLength, value: 1)
 
         var t = 0
@@ -558,6 +611,27 @@ private extension ParakeetCoreMLRNNTTranscriptionModel {
     }
 
     static func fill(array: MLMultiArray, with value: Float) throws {
+        if value == 0 {
+            let bytesPerElement: Int
+            switch array.dataType {
+            case .float16:
+                bytesPerElement = MemoryLayout<UInt16>.stride
+            case .float32:
+                bytesPerElement = MemoryLayout<Float>.stride
+            case .double:
+                bytesPerElement = MemoryLayout<Double>.stride
+            case .int32:
+                bytesPerElement = MemoryLayout<Int32>.stride
+            case .int8:
+                bytesPerElement = MemoryLayout<Int8>.stride
+            default:
+                bytesPerElement = 0
+            }
+            if bytesPerElement > 0 {
+                memset(array.dataPointer, 0, array.count * bytesPerElement)
+                return
+            }
+        }
         for idx in 0..<array.count {
             array.setFloatValue(value, flatIndex: idx)
         }
@@ -571,35 +645,6 @@ private extension ParakeetCoreMLRNNTTranscriptionModel {
             ptr[0] = Int32(value)
         default:
             array.setFloatValue(Float(value), flatIndex: 0)
-        }
-    }
-
-    static func copyFeatureMatrixToEncoderInput(
-        featureMatrix: [Float],
-        melBins: Int,
-        sourceFrames: Int,
-        destination: MLMultiArray,
-        destinationFrames: Int,
-        copyFrames: Int
-    ) throws {
-        guard destination.intShape.count == 3 else {
-            throw ParakeetCoreMLRNNTError.unsupportedArrayRank(destination.intShape.count)
-        }
-        let shape = destination.intShape
-        let batch = shape[0]
-        let features = shape[1]
-        let frames = shape[2]
-        guard batch >= 1, features >= melBins, frames >= destinationFrames else {
-            throw ParakeetCoreMLRNNTError.invalidModelIO("Encoder input shape mismatch.")
-        }
-        guard sourceFrames > 0 else { return }
-
-        for m in 0..<melBins {
-            for t in 0..<copyFrames {
-                let srcIdx = m * sourceFrames + t
-                let value = srcIdx < featureMatrix.count ? featureMatrix[srcIdx] : 0
-                destination.setFloatValue(value, indices: [0, m, t])
-            }
         }
     }
 
@@ -620,6 +665,28 @@ private extension ParakeetCoreMLRNNTTranscriptionModel {
             throw ParakeetCoreMLRNNTError.invalidModelIO("Encoder input shape mismatch.")
         }
         guard totalFrames > 0 else { return }
+        let strides = destination.intStrides
+        let dstMelStride = strides[1]
+        let dstFrameStride = strides[2]
+
+        if destination.dataType == .float32 {
+            let dst = destination.dataPointer.bindMemory(to: Float.self, capacity: destination.count)
+            for m in 0..<melBins {
+                let srcBase = m * totalFrames + startFrame
+                let dstBase = m * dstMelStride
+                if dstFrameStride == 1 {
+                    for t in 0..<copyFrames {
+                        dst[dstBase + t] = featureMatrix[srcBase + t]
+                    }
+                } else {
+                    for t in 0..<copyFrames {
+                        dst[dstBase + t * dstFrameStride] = featureMatrix[srcBase + t]
+                    }
+                }
+            }
+            return
+        }
+
         for m in 0..<melBins {
             let base = m * totalFrames
             for t in 0..<copyFrames {
@@ -679,32 +746,62 @@ private extension ParakeetCoreMLRNNTTranscriptionModel {
         return (tensor, length)
     }
 
-    static func copyOverlapping(source: MLMultiArray, destination: MLMultiArray) throws {
+    static func copyTensorWindowToDecoderInput(
+        source: MLMultiArray,
+        sourceStartFrame: Int,
+        sourceFrameCount: Int,
+        destination: MLMultiArray
+    ) throws -> Int {
         let srcShape = source.intShape
         let dstShape = destination.intShape
-        guard srcShape.count == dstShape.count else {
-            throw ParakeetCoreMLRNNTError.invalidModelIO("Cannot copy tensors with different ranks.")
+        guard srcShape.count == 3, dstShape.count == 3 else {
+            throw ParakeetCoreMLRNNTError.invalidModelIO("Expected rank-3 tensors for decoder copy.")
         }
-        let rank = srcShape.count
-        var indices = Array(repeating: 0, count: rank)
-
-        func recurse(_ dim: Int) {
-            if dim == rank {
-                let v = source.floatValue(indices: indices)
-                destination.setFloatValue(v, indices: indices)
-                return
-            }
-            let limit = min(srcShape[dim], dstShape[dim])
-            if limit <= 0 {
-                return
-            }
-            for i in 0..<limit {
-                indices[dim] = i
-                recurse(dim + 1)
-            }
+        let srcStart = max(0, min(sourceStartFrame, srcShape[2]))
+        let srcAvailable = max(0, srcShape[2] - srcStart)
+        let frames = max(0, min(sourceFrameCount, min(srcAvailable, dstShape[2])))
+        if frames == 0 {
+            return 0
         }
 
-        recurse(0)
+        let batch = min(srcShape[0], dstShape[0])
+        let channels = min(srcShape[1], dstShape[1])
+        if batch == 0 || channels == 0 {
+            return 0
+        }
+
+        if source.dataType == .float32, destination.dataType == .float32 {
+            let src = source.dataPointer.bindMemory(to: Float.self, capacity: source.count)
+            let dst = destination.dataPointer.bindMemory(to: Float.self, capacity: destination.count)
+            let srcStrides = source.intStrides
+            let dstStrides = destination.intStrides
+            for b in 0..<batch {
+                for c in 0..<channels {
+                    let srcBase = b * srcStrides[0] + c * srcStrides[1] + srcStart * srcStrides[2]
+                    let dstBase = b * dstStrides[0] + c * dstStrides[1]
+                    if srcStrides[2] == 1, dstStrides[2] == 1 {
+                        dst.advanced(by: dstBase).update(from: src.advanced(by: srcBase), count: frames)
+                    } else {
+                        for t in 0..<frames {
+                            dst[dstBase + t * dstStrides[2]] = src[srcBase + t * srcStrides[2]]
+                        }
+                    }
+                }
+            }
+            return frames
+        }
+
+        for b in 0..<batch {
+            for c in 0..<channels {
+                for t in 0..<frames {
+                    destination.setFloatValue(
+                        source.floatValue(indices: [b, c, srcStart + t]),
+                        indices: [b, c, t]
+                    )
+                }
+            }
+        }
+        return frames
     }
 
     static func slice3DTensor(_ source: MLMultiArray, startFrame: Int, endFrame: Int) throws -> MLMultiArray {
