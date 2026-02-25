@@ -61,6 +61,7 @@ public struct StreamingInferenceEngine<Model: TranscriptionModel, VAD: VoiceActi
                 )
             } else if previouslyInSpeech {
                 let state = textController.endSegment()
+                model.resetState()
                 events.append(
                     StreamingInferenceEvent(
                         transcript: state,

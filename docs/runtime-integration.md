@@ -1,6 +1,9 @@
 # Runtime Integration (CoreML -> Swift)
 
-This repo now includes a baseline CTC runtime path:
+This repo includes:
+
+- `CoreMLCTCTranscriptionModel`: baseline CTC adapter.
+- `ParakeetCoreMLRNNTTranscriptionModel`: native RNNT/TDT adapter for Parakeet v2 encoder+decoder CoreML packages.
 
 1. Export and inspect ONNX:
    - `scripts/export_nemo_to_onnx.py`
@@ -8,7 +11,7 @@ This repo now includes a baseline CTC runtime path:
 2. Convert/compress CoreML:
    - `scripts/convert_onnx_to_coreml.py`
    - `scripts/compress_coreml.py`
-3. Load model in Swift with `CoreMLCTCTranscriptionModel`.
+3. Load model in Swift with either `CoreMLCTCTranscriptionModel` (CTC) or `ParakeetCoreMLRNNTTranscriptionModel` (Parakeet RNNT/TDT).
 4. Drive chunked inference with `StreamingInferenceEngine`.
 
 ## Minimal Swift Wiring
@@ -38,6 +41,6 @@ var engine = StreamingInferenceEngine(model: model, vad: vad)
 
 ## Important
 
-- The included adapter is for CTC-style logits output.
-- Parakeet TDT/RNNT variants typically need additional decoder state management and custom post-processing.
-- Use `scripts/inspect_onnx.py` output to map real input/output names before wiring.
+- Parakeet adapter expects split CoreML packages (`encoder-model-*.mlpackage`, `decoder_joint-model-*.mlpackage`) and `vocab.txt`.
+- Streaming engine now resets RNNT decoder state on speech-segment flush (VAD silence transition).
+- Use `scripts/inspect_onnx.py` output to validate input/output names when changing exported models.

@@ -139,6 +139,25 @@ python scripts/benchmark_rnnt_components.py \
 swift test
 ```
 
+### 7b) Swift file transcription CLI (native CoreML RNNT/TDT)
+
+```bash
+swift run transcribe-cli \
+  --audio /path/to/audio.wav \
+  --model-dir artifacts/parakeet-tdt-0.6b-v2 \
+  --suffix odmbp-approx
+```
+
+If `--audio` is omitted, `transcribe-cli` falls back to the LocalAgreement text demo.
+
+### 7c) Minimal macOS mic app (SwiftUI)
+
+```bash
+swift run transcribe-macos
+```
+
+Set `PARAKEET_COREML_MODEL_DIR` (or enter it in the app UI) to point to your model artifacts directory.
+
 ### 8) Standardized WER benchmark (OpenBench datasets)
 
 ```bash
