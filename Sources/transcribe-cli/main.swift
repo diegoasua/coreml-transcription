@@ -5,6 +5,14 @@ struct CLIArgs {
     var audioPath: String?
     var modelDir: String?
     var modelSuffix: String = ProcessInfo.processInfo.environment["PARAKEET_COREML_MODEL_SUFFIX"] ?? "odmbp-approx"
+    var chunkSec: Double = Double(ProcessInfo.processInfo.environment["PARAKEET_CLI_CHUNK_SEC"] ?? "") ?? 3.0
+    var longformSegmentSec: Double = Double(ProcessInfo.processInfo.environment["PARAKEET_LONGFORM_SEGMENT_SEC"] ?? "") ?? 0.0
+    var longformOverlapSec: Double = Double(ProcessInfo.processInfo.environment["PARAKEET_LONGFORM_OVERLAP_SEC"] ?? "") ?? 0.0
+    var leftContextFrames: Int = Int(ProcessInfo.processInfo.environment["PARAKEET_ENCODER_LEFT_CONTEXT_FRAMES"] ?? "") ?? 300
+    var rightContextFrames: Int = Int(ProcessInfo.processInfo.environment["PARAKEET_ENCODER_RIGHT_CONTEXT_FRAMES"] ?? "") ?? 120
+    var allowRightContext: Bool = (ProcessInfo.processInfo.environment["PARAKEET_CLI_ALLOW_RIGHT_CONTEXT"] ?? "1") != "0"
+    var maxSymbolsPerStep: Int = Int(ProcessInfo.processInfo.environment["PARAKEET_RNNT_MAX_SYMBOLS_PER_STEP"] ?? "") ?? 10
+    var maxTokensPerChunk: Int = Int(ProcessInfo.processInfo.environment["PARAKEET_RNNT_MAX_TOKENS_PER_CHUNK"] ?? "") ?? 0
 }
 
 func parseArgs() -> CLIArgs {
@@ -26,6 +34,43 @@ func parseArgs() -> CLIArgs {
         case "--suffix":
             if i + 1 < argv.count {
                 args.modelSuffix = argv[i + 1]
+                i += 1
+            }
+        case "--chunk-sec":
+            if i + 1 < argv.count {
+                args.chunkSec = Double(argv[i + 1]) ?? args.chunkSec
+                i += 1
+            }
+        case "--longform-segment-sec":
+            if i + 1 < argv.count {
+                args.longformSegmentSec = Double(argv[i + 1]) ?? args.longformSegmentSec
+                i += 1
+            }
+        case "--longform-overlap-sec":
+            if i + 1 < argv.count {
+                args.longformOverlapSec = Double(argv[i + 1]) ?? args.longformOverlapSec
+                i += 1
+            }
+        case "--left-context-frames":
+            if i + 1 < argv.count {
+                args.leftContextFrames = Int(argv[i + 1]) ?? args.leftContextFrames
+                i += 1
+            }
+        case "--right-context-frames":
+            if i + 1 < argv.count {
+                args.rightContextFrames = Int(argv[i + 1]) ?? args.rightContextFrames
+                i += 1
+            }
+        case "--no-right-context":
+            args.allowRightContext = false
+        case "--max-symbols-per-step":
+            if i + 1 < argv.count {
+                args.maxSymbolsPerStep = Int(argv[i + 1]) ?? args.maxSymbolsPerStep
+                i += 1
+            }
+        case "--max-tokens-per-chunk":
+            if i + 1 < argv.count {
+                args.maxTokensPerChunk = Int(argv[i + 1]) ?? args.maxTokensPerChunk
                 i += 1
             }
         default:
@@ -170,6 +215,55 @@ func avResampleMonoFloat(_ samples: [Float], from sourceRate: Int, to targetRate
     return Array(UnsafeBufferPointer(start: dstData, count: outLen))
 }
 
+func mergeTextByOverlap(_ chunks: [String]) -> String {
+    var merged: [String] = []
+    for text in chunks {
+        let tokens = text.split(whereSeparator: \.isWhitespace).map(String.init)
+        if tokens.isEmpty { continue }
+        if merged.isEmpty {
+            merged.append(contentsOf: tokens)
+            continue
+        }
+        let maxOverlap = min(64, min(merged.count, tokens.count))
+        var overlap = 0
+        if maxOverlap > 0 {
+            for candidate in stride(from: maxOverlap, through: 1, by: -1) {
+                let lhs = Array(merged.suffix(candidate))
+                let rhs = Array(tokens.prefix(candidate))
+                if lhs == rhs {
+                    overlap = candidate
+                    break
+                }
+            }
+        }
+        merged.append(contentsOf: tokens.dropFirst(overlap))
+    }
+    return merged.joined(separator: " ")
+}
+
+func transcribeSamplesByChunks(
+    model: ParakeetCoreMLRNNTTranscriptionModel,
+    samples: [Float],
+    sampleRate: Int,
+    chunkSamples: Int,
+    progressPrefix: String
+) throws -> String {
+    if samples.isEmpty { return "" }
+    model.resetState()
+    var start = 0
+    var latest = ""
+    let totalChunks = max(1, Int(ceil(Double(samples.count) / Double(chunkSamples))))
+    var chunkIndex = 0
+    while start < samples.count {
+        let end = min(samples.count, start + chunkSamples)
+        chunkIndex += 1
+        logProgress("\(progressPrefix) chunk \(chunkIndex)/\(totalChunks)")
+        latest = try model.transcribeChunk(Array(samples[start..<end]), sampleRate: sampleRate)
+        start = end
+    }
+    return latest
+}
+
 func runAudioTranscription(args: CLIArgs) throws {
     guard let audioPath = args.audioPath else {
         runInteractiveDemo()
@@ -182,7 +276,11 @@ func runAudioTranscription(args: CLIArgs) throws {
     logProgress("loading models from \(modelDir.path) (suffix=\(args.modelSuffix))")
     let model = try ParakeetCoreMLRNNTTranscriptionModel(
         modelDirectory: modelDir,
-        modelSuffix: args.modelSuffix
+        modelSuffix: args.modelSuffix,
+        config: .init(
+            maxSymbolsPerStep: args.maxSymbolsPerStep,
+            maxTokensPerChunk: args.maxTokensPerChunk
+        )
     )
     logProgress("models loaded")
 
@@ -194,18 +292,48 @@ func runAudioTranscription(args: CLIArgs) throws {
     let audioSeconds = Double(samples.count) / Double(sampleRate)
     logProgress(String(format: "audio ready: %.2fs at %d Hz", audioSeconds, sampleRate))
 
-    let chunkSamples = sampleRate * 3
     let modelVar = model
-    var start = 0
-    var latest = ""
-    let totalChunks = max(1, Int(ceil(Double(samples.count) / Double(chunkSamples))))
-    var chunkIndex = 0
-    while start < samples.count {
-        let end = min(samples.count, start + chunkSamples)
-        chunkIndex += 1
-        logProgress("transcribing chunk \(chunkIndex)/\(totalChunks)")
-        latest = try modelVar.transcribeChunk(Array(samples[start..<end]), sampleRate: sampleRate)
-        start = end
+    let latest: String
+    if args.longformSegmentSec <= 0 {
+        logProgress("longform decode left=\(args.leftContextFrames) right=\(args.allowRightContext ? args.rightContextFrames : 0)")
+        latest = try modelVar.transcribeLongform(
+            samples,
+            sampleRate: sampleRate,
+            leftContextFrames: args.leftContextFrames,
+            rightContextFrames: args.rightContextFrames,
+            allowRightContext: args.allowRightContext
+        )
+    } else {
+        let segmentSamples = max(1, Int(round(args.longformSegmentSec * Double(sampleRate))))
+        var overlapSamples = max(0, Int(round(max(0, args.longformOverlapSec) * Double(sampleRate))))
+        if overlapSamples >= segmentSamples {
+            overlapSamples = max(0, segmentSamples / 4)
+        }
+        let stepSamples = max(1, segmentSamples - overlapSamples)
+
+        var chunkTexts: [String] = []
+        var segmentStart = 0
+        var segmentIndex = 0
+        let totalSegments = max(1, Int(ceil(Double(samples.count) / Double(stepSamples))))
+        while segmentStart < samples.count {
+            let end = min(samples.count, segmentStart + segmentSamples)
+            segmentIndex += 1
+            logProgress("segment \(segmentIndex)/\(totalSegments) [\(segmentStart):\(end)]")
+            let segmentAudio = Array(samples[segmentStart..<end])
+            let segmentText = try modelVar.transcribeLongform(
+                segmentAudio,
+                sampleRate: sampleRate,
+                leftContextFrames: args.leftContextFrames,
+                rightContextFrames: args.rightContextFrames,
+                allowRightContext: args.allowRightContext
+            )
+            if !segmentText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                chunkTexts.append(segmentText)
+            }
+            if end >= samples.count { break }
+            segmentStart += stepSamples
+        }
+        latest = mergeTextByOverlap(chunkTexts)
     }
 
     let elapsed = Date().timeIntervalSince(startTime)
