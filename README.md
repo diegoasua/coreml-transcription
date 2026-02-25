@@ -177,6 +177,12 @@ Outputs are written to:
 - `artifacts/hf-asr-eval/<run-name>/summary.json`
 - `artifacts/hf-asr-eval/<run-name>/predictions.jsonl`
 
+FP16 long-form tuning sweep (context + max-symbols):
+
+```bash
+bash scripts/run_hf_earnings22_fp16_tuning.sh
+```
+
 ### 9) Native OpenBench run (custom local pipeline)
 
 If you cloned OpenBench at `external/OpenBench`, run this from repo root:
@@ -355,6 +361,19 @@ source configs/parakeet-coreml-decoder-longform-context.env
 
 This sets `PARAKEET_ENCODER_LEFT_CONTEXT_FRAMES` (default in that profile: `240`)
 to preserve encoder context across chunk boundaries.
+
+Bidirectional context variant:
+
+```bash
+source configs/parakeet-coreml-decoder-longform-context-bidir.env
+```
+
+This sets `PARAKEET_ENCODER_LEFT_CONTEXT_FRAMES=240` and
+`PARAKEET_ENCODER_RIGHT_CONTEXT_FRAMES=120`.
+
+Note:
+- `transcribe_file(...)` (offline) uses configured right-context.
+- `stream_transcribe_file(...)` is causal by default (`PARAKEET_STREAM_ALLOW_RIGHT_CONTEXT=0`).
 
 Optional: include AMI SDM in the same matrix:
 

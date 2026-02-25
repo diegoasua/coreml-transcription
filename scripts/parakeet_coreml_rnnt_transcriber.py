@@ -204,6 +204,10 @@ class ParakeetCoreMLRNNT:
             0,
             int(os.environ.get("PARAKEET_ENCODER_LEFT_CONTEXT_FRAMES", "0")),
         )
+        self.encoder_right_context_frames = max(
+            0,
+            int(os.environ.get("PARAKEET_ENCODER_RIGHT_CONTEXT_FRAMES", "0")),
+        )
 
         self._zero_duration_idx: int | None = None
         self._min_non_zero_duration_idx: int | None = None
@@ -681,7 +685,7 @@ class ParakeetCoreMLRNNT:
             return self._decode_chunk_beam(decoder_encoder_input, enc_steps, state1, state2, prev_token)
         return self._decode_chunk_greedy(decoder_encoder_input, enc_steps, state1, state2, prev_token)
 
-    def _transcribe_features(self, features: np.ndarray) -> str:
+    def _transcribe_features(self, features: np.ndarray, allow_right_context: bool = True) -> str:
         total_frames = int(features.shape[-1])
         if total_frames <= 0:
             return ""
@@ -692,12 +696,15 @@ class ParakeetCoreMLRNNT:
         state2 = np.zeros(state2_shape, dtype=np.float32)
         prev_token = self.blank_id
 
-        left_ctx = min(self.encoder_left_context_frames, max(0, self._encoder_frame_count - 1))
-        hop_frames = max(1, self._encoder_frame_count - left_ctx)
+        max_context_total = max(0, self._encoder_frame_count - 1)
+        left_ctx = min(self.encoder_left_context_frames, max_context_total)
+        configured_right_ctx = self.encoder_right_context_frames if allow_right_context else 0
+        right_ctx = min(configured_right_ctx, max(0, max_context_total - left_ctx))
+        hop_frames = max(1, self._encoder_frame_count - left_ctx - right_ctx)
 
         all_tokens: list[int] = []
         for center_start in range(0, total_frames, hop_frames):
-            # Optional left context to reduce encoder boundary loss on long-form audio.
+            # Optional left/right context to reduce encoder boundary loss on long-form audio.
             input_start = max(0, center_start - left_ctx)
             feat_chunk, actual_frames = self._slice_or_pad_features(features, input_start)
             if actual_frames <= 0:
@@ -713,8 +720,8 @@ class ParakeetCoreMLRNNT:
             if encoder_len is None:
                 encoder_len = int(encoder_tensor.shape[-1])
 
-            # Decode only the non-overlapping center span; keep left context as encoder-only context.
-            if left_ctx > 0 and encoder_len > 0 and actual_frames > 0:
+            # Decode only the non-overlapping center span; keep context as encoder-only context.
+            if (left_ctx > 0 or right_ctx > 0) and encoder_len > 0 and actual_frames > 0:
                 left_in = center_start - input_start
                 center_in = min(hop_frames, total_frames - center_start)
 
@@ -753,7 +760,7 @@ class ParakeetCoreMLRNNT:
         overlap_sec = float(os.environ.get("PARAKEET_LONGFORM_OVERLAP_SEC", "0"))
         if segment_sec <= 0:
             features = self._extract_features_prepared(prepared_audio)
-            return self._transcribe_features(features)
+            return self._transcribe_features(features, allow_right_context=True)
 
         segment_samples = max(1, int(round(segment_sec * self.sample_rate)))
         overlap_samples = int(round(max(0.0, overlap_sec) * self.sample_rate))
@@ -768,7 +775,7 @@ class ParakeetCoreMLRNNT:
             end = min(total, start + segment_samples)
             segment_audio = prepared_audio[start:end]
             features = self._extract_features_prepared(segment_audio)
-            chunk_text = self._transcribe_features(features)
+            chunk_text = self._transcribe_features(features, allow_right_context=True)
             if chunk_text:
                 chunk_texts.append(chunk_text)
             if end >= total:
@@ -817,6 +824,7 @@ class ParakeetCoreMLRNNT:
         frame_hop_sec = 0.01
         step_frames = max(1, int(round(stream_step_sec / frame_hop_sec)))
         total_audio_sec = float(total_frames * frame_hop_sec)
+        allow_right_ctx_stream = os.environ.get("PARAKEET_STREAM_ALLOW_RIGHT_CONTEXT", "0") == "1"
 
         interim_results: list[str] = []
         audio_cursor: list[float] = []
@@ -829,7 +837,8 @@ class ParakeetCoreMLRNNT:
         while end_frame < total_frames:
             end_frame = min(total_frames, end_frame + step_frames)
             prefix_features = features[:, :, :end_frame]
-            hypothesis_text = self._transcribe_features(prefix_features)
+            # Streaming path stays causal by default (no right-context lookahead).
+            hypothesis_text = self._transcribe_features(prefix_features, allow_right_context=allow_right_ctx_stream)
             hypothesis_tokens = hypothesis_text.split()
             rolling_hypotheses.append(hypothesis_tokens)
             if len(rolling_hypotheses) > agreement_window:
@@ -854,7 +863,11 @@ class ParakeetCoreMLRNNT:
                 confirmed_interim_results.append(candidate_text)
                 confirmed_audio_cursor.append(cursor_sec)
 
-        final_text = interim_results[-1] if interim_results else self._transcribe_features(features)
+        final_text = (
+            interim_results[-1]
+            if interim_results
+            else self._transcribe_features(features, allow_right_context=allow_right_ctx_stream)
+        )
         if final_text:
             if not confirmed_interim_results or confirmed_interim_results[-1] != final_text:
                 confirmed_interim_results.append(final_text)
