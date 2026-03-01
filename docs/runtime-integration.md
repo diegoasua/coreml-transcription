@@ -3,7 +3,7 @@
 This repo includes:
 
 - `CoreMLCTCTranscriptionModel`: baseline CTC adapter.
-- `ParakeetCoreMLRNNTTranscriptionModel`: native RNNT/TDT adapter for Parakeet v2 encoder+decoder CoreML packages.
+- `ParakeetCoreMLTDTTranscriptionModel`: native TDT adapter for Parakeet v2 encoder+decoder CoreML packages.
 
 1. Export and inspect ONNX:
    - `scripts/export_nemo_to_onnx.py`
@@ -11,7 +11,7 @@ This repo includes:
 2. Convert/compress CoreML:
    - `scripts/convert_onnx_to_coreml.py`
    - `scripts/compress_coreml.py`
-3. Load model in Swift with either `CoreMLCTCTranscriptionModel` (CTC) or `ParakeetCoreMLRNNTTranscriptionModel` (Parakeet RNNT/TDT).
+3. Load model in Swift with either `CoreMLCTCTranscriptionModel` (CTC) or `ParakeetCoreMLTDTTranscriptionModel` (Parakeet TDT).
 4. Drive chunked inference with `StreamingInferenceEngine`.
 
 ## Minimal Swift Wiring
@@ -42,5 +42,25 @@ var engine = StreamingInferenceEngine(model: model, vad: vad)
 ## Important
 
 - Parakeet adapter expects split CoreML packages (`encoder-model-*.mlpackage`, `decoder_joint-model-*.mlpackage`) and `vocab.txt`.
-- Streaming engine now resets RNNT decoder state on speech-segment flush (VAD silence transition).
+- Streaming engine supports both policies:
+  - `flushOnSpeechEnd=true`: reset on VAD speech->silence transitions.
+  - `flushOnSpeechEnd=false` (current low-latency default): preserve decoder/model state across short pauses.
 - Use `scripts/inspect_onnx.py` output to validate input/output names when changing exported models.
+
+## Realtime Defaults (Current)
+
+The current low-latency profile used by `transcribe-macos` and realtime bench:
+
+- `chunk=160ms`, `hop=80ms`
+- `decodeOnlyWhenSpeech=true`
+- `flushOnSpeechEnd=false`
+- `VAD start=-50 dBFS`, `VAD end=-58 dBFS`
+- `maxSymbolsPerStep=4`, `maxTokensPerChunk=64`
+
+Run realtime bench:
+
+```bash
+AUDIO_PATH=/path/to/audio.wav \
+RUN_NAME=rt-bench \
+bash scripts/run_realtime_bench_cli.sh
+```

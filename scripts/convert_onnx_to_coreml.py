@@ -9,15 +9,19 @@ from pathlib import Path
 
 def _resolve_target(ct, raw_target: str):
     target_map = {
-        "ios17": ct.target.iOS17,
-        "ios18": getattr(ct.target, "iOS18", ct.target.iOS17),
-        "macos14": ct.target.macOS14,
-        "macos15": getattr(ct.target, "macOS15", ct.target.macOS14),
+        "ios18": getattr(ct.target, "iOS18", None),
+        "macos15": getattr(ct.target, "macOS15", None),
     }
     key = raw_target.lower()
     if key not in target_map:
         raise ValueError(f"Unsupported target '{raw_target}'. Use one of: {', '.join(target_map)}")
-    return target_map[key]
+    resolved = target_map[key]
+    if resolved is None:
+        raise ValueError(
+            f"Target '{raw_target}' is unavailable in this coremltools build. "
+            "Use coremltools 8+/9+ with iOS18/macOS15 support."
+        )
+    return resolved
 
 
 def _resolve_compute_units(ct, raw_units: str):
@@ -88,8 +92,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True, help="Output .mlpackage or .mlmodel path.")
     parser.add_argument(
         "--target",
-        default="macos14",
-        help="Deployment target: ios17, ios18, macos14, macos15",
+        default="macos15",
+        help="Deployment target: ios18, macos15",
     )
     parser.add_argument(
         "--compute-units",

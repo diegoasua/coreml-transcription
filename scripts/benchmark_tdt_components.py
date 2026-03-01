@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark RNNT component latency (encoder + decoder loop) for CoreML models."""
+"""Benchmark TDT component latency (encoder + decoder loop) for CoreML models."""
 
 from __future__ import annotations
 
@@ -364,7 +364,7 @@ def run_benchmark(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Benchmark RNNT CoreML encoder+decoder components.")
+    parser = argparse.ArgumentParser(description="Benchmark TDT CoreML encoder+decoder components.")
     parser.add_argument("--encoder-model", type=Path, required=True)
     parser.add_argument("--encoder-manifest", type=Path, required=True)
     parser.add_argument("--decoder-model", type=Path, required=True)

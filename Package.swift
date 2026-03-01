@@ -1,11 +1,11 @@
-// swift-tools-version: 5.10
+// swift-tools-version: 6.0
 import PackageDescription
 
 let package = Package(
     name: "coreml-transcription",
     platforms: [
-        .macOS(.v13),
-        .iOS(.v17),
+        .macOS("26.0"),
+        .iOS("26.0"),
     ],
     products: [
         .library(
@@ -21,6 +21,7 @@ let package = Package(
             targets: ["transcribe-macos"]
         ),
     ],
+    dependencies: [],
     targets: [
         .target(
             name: "RealtimeTranscriptionCore"
@@ -37,5 +38,6 @@ let package = Package(
             name: "RealtimeTranscriptionCoreTests",
             dependencies: ["RealtimeTranscriptionCore"]
         ),
-    ]
+    ],
+    swiftLanguageModes: [.v6]
 )

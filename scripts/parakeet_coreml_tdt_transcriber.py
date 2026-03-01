@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Local Parakeet v2 CoreML RNNT/TDT transcriber.
+"""Local Parakeet v2 CoreML TDT transcriber.
 
 Exports:
   transcribe_file(audio_path, language=None, keywords=None) -> str
   stream_transcribe_file(audio_path, language=None, keywords=None) -> dict
 
 Can also run as CLI:
-  python scripts/parakeet_coreml_rnnt_transcriber.py --audio path.wav
+  python scripts/parakeet_coreml_tdt_transcriber.py --audio path.wav
 """
 
 from __future__ import annotations
@@ -137,7 +137,7 @@ def _get_input_specs(model) -> list[_InputSpec]:
     return specs
 
 
-class ParakeetCoreMLRNNT:
+class ParakeetCoreMLTDT:
     def __init__(
         self,
         model_dir: Path,
@@ -182,7 +182,7 @@ class ParakeetCoreMLRNNT:
         self.encoder_inputs_by_name = {s.name: s for s in self.encoder_input_specs}
         self.decoder_inputs_by_name = {s.name: s for s in self.decoder_input_specs}
 
-        # RNNT setup: vocab + blank (+ duration bins in TDT head)
+        # TDT setup: vocab + blank (+ duration bins in TDT head)
         self.blank_id = len(self.vocab)
         durations_env = os.environ.get("PARAKEET_TDT_DURATIONS", "").strip()
         if durations_env:
@@ -193,13 +193,13 @@ class ParakeetCoreMLRNNT:
         else:
             self.duration_values = [0, 1, 2, 3, 4]
 
-        self.max_symbols_per_step = max(1, int(os.environ.get("PARAKEET_RNNT_MAX_SYMBOLS_PER_STEP", "10")))
-        self.beam_width = max(1, int(os.environ.get("PARAKEET_RNNT_BEAM_WIDTH", "1")))
+        self.max_symbols_per_step = max(1, int(os.environ.get("PARAKEET_TDT_MAX_SYMBOLS_PER_STEP", "10")))
+        self.beam_width = max(1, int(os.environ.get("PARAKEET_TDT_BEAM_WIDTH", "1")))
         self.duration_beam_width = max(
             1,
-            int(os.environ.get("PARAKEET_RNNT_DURATION_BEAM_WIDTH", str(self.beam_width))),
+            int(os.environ.get("PARAKEET_TDT_DURATION_BEAM_WIDTH", str(self.beam_width))),
         )
-        self.max_tokens_per_chunk = max(0, int(os.environ.get("PARAKEET_RNNT_MAX_TOKENS_PER_CHUNK", "0")))
+        self.max_tokens_per_chunk = max(0, int(os.environ.get("PARAKEET_TDT_MAX_TOKENS_PER_CHUNK", "0")))
         self.encoder_left_context_frames = max(
             0,
             int(os.environ.get("PARAKEET_ENCODER_LEFT_CONTEXT_FRAMES", "0")),
@@ -884,7 +884,7 @@ class ParakeetCoreMLRNNT:
         }
 
 
-_ENGINE: ParakeetCoreMLRNNT | None = None
+_ENGINE: ParakeetCoreMLTDT | None = None
 
 
 def _resolve_model_dir() -> Path:
@@ -902,12 +902,12 @@ def _resolve_model_names() -> tuple[str, str]:
     return encoder_name, decoder_name
 
 
-def _get_engine() -> ParakeetCoreMLRNNT:
+def _get_engine() -> ParakeetCoreMLTDT:
     global _ENGINE
     if _ENGINE is None:
         model_dir = _resolve_model_dir()
         encoder_name, decoder_name = _resolve_model_names()
-        _ENGINE = ParakeetCoreMLRNNT(
+        _ENGINE = ParakeetCoreMLTDT(
             model_dir=model_dir,
             encoder_model_name=encoder_name,
             decoder_model_name=decoder_name,
@@ -947,7 +947,7 @@ def warmup() -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Parakeet CoreML RNNT/TDT transcriber.")
+    parser = argparse.ArgumentParser(description="Parakeet CoreML TDT transcriber.")
     parser.add_argument("--audio", type=Path, required=True, help="Audio path")
     args = parser.parse_args()
     print(transcribe_file(str(args.audio)))

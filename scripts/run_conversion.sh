@@ -3,7 +3,7 @@ set -euo pipefail
 
 MODEL_NAME="${1:-nvidia/parakeet-tdt-0.6b-v2}"
 ARTIFACT_DIR="${2:-artifacts/parakeet-tdt-0.6b-v2}"
-TARGET="${3:-macos14}"
+TARGET="${3:-macos15}"
 SKIP_EXPORT="${SKIP_EXPORT:-0}"
 EXPORT_FORMATS="${EXPORT_FORMATS:-onnx,ts}"
 if [[ -z "${PYTHON_BIN:-}" ]]; then
@@ -259,8 +259,8 @@ if [[ -n "${encoder_candidate}" && -n "${decoder_candidate}" ]]; then
   decoder_manifest="${ARTIFACT_DIR}/${decoder_base}-manifest.json"
 
   if [[ -f "${encoder_manifest}" && -f "${decoder_manifest}" ]]; then
-    echo "  - benchmark RNNT components"
-    if "${PYTHON_BIN}" scripts/benchmark_rnnt_components.py \
+    echo "  - benchmark TDT components"
+    if "${PYTHON_BIN}" scripts/benchmark_tdt_components.py \
       --encoder-model "${encoder_candidate}" \
       --encoder-manifest "${encoder_manifest}" \
       --decoder-model "${decoder_candidate}" \
@@ -271,10 +271,10 @@ if [[ -n "${encoder_candidate}" && -n "${decoder_candidate}" ]]; then
       --compute-units cpu_and_ne; then
       :
     else
-      echo "  - warning: RNNT component benchmark failed"
+      echo "  - warning: TDT component benchmark failed"
     fi
   else
-    echo "  - warning: missing encoder/decoder manifests for RNNT benchmark"
+    echo "  - warning: missing encoder/decoder manifests for TDT benchmark"
   fi
 else
   echo "  - fallback: encoder-only benchmark"

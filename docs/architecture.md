@@ -24,7 +24,7 @@
 2. Inspect ONNX input/output signatures.
 3. Convert TorchScript -> CoreML (`scripts/convert_torchscript_to_coreml.py`) using ONNX manifests for shapes.
 4. Run compression experiments (`scripts/compress_coreml.py`).
-5. Measure component latency + RTF estimate (`scripts/benchmark_rnnt_components.py`) and WER (`scripts/benchmark_transcripts.py`, `scripts/eval_openbench_dataset.py`, or OpenBench-native `scripts/run_openbench_custom_transcription.py`).
+5. Measure component latency + RTF estimate (`scripts/benchmark_tdt_components.py`) and WER (`scripts/benchmark_transcripts.py`, `scripts/eval_openbench_dataset.py`, or OpenBench-native `scripts/run_openbench_custom_transcription.py`).
 
 ## Streaming Track
 

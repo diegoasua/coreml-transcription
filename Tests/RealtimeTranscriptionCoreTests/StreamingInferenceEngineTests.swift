@@ -31,6 +31,95 @@ final class StreamingInferenceEngineTests: XCTestCase {
         XCTAssertEqual(events[2].transcript.confirmed, "hello world")
         XCTAssertEqual(events[2].transcript.hypothesis, "")
     }
+
+    func testDecodeEvenWhenVADSaysNonSpeechWhenConfigured() throws {
+        let model = MockModel(outputs: ["alpha", "alpha beta", "alpha beta gamma"])
+        let vad = MockVAD(decisions: [false, false, false], energyDBFS: -60)
+        var engine = StreamingInferenceEngine(
+            model: model,
+            vad: vad,
+            policy: .init(sampleRate: 1000, chunkMs: 100, hopMs: 100),
+            requiredAgreementCount: 2,
+            decodeOnlyWhenSpeech: false,
+            ringBufferCapacity: 400
+        )
+
+        let samples = Array(repeating: Float(0.1), count: 300)
+        let events = try engine.process(samples: samples)
+
+        XCTAssertEqual(events.count, 3)
+        XCTAssertFalse(events[0].isSpeech)
+        XCTAssertFalse(events[1].isSpeech)
+        XCTAssertFalse(events[2].isSpeech)
+        XCTAssertFalse(events[0].didFlushSegment)
+        XCTAssertFalse(events[1].didFlushSegment)
+        XCTAssertFalse(events[2].didFlushSegment)
+        XCTAssertEqual(events[0].transcript.confirmed, "")
+        XCTAssertEqual(events[0].transcript.hypothesis, "alpha")
+        XCTAssertEqual(events[1].transcript.confirmed, "alpha")
+        XCTAssertEqual(events[1].transcript.hypothesis, "beta")
+    }
+
+    func testForceFlushOnStagnantSpeech() throws {
+        let model = MockModel(outputs: ["hello", "hello", "hello", "hello", "hello"])
+        let vad = MockVAD(decisions: [true, true, true, true, true], energyDBFS: -20)
+        var engine = StreamingInferenceEngine(
+            model: model,
+            vad: vad,
+            policy: .init(sampleRate: 1000, chunkMs: 100, hopMs: 100),
+            requiredAgreementCount: 2,
+            decodeOnlyWhenSpeech: true,
+            maxSpeechChunkRunBeforeReset: nil,
+            maxStagnantSpeechChunks: 1,
+            ringBufferCapacity: 600
+        )
+
+        let samples = Array(repeating: Float(0.1), count: 500)
+        let events = try engine.process(samples: samples)
+
+        XCTAssertTrue(events.contains(where: { $0.didFlushSegment }))
+    }
+
+    func testNoSilenceDrivenFlushWhenAlwaysDecodeMode() throws {
+        let model = MockModel(outputs: ["mm", "mm", "mm", "mm"])
+        let vad = MockVAD(decisions: [true, false, false, false], energyDBFS: -55)
+        var engine = StreamingInferenceEngine(
+            model: model,
+            vad: vad,
+            policy: .init(sampleRate: 1000, chunkMs: 100, hopMs: 100),
+            requiredAgreementCount: 1,
+            decodeOnlyWhenSpeech: false,
+            flushOnSpeechEnd: false,
+            maxSpeechChunkRunBeforeReset: nil,
+            maxStagnantSpeechChunks: 1,
+            ringBufferCapacity: 500
+        )
+
+        let samples = Array(repeating: Float(0.1), count: 400)
+        let events = try engine.process(samples: samples)
+
+        XCTAssertEqual(events.filter(\.didFlushSegment).count, 0)
+        XCTAssertEqual(events.count, 4)
+    }
+
+    func testDecodesHopSliceWhenChunkOverlaps() throws {
+        let model = RecordingModel()
+        let vad = MockVAD(decisions: Array(repeating: true, count: 16), energyDBFS: -20)
+        var engine = StreamingInferenceEngine(
+            model: model,
+            vad: vad,
+            policy: .init(sampleRate: 1000, chunkMs: 100, hopMs: 50),
+            requiredAgreementCount: 1,
+            decodeOnlyWhenSpeech: true,
+            ringBufferCapacity: 800
+        )
+
+        let samples = Array(repeating: Float(0.1), count: 400)
+        _ = try engine.process(samples: samples)
+
+        XCTAssertFalse(model.seenCounts.isEmpty)
+        XCTAssertTrue(model.seenCounts.allSatisfy { $0 == 50 })
+    }
 }
 
 private struct MockModel: TranscriptionModel {
@@ -73,4 +162,15 @@ private struct MockVAD: VoiceActivityDetecting {
     mutating func reset() {
         index = 0
     }
+}
+
+private final class RecordingModel: TranscriptionModel {
+    private(set) var seenCounts: [Int] = []
+
+    func transcribeChunk(_ samples: [Float], sampleRate: Int) throws -> String {
+        seenCounts.append(samples.count)
+        return "x"
+    }
+
+    func resetState() {}
 }

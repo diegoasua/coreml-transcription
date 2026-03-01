@@ -1,8 +1,56 @@
 import SwiftUI
-import AVFoundation
+@preconcurrency import AVFoundation
 import RealtimeTranscriptionCore
 #if canImport(AppKit)
 import AppKit
+#endif
+#if canImport(CoreAudio)
+import CoreAudio
+#endif
+
+private final class ConversionInputState: @unchecked Sendable {
+    var consumed = false
+}
+
+#if canImport(CoreAudio)
+private func defaultInputDeviceName() -> String? {
+    var deviceID = AudioDeviceID(0)
+    var address = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultInputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+    let status = AudioObjectGetPropertyData(
+        AudioObjectID(kAudioObjectSystemObject),
+        &address,
+        0,
+        nil,
+        &size,
+        &deviceID
+    )
+    guard status == noErr, deviceID != 0 else { return nil }
+
+    var nameAddress = AudioObjectPropertyAddress(
+        mSelector: kAudioObjectPropertyName,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var cfName: Unmanaged<CFString>?
+    var nameSize = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+    let nameStatus = AudioObjectGetPropertyData(
+        deviceID,
+        &nameAddress,
+        0,
+        nil,
+        &nameSize,
+        &cfName
+    )
+    guard nameStatus == noErr, let cfName else { return nil }
+    return cfName.takeUnretainedValue() as String
+}
+#else
+private func defaultInputDeviceName() -> String? { nil }
 #endif
 
 private func parakeetModelDirectoryCandidates() -> [URL] {
@@ -110,6 +158,9 @@ struct ContentView: View {
             Text("Status: \(vm.status)")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
+            Text("Metrics: \(vm.metrics)")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
 
             GroupBox("Confirmed") {
                 ScrollView {
@@ -137,41 +188,88 @@ struct ContentView: View {
     }
 }
 
-final class MicTranscriptionViewModel: ObservableObject {
+final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
     @Published var confirmedText: String = ""
     @Published var hypothesisText: String = ""
     @Published var status: String = "Idle"
+    @Published var metrics: String = "RTFx(inf/wall)=0.0/0.0 | first-token=n/a"
     @Published var isRunning: Bool = false
     @Published var isStarting: Bool = false
     @Published var modelDirectory: String = defaultParakeetModelDirectoryPath()
     @Published var modelSuffix: String = ProcessInfo.processInfo.environment["PARAKEET_COREML_MODEL_SUFFIX"] ?? "odmbp-approx"
 
-    private typealias InferenceEngine = StreamingInferenceEngine<ParakeetCoreMLRNNTTranscriptionModel, EnergyVAD>
+    private typealias InferenceEngine = StreamingInferenceEngine<ParakeetCoreMLTDTTranscriptionModel, EnergyVAD>
     private var inferenceEngine: InferenceEngine?
 
     private let queue = DispatchQueue(label: "transcribe.macos.inference")
+    private let startupQueue = DispatchQueue(label: "transcribe.macos.startup", qos: .userInitiated)
     private let audioEngine = AVAudioEngine()
     private var audioConverter: AVAudioConverter?
     private let targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16_000, channels: 1, interleaved: false)!
-    private let chunkMs = Int(ProcessInfo.processInfo.environment["PARAKEET_STREAM_CHUNK_MS"] ?? "") ?? 960
-    private let hopMs = Int(ProcessInfo.processInfo.environment["PARAKEET_STREAM_HOP_MS"] ?? "") ?? 960
+    private let chunkMs = Int(ProcessInfo.processInfo.environment["PARAKEET_STREAM_CHUNK_MS"] ?? "") ?? 160
+    private let hopMs = Int(ProcessInfo.processInfo.environment["PARAKEET_STREAM_HOP_MS"] ?? "") ?? 80
     private let agreementCount = Int(ProcessInfo.processInfo.environment["PARAKEET_STREAM_AGREEMENT"] ?? "") ?? 2
-    private let maxSymbolsPerStep = Int(ProcessInfo.processInfo.environment["PARAKEET_RNNT_MAX_SYMBOLS_PER_STEP"] ?? "") ?? 10
-    private let maxTokensPerChunk = Int(ProcessInfo.processInfo.environment["PARAKEET_RNNT_MAX_TOKENS_PER_CHUNK"] ?? "") ?? 0
-    private let vadStartThresholdDBFS = Float(ProcessInfo.processInfo.environment["PARAKEET_VAD_START_DBFS"] ?? "") ?? -42
-    private let vadEndThresholdDBFS = Float(ProcessInfo.processInfo.environment["PARAKEET_VAD_END_DBFS"] ?? "") ?? -52
-    private let vadMinSpeechMs = Int(ProcessInfo.processInfo.environment["PARAKEET_VAD_MIN_SPEECH_MS"] ?? "") ?? 120
-    private let vadMinSilenceMs = Int(ProcessInfo.processInfo.environment["PARAKEET_VAD_MIN_SILENCE_MS"] ?? "") ?? 800
+    private let decodeOnlyWhenSpeech = (ProcessInfo.processInfo.environment["PARAKEET_DECODE_ONLY_WHEN_SPEECH"] ?? "1") != "0"
+    private let flushOnSpeechEnd: Bool = {
+        let env = ProcessInfo.processInfo.environment
+        if let explicit = env["PARAKEET_STREAM_FLUSH_ON_SPEECH_END"], !explicit.isEmpty {
+            return explicit != "0"
+        }
+        // Default low-latency mode: keep decoder/model state across silence
+        // boundaries unless explicitly requested otherwise.
+        return false
+    }()
+    private let maxSpeechChunkRunBeforeReset = Int(ProcessInfo.processInfo.environment["PARAKEET_STREAM_MAX_SPEECH_CHUNKS"] ?? "") ?? 240
+    private let maxStagnantSpeechChunks = Int(ProcessInfo.processInfo.environment["PARAKEET_STREAM_MAX_STAGNANT_CHUNKS"] ?? "") ?? 24
+    private let maxSymbolsPerStep = Int(ProcessInfo.processInfo.environment["PARAKEET_TDT_MAX_SYMBOLS_PER_STEP"] ?? "") ?? 4
+    private let maxTokensPerChunk = Int(ProcessInfo.processInfo.environment["PARAKEET_TDT_MAX_TOKENS_PER_CHUNK"] ?? "") ?? 64
+    private let streamingHistoryFrames = Int(ProcessInfo.processInfo.environment["PARAKEET_STREAM_HISTORY_FRAMES"] ?? "") ?? 300
+    private let streamingMinTailDecodeFrames = Int(ProcessInfo.processInfo.environment["PARAKEET_STREAM_MIN_TAIL_FRAMES"] ?? "") ?? 8
+    private let vadStartThresholdDBFS = Float(ProcessInfo.processInfo.environment["PARAKEET_VAD_START_DBFS"] ?? "") ?? -50
+    private let vadEndThresholdDBFS = Float(ProcessInfo.processInfo.environment["PARAKEET_VAD_END_DBFS"] ?? "") ?? -58
+    private let vadMinSpeechMs = Int(ProcessInfo.processInfo.environment["PARAKEET_VAD_MIN_SPEECH_MS"] ?? "") ?? 60
+    private let vadMinSilenceMs = Int(ProcessInfo.processInfo.environment["PARAKEET_VAD_MIN_SILENCE_MS"] ?? "") ?? 400
+    private let enableVoiceProcessing = (ProcessInfo.processInfo.environment["PARAKEET_AUDIO_VOICE_PROCESSING"] ?? "1") != "0"
+    private let enableVoiceProcessingAGC = (ProcessInfo.processInfo.environment["PARAKEET_AUDIO_VOICE_PROCESSING_AGC"] ?? "1") != "0"
     private let pendingLock = NSLock()
     private var pendingSamples: [Float] = []
     private var processingScheduled = false
-    private let maxBufferedSamples = (Int(ProcessInfo.processInfo.environment["PARAKEET_STREAM_MAX_BUFFER_SEC"] ?? "") ?? 0) * 16_000
-    private let maxProcessingBatchSamples = (Int(ProcessInfo.processInfo.environment["PARAKEET_STREAM_MAX_BATCH_SEC"] ?? "") ?? 2) * 16_000
+    private let maxBufferedSamples = (Int(ProcessInfo.processInfo.environment["PARAKEET_STREAM_MAX_BUFFER_SEC"] ?? "") ?? 4) * 16_000
+    private let latestFirstScheduling = (ProcessInfo.processInfo.environment["PARAKEET_STREAM_LATEST_FIRST"] ?? "1") != "0"
+    private let backlogSoftLimitSamples: Int = {
+        let env = ProcessInfo.processInfo.environment
+        if let raw = env["PARAKEET_STREAM_BACKLOG_SOFT_SEC"], let sec = Double(raw), sec > 0 {
+            return Int(sec * 16_000.0)
+        }
+        return Int(1.5 * 16_000.0)
+    }()
+    private let backlogTargetSamples: Int = {
+        let env = ProcessInfo.processInfo.environment
+        if let raw = env["PARAKEET_STREAM_BACKLOG_TARGET_SEC"], let sec = Double(raw), sec > 0 {
+            return Int(sec * 16_000.0)
+        }
+        return Int(0.4 * 16_000.0)
+    }()
+    private var resyncAfterDrop = false
+    private let maxProcessingBatchSamples: Int = {
+        let env = ProcessInfo.processInfo.environment
+        if let raw = env["PARAKEET_STREAM_MAX_BATCH_SEC"], let sec = Double(raw), sec > 0 {
+            return max(1, Int(sec * 16_000.0))
+        }
+        // Keep UI responsive and avoid bursty "all-at-once" transcript updates.
+        return Int(0.25 * 16_000.0)
+    }()
     private var totalProcessedAudioSec: Double = 0
     private var totalInferenceSec: Double = 0
-    private let maxStagnantSpeechChunks = Int(ProcessInfo.processInfo.environment["PARAKEET_STREAM_MAX_STAGNANT_CHUNKS"] ?? "") ?? 8
-    private var stagnantSpeechChunkCount = 0
-    private var lastSpeechTranscriptFingerprint = ""
+    private var runStartedAtSec: Double = 0
+    private var currentSpeechStartedAtSec: Double?
+    private var currentSpeechBaselineText: String = ""
+    private var currentSpeechFirstTokenLatencyMs: Double?
+    private var firstTokenLatencyMsSamples: [Double] = []
+    private var modelLoadStartedAt: Date?
+    private var modelLoadTimer: Timer?
+    private let metricsLogEnabled = (ProcessInfo.processInfo.environment["PARAKEET_METRICS_LOG"] ?? "0") != "0"
+    private var inputDeviceName: String = "unknown"
 
     func toggle() {
         if isRunning {
@@ -183,10 +281,13 @@ final class MicTranscriptionViewModel: ObservableObject {
 
     func activateAppWindow() {
 #if canImport(AppKit)
-        NSApp.activate(ignoringOtherApps: true)
+        DispatchQueue.main.async {
+            NSApp.activate(ignoringOtherApps: true)
+        }
 #endif
     }
 
+    @MainActor
     func chooseModelDirectory() {
 #if canImport(AppKit)
         let panel = NSOpenPanel()
@@ -219,20 +320,36 @@ final class MicTranscriptionViewModel: ObservableObject {
         requestMicrophoneAccess { [weak self] granted in
             guard let self else { return }
             if !granted {
-                Task { @MainActor in
+                DispatchQueue.main.async {
                     self.status = "Microphone access denied. Enable it in System Settings > Privacy & Security > Microphone."
                     self.isStarting = false
                 }
                 return
             }
 
-            self.queue.async { [weak self] in
+            DispatchQueue.main.async {
+                self.status = "Microphone granted. Loading model..."
+                self.startModelLoadTicker()
+            }
+
+            self.startupQueue.async { [weak self] in
                 guard let self else { return }
                 do {
-                    let model = try ParakeetCoreMLRNNTTranscriptionModel(
+                    let model = try ParakeetCoreMLTDTTranscriptionModel(
                         modelDirectory: dirURL,
                         modelSuffix: self.modelSuffix,
-                        config: .init(maxSymbolsPerStep: self.maxSymbolsPerStep, maxTokensPerChunk: self.maxTokensPerChunk)
+                        config: .init(
+                            maxSymbolsPerStep: self.maxSymbolsPerStep,
+                            maxTokensPerChunk: self.maxTokensPerChunk,
+                            streamingHistoryFrames: self.streamingHistoryFrames,
+                            streamingMinTailDecodeFrames: self.streamingMinTailDecodeFrames
+                        ),
+                        progress: { [weak self] message in
+                            guard let self else { return }
+                            DispatchQueue.main.async {
+                                self.status = self.decorateModelLoadStatus(message)
+                            }
+                        }
                     )
                     let engine = InferenceEngine(
                         model: model,
@@ -246,14 +363,21 @@ final class MicTranscriptionViewModel: ObservableObject {
                         ),
                         policy: .init(sampleRate: 16_000, chunkMs: self.chunkMs, hopMs: self.hopMs),
                         requiredAgreementCount: self.agreementCount,
+                        decodeOnlyWhenSpeech: self.decodeOnlyWhenSpeech,
+                        flushOnSpeechEnd: self.flushOnSpeechEnd,
+                        maxSpeechChunkRunBeforeReset: self.maxSpeechChunkRunBeforeReset,
+                        maxStagnantSpeechChunks: self.maxStagnantSpeechChunks,
                         ringBufferCapacity: 16_000 * 12
                     )
 
-                    Task { @MainActor in
+                    DispatchQueue.main.async {
+                        self.stopModelLoadTicker()
+                        self.status = "Model loaded. Starting audio engine..."
                         self.configureAndStartAudio(engine: engine)
                     }
                 } catch {
-                    Task { @MainActor in
+                    DispatchQueue.main.async {
+                        self.stopModelLoadTicker()
                         self.status = "Failed to load model: \(error)"
                         self.isStarting = false
                     }
@@ -273,27 +397,39 @@ final class MicTranscriptionViewModel: ObservableObject {
         pendingLock.unlock()
         totalProcessedAudioSec = 0
         totalInferenceSec = 0
-        stagnantSpeechChunkCount = 0
-        lastSpeechTranscriptFingerprint = ""
+        stopModelLoadTicker()
+        runStartedAtSec = 0
+        currentSpeechStartedAtSec = nil
+        currentSpeechBaselineText = ""
+        currentSpeechFirstTokenLatencyMs = nil
+        firstTokenLatencyMsSamples.removeAll(keepingCapacity: false)
 
         queue.sync {
             if var engine = inferenceEngine {
                 let finalState = engine.finishStream()
                 inferenceEngine = engine
-                Task { @MainActor in
-                    self.confirmedText = finalState.confirmed
-                    self.hypothesisText = finalState.hypothesis
+                let finalConfirmed = finalState.confirmed
+                let finalHypothesis = finalState.hypothesis
+                DispatchQueue.main.async {
+                    self.confirmedText = finalConfirmed
+                    self.hypothesisText = finalHypothesis
+                    self.metrics = "RTFx(inf/wall)=0.0/0.0 | first-token=n/a"
                 }
             }
         }
         status = "Stopped"
     }
 
-    @MainActor
     private func configureAndStartAudio(engine: InferenceEngine) {
         inferenceEngine = engine
         totalProcessedAudioSec = 0
         totalInferenceSec = 0
+        stopModelLoadTicker()
+        runStartedAtSec = 0
+        currentSpeechStartedAtSec = nil
+        currentSpeechBaselineText = ""
+        currentSpeechFirstTokenLatencyMs = nil
+        firstTokenLatencyMsSamples.removeAll(keepingCapacity: false)
         pendingLock.lock()
         pendingSamples.removeAll(keepingCapacity: false)
         processingScheduled = false
@@ -302,6 +438,20 @@ final class MicTranscriptionViewModel: ObservableObject {
         do {
             let inputNode = audioEngine.inputNode
             let inputFormat = inputNode.inputFormat(forBus: 0)
+            inputDeviceName = defaultInputDeviceName() ?? "unknown"
+            fputs("[transcribe-macos] input device: \(inputDeviceName)\n", stderr)
+            fputs("[transcribe-macos] input format: \(Int(inputFormat.sampleRate)) Hz, channels \(inputFormat.channelCount)\n", stderr)
+
+            if enableVoiceProcessing {
+                do {
+                    try inputNode.setVoiceProcessingEnabled(true)
+                    inputNode.isVoiceProcessingBypassed = false
+                    inputNode.isVoiceProcessingAGCEnabled = enableVoiceProcessingAGC
+                } catch {
+                    fputs("[transcribe-macos] voice processing unavailable: \(error)\n", stderr)
+                }
+            }
+
             guard let converter = AVAudioConverter(from: inputFormat, to: targetFormat) else {
                 throw NSError(
                     domain: "transcribe-macos",
@@ -320,9 +470,9 @@ final class MicTranscriptionViewModel: ObservableObject {
             isRunning = true
             isStarting = false
 #if DEBUG
-            status = "Listening... (DEBUG build; slower) chunk \(chunkMs)ms / hop \(hopMs)ms"
+            status = "Listening... (DEBUG build; slower) chunk \(chunkMs)ms / hop \(hopMs)ms | mic \(inputDeviceName)"
 #else
-            status = "Listening... (chunk \(chunkMs)ms / hop \(hopMs)ms)"
+            status = "Listening... (chunk \(chunkMs)ms / hop \(hopMs)ms) | mic \(inputDeviceName)"
 #endif
             activateAppWindow()
         } catch {
@@ -340,18 +490,13 @@ final class MicTranscriptionViewModel: ObservableObject {
         guard let converted = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: targetFrames) else { return }
 
         var error: NSError?
-        let sourceConsumed = UnsafeMutablePointer<Bool>.allocate(capacity: 1)
-        sourceConsumed.initialize(to: false)
-        defer {
-            sourceConsumed.deinitialize(count: 1)
-            sourceConsumed.deallocate()
-        }
+        let inputState = ConversionInputState()
         let inputBlock: AVAudioConverterInputBlock = { _, outStatus in
-            if sourceConsumed.pointee {
+            if inputState.consumed {
                 outStatus.pointee = .noDataNow
                 return nil
             }
-            sourceConsumed.pointee = true
+            inputState.consumed = true
             outStatus.pointee = .haveData
             return buffer
         }
@@ -376,6 +521,17 @@ final class MicTranscriptionViewModel: ObservableObject {
         if maxBufferedSamples > 0, pendingSamples.count > maxBufferedSamples {
             droppedCount = pendingSamples.count - maxBufferedSamples
             pendingSamples.removeFirst(droppedCount)
+            resyncAfterDrop = true
+        }
+        if backlogSoftLimitSamples > 0,
+           pendingSamples.count > backlogSoftLimitSamples {
+            let target = max(backlogTargetSamples, maxProcessingBatchSamples)
+            if pendingSamples.count > target {
+                let extraDrop = pendingSamples.count - target
+                droppedCount += extraDrop
+                pendingSamples.removeFirst(extraDrop)
+                resyncAfterDrop = true
+            }
         }
         if !processingScheduled {
             processingScheduled = true
@@ -385,12 +541,14 @@ final class MicTranscriptionViewModel: ObservableObject {
         pendingLock.unlock()
 
         if droppedCount > 0 {
-            Task { @MainActor in
-                self.status = String(format: "Catching up (dropped %.2fs)", Double(droppedCount) / 16_000.0)
+            let statusLine = String(format: "Catching up (dropped %.2fs)", Double(droppedCount) / 16_000.0)
+            DispatchQueue.main.async {
+                self.status = statusLine
             }
         } else if queuedSeconds > 1.0 {
-            Task { @MainActor in
-                self.status = String(format: "Processing backlog %.1fs", queuedSeconds)
+            let statusLine = String(format: "Processing backlog %.1fs", queuedSeconds)
+            DispatchQueue.main.async {
+                self.status = statusLine
             }
         }
 
@@ -413,6 +571,8 @@ final class MicTranscriptionViewModel: ObservableObject {
 
             let batch: [Float]
             let queuedAfterPopSec: Double
+            let shouldResyncBeforeBatch: Bool
+            var droppedForRealtime = 0
             pendingLock.lock()
             if pendingSamples.isEmpty {
                 processingScheduled = false
@@ -420,16 +580,49 @@ final class MicTranscriptionViewModel: ObservableObject {
                 return
             }
             if maxProcessingBatchSamples > 0, pendingSamples.count > maxProcessingBatchSamples {
-                batch = Array(pendingSamples.prefix(maxProcessingBatchSamples))
-                pendingSamples.removeFirst(maxProcessingBatchSamples)
+                if latestFirstScheduling {
+                    // Realtime mode: decode the most recent audio and drop stale backlog.
+                    batch = Array(pendingSamples.suffix(maxProcessingBatchSamples))
+                    droppedForRealtime = pendingSamples.count - batch.count
+                    pendingSamples.removeAll(keepingCapacity: true)
+                    if droppedForRealtime > 0 {
+                        resyncAfterDrop = true
+                    }
+                } else {
+                    batch = Array(pendingSamples.prefix(maxProcessingBatchSamples))
+                    pendingSamples.removeFirst(maxProcessingBatchSamples)
+                }
             } else {
                 batch = pendingSamples
                 pendingSamples.removeAll(keepingCapacity: true)
             }
+            shouldResyncBeforeBatch = resyncAfterDrop
+            resyncAfterDrop = false
             queuedAfterPopSec = Double(pendingSamples.count) / 16_000.0
             pendingLock.unlock()
 
+            if droppedForRealtime > 0 {
+                let droppedSec = Double(droppedForRealtime) / 16_000.0
+                let statusLine = String(format: "Realtime catch-up (dropped %.2fs stale audio)", droppedSec)
+                DispatchQueue.main.async {
+                    self.status = statusLine
+                }
+            }
+
             guard var engine = inferenceEngine else { return }
+            if shouldResyncBeforeBatch {
+                let flushed = engine.finishStream()
+                let flushedConfirmed = flushed.confirmed
+                let flushedHypothesis = flushed.hypothesis
+                inferenceEngine = engine
+                currentSpeechStartedAtSec = nil
+                currentSpeechBaselineText = ""
+                currentSpeechFirstTokenLatencyMs = nil
+                DispatchQueue.main.async {
+                    self.confirmedText = flushedConfirmed
+                    self.hypothesisText = flushedHypothesis
+                }
+            }
             let started = CFAbsoluteTimeGetCurrent()
             do {
                 let events = try engine.process(samples: batch)
@@ -438,63 +631,135 @@ final class MicTranscriptionViewModel: ObservableObject {
                 totalProcessedAudioSec += batchAudioSec
                 totalInferenceSec += elapsed
                 let inferRTFx = totalProcessedAudioSec / max(totalInferenceSec, 1e-6)
+                if runStartedAtSec == 0 {
+                    runStartedAtSec = started
+                }
+                let wallElapsed = max(CFAbsoluteTimeGetCurrent() - runStartedAtSec, 1e-6)
+                let wallRTFx = totalProcessedAudioSec / wallElapsed
                 inferenceEngine = engine
 
                 if let latest = events.last {
+                    let now = CFAbsoluteTimeGetCurrent()
                     if latest.didFlushSegment {
-                        stagnantSpeechChunkCount = 0
-                        lastSpeechTranscriptFingerprint = ""
-                    } else if latest.isSpeech {
-                        let fingerprint = "\(latest.transcript.confirmed)|\(latest.transcript.hypothesis)"
-                        if fingerprint == lastSpeechTranscriptFingerprint {
-                            stagnantSpeechChunkCount += 1
-                        } else {
-                            stagnantSpeechChunkCount = 0
-                            lastSpeechTranscriptFingerprint = fingerprint
+                        if let observed = currentSpeechFirstTokenLatencyMs {
+                            firstTokenLatencyMsSamples.append(observed)
                         }
-
-                        if stagnantSpeechChunkCount >= maxStagnantSpeechChunks {
-                            let flushed = engine.finishStream()
-                            inferenceEngine = engine
-                            stagnantSpeechChunkCount = 0
-                            lastSpeechTranscriptFingerprint = ""
-                            Task { @MainActor in
-                                self.confirmedText = flushed.confirmed
-                                self.hypothesisText = flushed.hypothesis
-                                self.status = "Stream resynced after stagnant decode."
+                        currentSpeechStartedAtSec = nil
+                        currentSpeechBaselineText = ""
+                        currentSpeechFirstTokenLatencyMs = nil
+                    } else if latest.isSpeech {
+                        let merged = mergedTranscript(confirmed: latest.transcript.confirmed, hypothesis: latest.transcript.hypothesis)
+                        if currentSpeechStartedAtSec == nil {
+                            currentSpeechStartedAtSec = now
+                            currentSpeechBaselineText = merged
+                            currentSpeechFirstTokenLatencyMs = nil
+                        } else if currentSpeechFirstTokenLatencyMs == nil, merged != currentSpeechBaselineText {
+                            let latencyMs = (now - (currentSpeechStartedAtSec ?? now)) * 1000.0
+                            currentSpeechFirstTokenLatencyMs = latencyMs
+                            firstTokenLatencyMsSamples.append(latencyMs)
+                            if metricsLogEnabled {
+                                fputs(String(format: "[metrics] first-token-latency=%.1f ms\n", latencyMs), stderr)
                             }
-                            continue
+                        }
+                    }
+
+                    let firstTokenCurrent = currentSpeechFirstTokenLatencyMs ?? firstTokenLatencyMsSamples.last
+                    let firstTokenAvg = firstTokenLatencyMsSamples.isEmpty ? nil : firstTokenLatencyMsSamples.reduce(0, +) / Double(firstTokenLatencyMsSamples.count)
+                    let firstTokenWorst = firstTokenLatencyMsSamples.max()
+                    let firstTokenSummary: String
+                    if let current = firstTokenCurrent {
+                        if let avg = firstTokenAvg, let worst = firstTokenWorst {
+                            firstTokenSummary = String(format: "first-token %.0fms (avg %.0f / worst %.0f)", current, avg, worst)
+                        } else {
+                            firstTokenSummary = String(format: "first-token %.0fms", current)
                         }
                     } else {
-                        stagnantSpeechChunkCount = 0
-                        lastSpeechTranscriptFingerprint = ""
+                        firstTokenSummary = "first-token n/a"
                     }
 
-                    Task { @MainActor in
-                        self.confirmedText = latest.transcript.confirmed
-                        self.hypothesisText = latest.transcript.hypothesis
-                        self.status = String(
-                            format: "%@ | %.1fx realtime | queue %.1fs",
-                            latest.isSpeech ? "Listening..." : "Silence",
-                            inferRTFx,
-                            queuedAfterPopSec
-                        )
+                    // For UI responsiveness, prefer the newest non-flush event for
+                    // display; flush events are still useful for finalization but
+                    // otherwise make the transcript appear as abrupt bursts.
+                    let displayEvent = events.last(where: { !$0.didFlushSegment }) ?? latest
+                    let latestConfirmed = displayEvent.transcript.confirmed
+                    let latestHypothesis = displayEvent.transcript.hypothesis
+                    let statusLine = String(
+                        format: "Listening... | mic %@ | vad=%@ %.0fdBFS | inf %.1fx | wall %.1fx | queue %.1fs",
+                        self.inputDeviceName,
+                        displayEvent.isSpeech ? "speech" : "silence",
+                        displayEvent.energyDBFS,
+                        inferRTFx,
+                        wallRTFx,
+                        queuedAfterPopSec
+                    )
+                    DispatchQueue.main.async {
+                        self.confirmedText = latestConfirmed
+                        self.hypothesisText = latestHypothesis
+                        self.status = statusLine
+                        self.metrics = firstTokenSummary
                     }
                 } else {
-                    Task { @MainActor in
-                        self.status = String(format: "Listening... | %.1fx realtime | queue %.1fs", inferRTFx, queuedAfterPopSec)
+                    let firstTokenAvg = firstTokenLatencyMsSamples.isEmpty ? nil : firstTokenLatencyMsSamples.reduce(0, +) / Double(firstTokenLatencyMsSamples.count)
+                    let firstTokenWorst = firstTokenLatencyMsSamples.max()
+                    let firstTokenSummary: String
+                    if let avg = firstTokenAvg, let worst = firstTokenWorst {
+                        firstTokenSummary = String(format: "first-token avg %.0fms / worst %.0fms", avg, worst)
+                    } else {
+                        firstTokenSummary = "first-token n/a"
+                    }
+                    let statusLine = String(format: "Listening... | inf %.1fx | wall %.1fx | queue %.1fs", inferRTFx, wallRTFx, queuedAfterPopSec)
+                    DispatchQueue.main.async {
+                        self.status = statusLine
+                        self.metrics = firstTokenSummary
                     }
                 }
             } catch {
-                Task { @MainActor in
-                    self.status = "Inference error: \(error)"
+                let errorLine = "Inference error: \(error)"
+                DispatchQueue.main.async {
+                    self.status = errorLine
                 }
                 return
             }
         }
     }
 
-    private func requestMicrophoneAccess(completion: @escaping (Bool) -> Void) {
+    private func mergedTranscript(confirmed: String, hypothesis: String) -> String {
+        let c = confirmed.trimmingCharacters(in: .whitespacesAndNewlines)
+        let h = hypothesis.trimmingCharacters(in: .whitespacesAndNewlines)
+        if c.isEmpty { return h }
+        if h.isEmpty { return c }
+        return c + " " + h
+    }
+
+    private func startModelLoadTicker() {
+        stopModelLoadTicker()
+        modelLoadStartedAt = Date()
+        modelLoadTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            guard self.isStarting, let started = self.modelLoadStartedAt else { return }
+            let elapsed = Date().timeIntervalSince(started)
+            if self.status.contains("Loading") || self.status.contains("Microphone granted") || self.status.contains("Model ready") {
+                self.status = self.decorateModelLoadStatus(
+                    self.status.components(separatedBy: " | ").first ?? self.status,
+                    elapsedOverride: elapsed
+                )
+            }
+        }
+    }
+
+    private func stopModelLoadTicker() {
+        modelLoadTimer?.invalidate()
+        modelLoadTimer = nil
+        modelLoadStartedAt = nil
+    }
+
+    private func decorateModelLoadStatus(_ base: String, elapsedOverride: TimeInterval? = nil) -> String {
+        let elapsed = elapsedOverride ?? modelLoadStartedAt.map { Date().timeIntervalSince($0) } ?? 0
+        if elapsed <= 0 { return base }
+        return String(format: "%@ | %.1fs", base, elapsed)
+    }
+
+    private func requestMicrophoneAccess(completion: @escaping @Sendable (Bool) -> Void) {
         let status = AVCaptureDevice.authorizationStatus(for: .audio)
         switch status {
         case .authorized:

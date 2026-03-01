@@ -35,7 +35,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--coreml-transcriber",
         type=Path,
-        default=repo_root / "scripts/parakeet_coreml_rnnt_transcriber.py",
+        default=repo_root / "scripts/parakeet_coreml_tdt_transcriber.py",
     )
     parser.add_argument(
         "--nemo-transcriber",

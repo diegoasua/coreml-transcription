@@ -9,7 +9,7 @@ RUNS_ROOT="${RUNS_ROOT:-${REPO_ROOT}/artifacts/openbench-runs}"
 MODEL_PROFILE="${MODEL_PROFILE:-configs/parakeet-coreml-fp16-baseline.env}"
 DATASET="${DATASET:-earnings22-3hours}"
 RUN_PREFIX="${RUN_PREFIX:-parakeet-coreml-${DATASET}-decoder-sweep}"
-PYTHON_TRANSCRIBER="${PYTHON_TRANSCRIBER:-scripts/parakeet_coreml_rnnt_transcriber.py}"
+PYTHON_TRANSCRIBER="${PYTHON_TRANSCRIBER:-scripts/parakeet_coreml_tdt_transcriber.py}"
 
 # Options:
 # - baseline: current decoder settings from model profile.
@@ -41,8 +41,8 @@ run_variant() {
     source "${MODEL_PROFILE}"
 
     # Reset decoder knobs between variants.
-    unset PARAKEET_RNNT_MAX_SYMBOLS_PER_STEP PARAKEET_RNNT_MAX_TOKENS_PER_CHUNK || true
-    unset PARAKEET_RNNT_BEAM_WIDTH PARAKEET_RNNT_DURATION_BEAM_WIDTH || true
+    unset PARAKEET_TDT_MAX_SYMBOLS_PER_STEP PARAKEET_TDT_MAX_TOKENS_PER_CHUNK || true
+    unset PARAKEET_TDT_BEAM_WIDTH PARAKEET_TDT_DURATION_BEAM_WIDTH || true
 
     case "${variant}" in
       baseline)

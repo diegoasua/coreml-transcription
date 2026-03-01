@@ -81,7 +81,7 @@ public final class CoreMLCTCTranscriptionModel: TranscriptionModel {
     }
 
     public func resetState() {
-        // Stateless baseline path. For stateful models (KV cache / RNNT state),
+        // Stateless baseline path. For stateful models (KV cache / TDT state),
         // this is where recurrent state would be cleared.
     }
 }

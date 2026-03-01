@@ -99,7 +99,7 @@ python scripts/convert_torchscript_to_coreml.py \
   --torchscript artifacts/parakeet-tdt-0.6b-v2/encoder-model.ts \
   --manifest artifacts/parakeet-tdt-0.6b-v2/encoder-model-manifest.json \
   --output artifacts/parakeet-tdt-0.6b-v2/encoder-model.mlpackage \
-  --target macos14 \
+  --target macos15 \
   --compute-units all
 ```
 
@@ -123,7 +123,7 @@ python scripts/compress_coreml.py \
 ### 6) CoreML latency benchmark (synthetic chunk input)
 
 ```bash
-python scripts/benchmark_rnnt_components.py \
+python scripts/benchmark_tdt_components.py \
   --encoder-model artifacts/parakeet-tdt-0.6b-v2/encoder-model-int4.mlpackage \
   --encoder-manifest artifacts/parakeet-tdt-0.6b-v2/encoder-model-manifest.json \
   --decoder-model artifacts/parakeet-tdt-0.6b-v2/decoder_joint-model-int4.mlpackage \
@@ -139,7 +139,7 @@ python scripts/benchmark_rnnt_components.py \
 swift test
 ```
 
-### 7b) Swift file transcription CLI (native CoreML RNNT/TDT)
+### 7b) Swift file transcription CLI (native CoreML TDT)
 
 ```bash
 swift run transcribe-cli \
@@ -183,7 +183,7 @@ If you want a second harness independent of OpenBench internals, use:
 ```bash
 bash scripts/run_hf_open_asr_eval.sh \
   --run-name parakeet-coreml-earnings22-hf \
-  --python-transcriber scripts/parakeet_coreml_rnnt_transcriber.py
+  --python-transcriber scripts/parakeet_coreml_tdt_transcriber.py
 ```
 
 Defaults are aligned with Hugging Face ESB test-only datasets:
@@ -212,7 +212,7 @@ uv sync
 uv run python ../../scripts/run_openbench_custom_transcription.py \
   --openbench-dir . \
   --dataset librispeech-200 \
-  --python-transcriber scripts/parakeet_coreml_rnnt_transcriber.py \
+  --python-transcriber scripts/parakeet_coreml_tdt_transcriber.py \
   --run-name parakeet-coreml-ls200
 ```
 
@@ -224,7 +224,7 @@ Shortcut wrapper:
 ```bash
 bash scripts/run_openbench_eval.sh \
   --dataset librispeech-200 \
-  --python-transcriber scripts/parakeet_coreml_rnnt_transcriber.py \
+  --python-transcriber scripts/parakeet_coreml_tdt_transcriber.py \
   --run-name parakeet-coreml-ls200
 ```
 
@@ -294,7 +294,7 @@ To benchmark FP16 baseline:
 source configs/parakeet-coreml-fp16-baseline.env
 bash scripts/run_openbench_eval.sh \
   --dataset librispeech-200 \
-  --python-transcriber scripts/parakeet_coreml_rnnt_transcriber.py \
+  --python-transcriber scripts/parakeet_coreml_tdt_transcriber.py \
   --run-name parakeet-coreml-ls200-fp16
 
 bash scripts/run_openbench_streaming_eval.sh \
@@ -407,10 +407,10 @@ Note:
 - `--python-transcriber` keeps the model loaded in-process (recommended for speed).
 - `--transcribe-cmd` is still supported for shell-command integration.
 - Commands run from project root by default (`--command-cwd`).
-- Decoder quality/speed knobs (CoreML RNNT transcriber):
-  - `PARAKEET_RNNT_BEAM_WIDTH` (default `1`, greedy). Try `2` or `4` for lower WER.
-  - `PARAKEET_RNNT_DURATION_BEAM_WIDTH` (default matches beam width).
-  - `PARAKEET_RNNT_MAX_SYMBOLS_PER_STEP` (default `10`).
+- Decoder quality/speed knobs (CoreML TDT transcriber):
+  - `PARAKEET_TDT_BEAM_WIDTH` (default `1`, greedy). Try `2` or `4` for lower WER.
+  - `PARAKEET_TDT_DURATION_BEAM_WIDTH` (default matches beam width).
+  - `PARAKEET_TDT_MAX_SYMBOLS_PER_STEP` (default `10`).
 
 If OpenBench dependency import fails on macOS due `texterrors_align`:
 - The runner auto-falls back to a safe stub for `texterrors` (keyword metrics disabled, WER unaffected).
@@ -427,11 +427,11 @@ If OpenBench dependency import fails on macOS due `texterrors_align`:
 - `scripts/compress_coreml.py`: compression experiment harness (optimize API with legacy fallback).
 - `scripts/inspect_onnx.py`: ONNX graph/I-O inspector with candidate name suggestions.
 - `scripts/benchmark_coreml_model.py`: runtime-only latency benchmark for CoreML models.
-- `scripts/benchmark_rnnt_components.py`: encoder + decoder-loop benchmark with end-to-end RTF estimate.
+- `scripts/benchmark_tdt_components.py`: encoder + decoder-loop benchmark with end-to-end RTF estimate.
 - `scripts/benchmark_transcripts.py`: quick WER/RTF calculator from JSONL logs.
 - `scripts/eval_openbench_dataset.py`: standardized dataset evaluation harness (HF OpenBench datasets + local transcriber command).
 - `scripts/run_openbench_custom_transcription.py`: OpenBench-native benchmark runner with custom local pipeline support for both `transcription` and `streaming_transcription`.
-- `scripts/parakeet_coreml_rnnt_transcriber.py`: local CoreML Parakeet RNNT/TDT module (`transcribe_file(...)`, `stream_transcribe_file(...)`).
+- `scripts/parakeet_coreml_tdt_transcriber.py`: local CoreML Parakeet TDT module (`transcribe_file(...)`, `stream_transcribe_file(...)`).
 - `scripts/run_openbench_eval.sh`: convenience wrapper to run OpenBench `uv sync` + custom benchmark script.
 - `scripts/run_openbench_streaming_eval.sh`: convenience wrapper for OpenBench streaming transcription metrics.
 - `scripts/run_openbench_matrix_english.sh`: matrix runner for English transcription benchmarks (`earnings22`, `ami-sdm-openbench`) across selected profiles.
@@ -451,10 +451,10 @@ If OpenBench dependency import fails on macOS due `texterrors_align`:
 ## Notes
 
 - Parakeet model export shape/signatures vary by release. Inspect exported ONNX I/O before wiring production inference.
-- RNNT/TDT exports are usually split into multiple ONNX files (for example `encoder-model.onnx` and `decoder_joint-model.onnx`).
+- TDT exports are usually split into multiple ONNX files (for example `encoder-model.onnx` and `decoder_joint-model.onnx`).
 - CoreMLTools 9 does not support ONNX frontend conversion; use TorchScript -> CoreML conversion.
 - CoreML/ANE behavior is highly architecture-dependent; measure on target hardware for every quantization setting.
-- `CoreMLCTCTranscriptionModel` is a baseline adapter; Parakeet TDT/RNNT graphs likely require custom decoder/state wiring.
+- `CoreMLCTCTranscriptionModel` is a baseline adapter; Parakeet TDT/TDT graphs likely require custom decoder/state wiring.
 
 ## Troubleshooting
 

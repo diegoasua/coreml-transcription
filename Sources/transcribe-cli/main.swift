@@ -11,8 +11,21 @@ struct CLIArgs {
     var leftContextFrames: Int = Int(ProcessInfo.processInfo.environment["PARAKEET_ENCODER_LEFT_CONTEXT_FRAMES"] ?? "") ?? 300
     var rightContextFrames: Int = Int(ProcessInfo.processInfo.environment["PARAKEET_ENCODER_RIGHT_CONTEXT_FRAMES"] ?? "") ?? 120
     var allowRightContext: Bool = (ProcessInfo.processInfo.environment["PARAKEET_CLI_ALLOW_RIGHT_CONTEXT"] ?? "1") != "0"
-    var maxSymbolsPerStep: Int = Int(ProcessInfo.processInfo.environment["PARAKEET_RNNT_MAX_SYMBOLS_PER_STEP"] ?? "") ?? 10
-    var maxTokensPerChunk: Int = Int(ProcessInfo.processInfo.environment["PARAKEET_RNNT_MAX_TOKENS_PER_CHUNK"] ?? "") ?? 0
+    var maxSymbolsPerStep: Int = Int(ProcessInfo.processInfo.environment["PARAKEET_TDT_MAX_SYMBOLS_PER_STEP"] ?? "") ?? 4
+    var maxTokensPerChunk: Int = Int(ProcessInfo.processInfo.environment["PARAKEET_TDT_MAX_TOKENS_PER_CHUNK"] ?? "") ?? 64
+    var realtimeBench: Bool = false
+    var streamChunkMs: Int = Int(ProcessInfo.processInfo.environment["PARAKEET_STREAM_CHUNK_MS"] ?? "") ?? 160
+    var streamHopMs: Int = Int(ProcessInfo.processInfo.environment["PARAKEET_STREAM_HOP_MS"] ?? "") ?? 80
+    var streamAgreement: Int = Int(ProcessInfo.processInfo.environment["PARAKEET_STREAM_AGREEMENT"] ?? "") ?? 2
+    var reportEveryMs: Int = Int(ProcessInfo.processInfo.environment["PARAKEET_BENCH_REPORT_MS"] ?? "") ?? 200
+    var maxBatchMs: Int = Int(ProcessInfo.processInfo.environment["PARAKEET_STREAM_MAX_BATCH_MS"] ?? "") ?? 200
+    var latestFirst: Bool = (ProcessInfo.processInfo.environment["PARAKEET_STREAM_LATEST_FIRST"] ?? "1") != "0"
+    var backlogSoftSec: Double = Double(ProcessInfo.processInfo.environment["PARAKEET_STREAM_BACKLOG_SOFT_SEC"] ?? "") ?? 1.5
+    var backlogTargetSec: Double = Double(ProcessInfo.processInfo.environment["PARAKEET_STREAM_BACKLOG_TARGET_SEC"] ?? "") ?? 0.25
+    var queuePassSec: Double = Double(ProcessInfo.processInfo.environment["PARAKEET_BENCH_QUEUE_PASS_SEC"] ?? "") ?? 0.5
+    var firstTokenPassMs: Double = Double(ProcessInfo.processInfo.environment["PARAKEET_BENCH_FIRST_TOKEN_PASS_MS"] ?? "") ?? 300
+    var confirmedPassMs: Double = Double(ProcessInfo.processInfo.environment["PARAKEET_BENCH_CONFIRMED_PASS_MS"] ?? "") ?? 1700
+    var metricsOutputPath: String?
 }
 
 func parseArgs() -> CLIArgs {
@@ -73,6 +86,67 @@ func parseArgs() -> CLIArgs {
                 args.maxTokensPerChunk = Int(argv[i + 1]) ?? args.maxTokensPerChunk
                 i += 1
             }
+        case "--realtime-bench":
+            args.realtimeBench = true
+        case "--stream-chunk-ms":
+            if i + 1 < argv.count {
+                args.streamChunkMs = Int(argv[i + 1]) ?? args.streamChunkMs
+                i += 1
+            }
+        case "--stream-hop-ms":
+            if i + 1 < argv.count {
+                args.streamHopMs = Int(argv[i + 1]) ?? args.streamHopMs
+                i += 1
+            }
+        case "--stream-agreement":
+            if i + 1 < argv.count {
+                args.streamAgreement = Int(argv[i + 1]) ?? args.streamAgreement
+                i += 1
+            }
+        case "--report-every-ms":
+            if i + 1 < argv.count {
+                args.reportEveryMs = Int(argv[i + 1]) ?? args.reportEveryMs
+                i += 1
+            }
+        case "--max-batch-ms":
+            if i + 1 < argv.count {
+                args.maxBatchMs = Int(argv[i + 1]) ?? args.maxBatchMs
+                i += 1
+            }
+        case "--latest-first":
+            args.latestFirst = true
+        case "--oldest-first":
+            args.latestFirst = false
+        case "--backlog-soft-sec":
+            if i + 1 < argv.count {
+                args.backlogSoftSec = Double(argv[i + 1]) ?? args.backlogSoftSec
+                i += 1
+            }
+        case "--backlog-target-sec":
+            if i + 1 < argv.count {
+                args.backlogTargetSec = Double(argv[i + 1]) ?? args.backlogTargetSec
+                i += 1
+            }
+        case "--queue-pass-sec":
+            if i + 1 < argv.count {
+                args.queuePassSec = Double(argv[i + 1]) ?? args.queuePassSec
+                i += 1
+            }
+        case "--first-token-pass-ms":
+            if i + 1 < argv.count {
+                args.firstTokenPassMs = Double(argv[i + 1]) ?? args.firstTokenPassMs
+                i += 1
+            }
+        case "--confirmed-pass-ms":
+            if i + 1 < argv.count {
+                args.confirmedPassMs = Double(argv[i + 1]) ?? args.confirmedPassMs
+                i += 1
+            }
+        case "--metrics-output":
+            if i + 1 < argv.count {
+                args.metricsOutputPath = argv[i + 1]
+                i += 1
+            }
         default:
             break
         }
@@ -108,7 +182,11 @@ func runInteractiveDemo() {
 
 #if canImport(CoreML) && canImport(AVFoundation)
 import CoreML
-import AVFoundation
+@preconcurrency import AVFoundation
+
+private final class ConversionInputState: @unchecked Sendable {
+    var consumed = false
+}
 
 func logProgress(_ message: String) {
     fputs("[transcribe-cli] \(message)\n", stderr)
@@ -192,14 +270,14 @@ func avResampleMonoFloat(_ samples: [Float], from sourceRate: Int, to targetRate
         throw NSError(domain: "transcribe-cli", code: 5, userInfo: [NSLocalizedDescriptionKey: "Failed to allocate destination conversion buffer"])
     }
 
-    var provided = false
+    let inputState = ConversionInputState()
     var convError: NSError?
     let status = converter.convert(to: dstBuffer, error: &convError) { _, outStatus in
-        if provided {
+        if inputState.consumed {
             outStatus.pointee = .noDataNow
             return nil
         }
-        provided = true
+        inputState.consumed = true
         outStatus.pointee = .haveData
         return srcBuffer
     }
@@ -242,7 +320,7 @@ func mergeTextByOverlap(_ chunks: [String]) -> String {
 }
 
 func transcribeSamplesByChunks(
-    model: ParakeetCoreMLRNNTTranscriptionModel,
+    model: ParakeetCoreMLTDTTranscriptionModel,
     samples: [Float],
     sampleRate: Int,
     chunkSamples: Int,
@@ -264,6 +342,319 @@ func transcribeSamplesByChunks(
     return latest
 }
 
+func mergedTranscript(confirmed: String, hypothesis: String) -> String {
+    let c = confirmed.trimmingCharacters(in: .whitespacesAndNewlines)
+    let h = hypothesis.trimmingCharacters(in: .whitespacesAndNewlines)
+    if c.isEmpty { return h }
+    if h.isEmpty { return c }
+    return c + " " + h
+}
+
+func percentile(_ values: [Double], q: Double) -> Double? {
+    guard !values.isEmpty else { return nil }
+    let sorted = values.sorted()
+    if sorted.count == 1 { return sorted[0] }
+    let index = max(0, min(Double(sorted.count - 1), q * Double(sorted.count - 1)))
+    let lo = Int(floor(index))
+    let hi = Int(ceil(index))
+    if lo == hi { return sorted[lo] }
+    let frac = index - Double(lo)
+    return sorted[lo] * (1.0 - frac) + sorted[hi] * frac
+}
+
+func runRealtimeBenchmark(
+    model: ParakeetCoreMLTDTTranscriptionModel,
+    samples: [Float],
+    sampleRate: Int,
+    args: CLIArgs
+) throws {
+    typealias BenchEngine = StreamingInferenceEngine<ParakeetCoreMLTDTTranscriptionModel, EnergyVAD>
+
+    let chunkSamples = max(1, sampleRate * max(20, args.streamChunkMs) / 1000)
+    let hopSamples = max(1, min(chunkSamples, sampleRate * max(10, args.streamHopMs) / 1000))
+    let maxBatchSamples = max(hopSamples, sampleRate * max(10, args.maxBatchMs) / 1000)
+    let reportEverySec = Double(max(50, args.reportEveryMs)) / 1000.0
+    let totalAudioSec = Double(samples.count) / Double(sampleRate)
+    let backlogSoftSamples = max(hopSamples, Int(args.backlogSoftSec * Double(sampleRate)))
+    let backlogTargetSamples = max(hopSamples, Int(args.backlogTargetSec * Double(sampleRate)))
+    let debugText = (ProcessInfo.processInfo.environment["PARAKEET_BENCH_DEBUG_TEXT"] ?? "0") == "1"
+    let benchVADStart = Float(ProcessInfo.processInfo.environment["PARAKEET_VAD_START_DBFS"] ?? "") ?? -50
+    let benchVADEnd = Float(ProcessInfo.processInfo.environment["PARAKEET_VAD_END_DBFS"] ?? "") ?? -58
+    let benchVADMinSpeech = Int(ProcessInfo.processInfo.environment["PARAKEET_VAD_MIN_SPEECH_MS"] ?? "") ?? 60
+    let benchVADMinSilence = Int(ProcessInfo.processInfo.environment["PARAKEET_VAD_MIN_SILENCE_MS"] ?? "") ?? 400
+    let benchDecodeOnlyWhenSpeech = (ProcessInfo.processInfo.environment["PARAKEET_DECODE_ONLY_WHEN_SPEECH"] ?? "1") != "0"
+    let benchFlushOnSpeechEnd = (ProcessInfo.processInfo.environment["PARAKEET_STREAM_FLUSH_ON_SPEECH_END"] ?? "0") != "0"
+
+    var chunks: [[Float]] = []
+    chunks.reserveCapacity(max(1, Int(ceil(Double(samples.count) / Double(hopSamples)))))
+    var s = 0
+    while s < samples.count {
+        let e = min(samples.count, s + hopSamples)
+        chunks.append(Array(samples[s..<e]))
+        s = e
+    }
+    let totalChunks = chunks.count
+    let hopSec = Double(hopSamples) / Double(sampleRate)
+
+    var engine = BenchEngine(
+        model: model,
+        vad: EnergyVAD(config: .init(
+            startThresholdDBFS: benchVADStart,
+            endThresholdDBFS: benchVADEnd,
+            minSpeechMs: benchVADMinSpeech,
+            minSilenceMs: benchVADMinSilence
+        )),
+        policy: .init(sampleRate: sampleRate, chunkMs: args.streamChunkMs, hopMs: args.streamHopMs),
+        requiredAgreementCount: max(1, args.streamAgreement),
+        decodeOnlyWhenSpeech: benchDecodeOnlyWhenSpeech,
+        flushOnSpeechEnd: benchFlushOnSpeechEnd,
+        maxSpeechChunkRunBeforeReset: nil,
+        maxStagnantSpeechChunks: 0,
+        ringBufferCapacity: sampleRate * 12
+    )
+
+    var currentTimeSec = 0.0
+    var nextReportSec = 0.0
+    var arrivalIndex = 0
+    var queue: [Int] = []
+    var processedChunks = 0
+    var totalInferSec = 0.0
+    var maxQueueSecObserved = 0.0
+    var droppedChunks = 0
+
+    var prevIsSpeech = false
+    var speechStartAudioSec: Double?
+    var speechBaselineMerged = ""
+    var speechBaselineConfirmed = ""
+    var speechFirstTokenRecorded = false
+    var speechConfirmedRecorded = false
+    var firstTokenMs: [Double] = []
+    var confirmedMs: [Double] = []
+    var corrections = 0
+    var lastConfirmed = ""
+    var lastHypothesis = ""
+    var lastMerged = ""
+    var transcriptCursorSec = 0.0
+
+    let startWall = CFAbsoluteTimeGetCurrent()
+    while arrivalIndex < totalChunks || !queue.isEmpty {
+        while arrivalIndex < totalChunks {
+            let arrivalTime = Double(arrivalIndex) * hopSec
+            if arrivalTime <= currentTimeSec {
+                queue.append(arrivalIndex)
+                arrivalIndex += 1
+            } else {
+                break
+            }
+        }
+
+        if queue.isEmpty {
+            if arrivalIndex < totalChunks {
+                currentTimeSec = Double(arrivalIndex) * hopSec
+            }
+            continue
+        }
+
+        // Low-latency policy: drop stale queue beyond configured budget.
+        let queueSamples = queue.count * hopSamples
+        if queueSamples > backlogSoftSamples && queue.count > 1 {
+            let targetChunkCount = max(1, backlogTargetSamples / hopSamples)
+            if queue.count > targetChunkCount {
+                let keep: [Int]
+                if args.latestFirst {
+                    keep = Array(queue.suffix(targetChunkCount))
+                } else {
+                    keep = Array(queue.prefix(targetChunkCount))
+                }
+                droppedChunks += max(0, queue.count - keep.count)
+                queue = keep
+                _ = engine.finishStream()
+                prevIsSpeech = false
+                speechStartAudioSec = nil
+                speechBaselineMerged = ""
+                speechBaselineConfirmed = ""
+                speechFirstTokenRecorded = false
+                speechConfirmedRecorded = false
+            }
+        }
+
+        let batchIndexes: [Int]
+        let maxBatchChunks = max(1, maxBatchSamples / hopSamples)
+        if args.latestFirst {
+            batchIndexes = Array(queue.suffix(maxBatchChunks))
+            queue.removeAll(keepingCapacity: true)
+        } else {
+            batchIndexes = Array(queue.prefix(maxBatchChunks))
+            queue.removeFirst(batchIndexes.count)
+        }
+
+        var batch: [Float] = []
+        batch.reserveCapacity(batchIndexes.reduce(0) { $0 + chunks[$1].count })
+        for idx in batchIndexes {
+            batch.append(contentsOf: chunks[idx])
+        }
+
+        let before = CFAbsoluteTimeGetCurrent()
+        let events = try engine.process(samples: batch)
+        let elapsed = CFAbsoluteTimeGetCurrent() - before
+        totalInferSec += elapsed
+        currentTimeSec += elapsed
+        processedChunks += batchIndexes.count
+
+        let latestChunk = batchIndexes.last ?? 0
+        let latestAudioCursorSec = min(totalAudioSec, Double(latestChunk + 1) * hopSec)
+
+        if let event = events.last {
+            let merged = mergedTranscript(confirmed: event.transcript.confirmed, hypothesis: event.transcript.hypothesis)
+            if debugText, merged != lastMerged {
+                let snippet = String(merged.prefix(160)).replacingOccurrences(of: "\n", with: " ")
+                logProgress("realtime-bench text-change: \(snippet)")
+            }
+            lastMerged = merged
+            if event.isSpeech, !prevIsSpeech {
+                speechStartAudioSec = latestAudioCursorSec
+                speechBaselineMerged = merged
+                speechBaselineConfirmed = event.transcript.confirmed
+                speechFirstTokenRecorded = false
+                speechConfirmedRecorded = false
+            }
+            if event.isSpeech,
+               let startAudio = speechStartAudioSec,
+               !speechFirstTokenRecorded,
+               merged != speechBaselineMerged {
+                firstTokenMs.append(max(0, (currentTimeSec - startAudio) * 1000.0))
+                speechFirstTokenRecorded = true
+            }
+            if event.isSpeech,
+               let startAudio = speechStartAudioSec,
+               !speechConfirmedRecorded,
+               event.transcript.confirmed != speechBaselineConfirmed {
+                confirmedMs.append(max(0, (currentTimeSec - startAudio) * 1000.0))
+                speechConfirmedRecorded = true
+            }
+            if event.didFlushSegment, let startAudio = speechStartAudioSec {
+                if !speechConfirmedRecorded {
+                    confirmedMs.append(max(0, (currentTimeSec - startAudio) * 1000.0))
+                    speechConfirmedRecorded = true
+                }
+                transcriptCursorSec = max(transcriptCursorSec, latestAudioCursorSec)
+                speechStartAudioSec = nil
+                speechBaselineMerged = ""
+                speechBaselineConfirmed = ""
+                speechFirstTokenRecorded = false
+                speechConfirmedRecorded = false
+            }
+            if event.transcript.confirmed == lastConfirmed,
+               event.transcript.hypothesis != lastHypothesis,
+               !lastHypothesis.isEmpty {
+                corrections += 1
+            }
+            lastConfirmed = event.transcript.confirmed
+            lastHypothesis = event.transcript.hypothesis
+            prevIsSpeech = event.isSpeech
+        }
+
+        let queueSec = Double(queue.count * hopSamples) / Double(sampleRate)
+        maxQueueSecObserved = max(maxQueueSecObserved, queueSec)
+        if currentTimeSec >= nextReportSec {
+            let ingestedAudioSec = min(totalAudioSec, Double(arrivalIndex) * hopSec)
+            let inferRTFx = ingestedAudioSec / max(totalInferSec, 1e-9)
+            let wallRTFx = ingestedAudioSec / max(currentTimeSec, 1e-9)
+            let firstNow = firstTokenMs.last ?? -1
+            let firstAvg = firstTokenMs.isEmpty ? -1 : (firstTokenMs.reduce(0, +) / Double(firstTokenMs.count))
+            let firstWorst = firstTokenMs.max() ?? -1
+            logProgress(
+                String(
+                    format: "realtime-bench t=%.2fs audio=%.2fs transcript=%.2fs queue=%.2fs inf=%.2fx wall=%.2fx first=%.0fms avg=%.0f worst=%.0f drops=%d",
+                    currentTimeSec,
+                    ingestedAudioSec,
+                    transcriptCursorSec,
+                    queueSec,
+                    inferRTFx,
+                    wallRTFx,
+                    firstNow,
+                    firstAvg,
+                    firstWorst,
+                    droppedChunks
+                )
+            )
+            nextReportSec += reportEverySec
+        }
+    }
+
+    let finalState = engine.finishStream()
+    if let pendingStart = speechStartAudioSec {
+        let anyText = !finalState.confirmed.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+            !finalState.hypothesis.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        if anyText, !speechConfirmedRecorded {
+            confirmedMs.append(max(0, (currentTimeSec - pendingStart) * 1000.0))
+        }
+    }
+    if !finalState.confirmed.isEmpty {
+        transcriptCursorSec = totalAudioSec
+    }
+    let wallElapsed = CFAbsoluteTimeGetCurrent() - startWall
+    let inferRTFx = totalAudioSec / max(totalInferSec, 1e-9)
+    let wallRTFx = totalAudioSec / max(currentTimeSec, 1e-9)
+
+    let firstP95 = percentile(firstTokenMs, q: 0.95) ?? .infinity
+    let confirmedP95 = percentile(confirmedMs, q: 0.95) ?? .infinity
+    let correctionsPerMin = totalAudioSec > 0 ? (Double(corrections) / totalAudioSec) * 60.0 : 0.0
+
+    let passQueue = maxQueueSecObserved <= args.queuePassSec
+    let passFirst = firstP95 <= args.firstTokenPassMs
+    let passConfirmed = confirmedP95 <= args.confirmedPassMs
+    let overallPass = passQueue && passFirst && passConfirmed
+
+    let summary: [String: Any] = [
+        "mode": "realtime_bench",
+        "audio_sec": totalAudioSec,
+        "stream_chunk_ms": args.streamChunkMs,
+        "stream_hop_ms": args.streamHopMs,
+        "agreement": args.streamAgreement,
+        "latest_first": args.latestFirst,
+        "max_batch_ms": args.maxBatchMs,
+        "backlog_soft_sec": args.backlogSoftSec,
+        "backlog_target_sec": args.backlogTargetSec,
+        "processed_chunks": processedChunks,
+        "dropped_chunks": droppedChunks,
+        "max_queue_sec": maxQueueSecObserved,
+        "first_token_ms_p95": firstP95.isFinite ? firstP95 : NSNull(),
+        "confirmed_latency_ms_p95": confirmedP95.isFinite ? confirmedP95 : NSNull(),
+        "first_token_ms_avg": firstTokenMs.isEmpty ? NSNull() : (firstTokenMs.reduce(0, +) / Double(firstTokenMs.count)),
+        "confirmed_latency_ms_avg": confirmedMs.isEmpty ? NSNull() : (confirmedMs.reduce(0, +) / Double(confirmedMs.count)),
+        "corrections": corrections,
+        "corrections_per_min": correctionsPerMin,
+        "infer_rtfx": inferRTFx,
+        "wall_rtfx_virtual": wallRTFx,
+        "wall_elapsed_sec": wallElapsed,
+        "thresholds": [
+            "queue_pass_sec": args.queuePassSec,
+            "first_token_pass_ms": args.firstTokenPassMs,
+            "confirmed_pass_ms": args.confirmedPassMs
+        ],
+        "pass": overallPass,
+        "pass_breakdown": [
+            "queue": passQueue,
+            "first_token": passFirst,
+            "confirmed": passConfirmed
+        ],
+        "final_confirmed_len": finalState.confirmed.count,
+        "final_hypothesis_len": finalState.hypothesis.count,
+        "final_confirmed_preview": String(finalState.confirmed.prefix(200)),
+        "final_hypothesis_preview": String(finalState.hypothesis.prefix(200))
+    ]
+
+    let summaryData = try JSONSerialization.data(withJSONObject: summary, options: [.prettyPrinted, .sortedKeys])
+    if let outPath = args.metricsOutputPath, !outPath.isEmpty {
+        let url = URL(fileURLWithPath: outPath)
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try summaryData.write(to: url)
+        logProgress("wrote realtime benchmark summary: \(url.path)")
+    }
+    print(String(decoding: summaryData, as: UTF8.self))
+}
+
 func runAudioTranscription(args: CLIArgs) throws {
     guard let audioPath = args.audioPath else {
         runInteractiveDemo()
@@ -274,7 +665,7 @@ func runAudioTranscription(args: CLIArgs) throws {
     let startTime = Date()
 
     logProgress("loading models from \(modelDir.path) (suffix=\(args.modelSuffix))")
-    let model = try ParakeetCoreMLRNNTTranscriptionModel(
+    let model = try ParakeetCoreMLTDTTranscriptionModel(
         modelDirectory: modelDir,
         modelSuffix: args.modelSuffix,
         config: .init(
@@ -293,6 +684,19 @@ func runAudioTranscription(args: CLIArgs) throws {
     logProgress(String(format: "audio ready: %.2fs at %d Hz", audioSeconds, sampleRate))
 
     let modelVar = model
+    if args.realtimeBench {
+        logProgress(
+            "realtime-bench chunk=\(args.streamChunkMs)ms hop=\(args.streamHopMs)ms batch=\(args.maxBatchMs)ms latest_first=\(args.latestFirst)"
+        )
+        try runRealtimeBenchmark(
+            model: modelVar,
+            samples: samples,
+            sampleRate: sampleRate,
+            args: args
+        )
+        return
+    }
+
     let latest: String
     if args.longformSegmentSec <= 0 {
         logProgress("longform decode left=\(args.leftContextFrames) right=\(args.allowRightContext ? args.rightContextFrames : 0)")

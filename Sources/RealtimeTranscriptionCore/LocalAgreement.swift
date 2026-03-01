@@ -4,7 +4,7 @@ public struct LocalAgreementConfig {
     public let requiredAgreementCount: Int
 
     public init(requiredAgreementCount: Int = 2) {
-        self.requiredAgreementCount = max(2, requiredAgreementCount)
+        self.requiredAgreementCount = max(1, requiredAgreementCount)
     }
 }
 

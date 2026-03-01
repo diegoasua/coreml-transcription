@@ -9,7 +9,7 @@ RUN_PREFIX="${RUN_PREFIX:-parakeet-coreml-english}"
 DATASETS_CSV="${DATASETS_CSV:-earnings22}"
 PROFILES_CSV="${PROFILES_CSV:-fp16,odmbp-approx,odmbp-approx-beam2}"
 NUM_SAMPLES="${NUM_SAMPLES:-}"
-PYTHON_TRANSCRIBER="${PYTHON_TRANSCRIBER:-scripts/parakeet_coreml_rnnt_transcriber.py}"
+PYTHON_TRANSCRIBER="${PYTHON_TRANSCRIBER:-scripts/parakeet_coreml_tdt_transcriber.py}"
 ENABLE_LONGFORM_SEGMENTED="${ENABLE_LONGFORM_SEGMENTED:-0}"
 
 mkdir -p "${RUNS_ROOT}"
@@ -25,12 +25,12 @@ load_profile() {
     fp16)
       # shellcheck source=/dev/null
       source "${REPO_ROOT}/configs/parakeet-coreml-fp16-baseline.env"
-      unset PARAKEET_RNNT_BEAM_WIDTH PARAKEET_RNNT_DURATION_BEAM_WIDTH || true
+      unset PARAKEET_TDT_BEAM_WIDTH PARAKEET_TDT_DURATION_BEAM_WIDTH || true
       ;;
     odmbp-approx)
       # shellcheck source=/dev/null
       source "${REPO_ROOT}/configs/parakeet-coreml-v7-odmbp-approx.env"
-      unset PARAKEET_RNNT_BEAM_WIDTH PARAKEET_RNNT_DURATION_BEAM_WIDTH || true
+      unset PARAKEET_TDT_BEAM_WIDTH PARAKEET_TDT_DURATION_BEAM_WIDTH || true
       ;;
     odmbp-approx-beam2)
       # shellcheck source=/dev/null

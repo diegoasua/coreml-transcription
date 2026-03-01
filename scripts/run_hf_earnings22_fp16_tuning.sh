@@ -27,7 +27,7 @@ for item in "${RUNS[@]}"; do
 
   export PARAKEET_ENCODER_LEFT_CONTEXT_FRAMES="${left}"
   export PARAKEET_ENCODER_RIGHT_CONTEXT_FRAMES="${right}"
-  export PARAKEET_RNNT_MAX_SYMBOLS_PER_STEP="${maxsym}"
+  export PARAKEET_TDT_MAX_SYMBOLS_PER_STEP="${maxsym}"
 
   run_name="parakeet-coreml-earnings22-hf-full-fp16-${suffix}"
   echo "==> ${run_name} (left=${left}, right=${right}, max_symbols=${maxsym})"
@@ -35,7 +35,7 @@ for item in "${RUNS[@]}"; do
   WARMUP_STEPS=0 \
   RUN_NAME="${run_name}" \
   bash scripts/run_hf_open_asr_eval.sh \
-    --python-transcriber scripts/parakeet_coreml_rnnt_transcriber.py
+    --python-transcriber scripts/parakeet_coreml_tdt_transcriber.py
 done
 
 echo

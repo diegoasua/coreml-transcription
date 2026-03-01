@@ -3,7 +3,7 @@ import Foundation
 #if canImport(CoreML)
 import CoreML
 
-public enum ParakeetCoreMLRNNTError: Error {
+public enum ParakeetCoreMLTDTError: Error {
     case sampleRateMismatch(expected: Int, actual: Int)
     case missingRequiredInput(String)
     case invalidModelIO(String)
@@ -11,7 +11,7 @@ public enum ParakeetCoreMLRNNTError: Error {
     case unsupportedArrayRank(Int)
 }
 
-public struct ParakeetCoreMLRNNTConfig {
+public struct ParakeetCoreMLTDTConfig {
     public let expectedSampleRate: Int
     public let durations: [Int]
     public let maxSymbolsPerStep: Int
@@ -21,6 +21,8 @@ public struct ParakeetCoreMLRNNTConfig {
     public let nFFT: Int
     public let windowLength: Int
     public let hopLength: Int
+    public let streamingHistoryFrames: Int
+    public let streamingMinTailDecodeFrames: Int
 
     public init(
         expectedSampleRate: Int = 16_000,
@@ -31,7 +33,9 @@ public struct ParakeetCoreMLRNNTConfig {
         melBins: Int = 128,
         nFFT: Int = 512,
         windowLength: Int = 400,
-        hopLength: Int = 160
+        hopLength: Int = 160,
+        streamingHistoryFrames: Int = 300,
+        streamingMinTailDecodeFrames: Int = 8
     ) {
         self.expectedSampleRate = expectedSampleRate
         self.durations = durations
@@ -42,13 +46,15 @@ public struct ParakeetCoreMLRNNTConfig {
         self.nFFT = nFFT
         self.windowLength = windowLength
         self.hopLength = hopLength
+        self.streamingHistoryFrames = max(64, streamingHistoryFrames)
+        self.streamingMinTailDecodeFrames = max(1, streamingMinTailDecodeFrames)
     }
 }
 
-public final class ParakeetCoreMLRNNTTranscriptionModel: TranscriptionModel {
+public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
     private let encoder: MLModel
     private let decoder: MLModel
-    private let config: ParakeetCoreMLRNNTConfig
+    private let config: ParakeetCoreMLTDTConfig
     private let vocab: [String]
     private let blankID: Int
 
@@ -77,6 +83,8 @@ public final class ParakeetCoreMLRNNTTranscriptionModel: TranscriptionModel {
     private var decoderTargetLengthBuffer: MLMultiArray
     private var previousToken: Int
     private var emittedTokenIDs: [Int]
+    private var streamingSampleHistory: [Float]
+    private let streamingHistorySampleLimit: Int
     private let debugLoggingEnabled: Bool
 
     private let featureExtractor: MelFeatureExtractor
@@ -87,7 +95,8 @@ public final class ParakeetCoreMLRNNTTranscriptionModel: TranscriptionModel {
         encoderModelName: String,
         decoderModelName: String,
         vocabFileName: String = "vocab.txt",
-        config: ParakeetCoreMLRNNTConfig = .init()
+        config: ParakeetCoreMLTDTConfig = .init(),
+        progress: ((String) -> Void)? = nil
     ) throws {
         self.config = config
         self.decoderStateOutputByInputName = [:]
@@ -100,9 +109,12 @@ public final class ParakeetCoreMLRNNTTranscriptionModel: TranscriptionModel {
 
         let mlConfig = MLModelConfiguration()
         mlConfig.computeUnits = config.computeUnits
+        progress?("Loading encoder CoreML model...")
         self.encoder = try Self.loadModel(at: encoderURL, configuration: mlConfig)
+        progress?("Loading decoder CoreML model...")
         self.decoder = try Self.loadModel(at: decoderURL, configuration: mlConfig)
 
+        progress?("Loading vocabulary...")
         self.vocab = try String(contentsOf: vocabURL, encoding: .utf8).split(separator: "\n").map(String.init)
         self.blankID = vocab.count
 
@@ -111,7 +123,7 @@ public final class ParakeetCoreMLRNNTTranscriptionModel: TranscriptionModel {
         self.encoderInputSpecs = encoderInputs
         self.decoderInputSpecs = decoderInputs
         guard let audioInput = encoderInputs["audio_signal"] ?? encoderInputs.values.first else {
-            throw ParakeetCoreMLRNNTError.invalidModelIO("Could not find encoder input.")
+            throw ParakeetCoreMLTDTError.invalidModelIO("Could not find encoder input.")
         }
         self.encoderAudioInputName = audioInput.name
         self.encoderAudioDataType = .float32
@@ -124,7 +136,7 @@ public final class ParakeetCoreMLRNNTTranscriptionModel: TranscriptionModel {
         } else if let inferred = decoderInputs.values.first(where: { $0.name.lowercased().contains("encoder") }) {
             self.decoderEncoderInputName = inferred.name
         } else {
-            throw ParakeetCoreMLRNNTError.invalidModelIO("Could not find decoder encoder input.")
+            throw ParakeetCoreMLTDTError.invalidModelIO("Could not find decoder encoder input.")
         }
 
         self.decoderStateInputNames = decoderInputs.values
@@ -132,7 +144,7 @@ public final class ParakeetCoreMLRNNTTranscriptionModel: TranscriptionModel {
             .map(\.name)
             .sorted()
         guard decoderStateInputNames.count >= 2 else {
-            throw ParakeetCoreMLRNNTError.invalidModelIO("Decoder is missing input_states_* tensors.")
+            throw ParakeetCoreMLTDTError.invalidModelIO("Decoder is missing input_states_* tensors.")
         }
         self.decoderFrameCount = max(1, decoderInputs[decoderEncoderInputName]?.shape.last ?? 300)
         self.decoderEncoderInputShape = decoderInputs[decoderEncoderInputName]?.shape ?? [1, 1024, decoderFrameCount]
@@ -169,6 +181,11 @@ public final class ParakeetCoreMLRNNTTranscriptionModel: TranscriptionModel {
         )
         try Self.setScalarInt(decoderTargetLengthBuffer, value: 1)
         self.previousToken = blankID
+        self.streamingSampleHistory = []
+        self.streamingHistorySampleLimit = max(
+            config.windowLength + config.hopLength,
+            config.streamingHistoryFrames * config.hopLength + config.windowLength
+        )
 
         self.featureExtractor = MelFeatureExtractor(
             sampleRate: config.expectedSampleRate,
@@ -178,36 +195,57 @@ public final class ParakeetCoreMLRNNTTranscriptionModel: TranscriptionModel {
             melBins: config.melBins
         )
         self.minNonZeroDuration = config.durations.filter { $0 > 0 }.min() ?? 1
+        progress?("Model ready.")
     }
 
     public convenience init(
         modelDirectory: URL,
         modelSuffix: String = "odmbp-approx",
         vocabFileName: String = "vocab.txt",
-        config: ParakeetCoreMLRNNTConfig = .init()
+        config: ParakeetCoreMLTDTConfig = .init(),
+        progress: ((String) -> Void)? = nil
     ) throws {
         try self.init(
             modelDirectory: modelDirectory,
             encoderModelName: "encoder-model-\(modelSuffix).mlpackage",
             decoderModelName: "decoder_joint-model-\(modelSuffix).mlpackage",
             vocabFileName: vocabFileName,
-            config: config
+            config: config,
+            progress: progress
         )
     }
 
     public func transcribeChunk(_ samples: [Float], sampleRate: Int) throws -> String {
         guard sampleRate == config.expectedSampleRate else {
-            throw ParakeetCoreMLRNNTError.sampleRateMismatch(expected: config.expectedSampleRate, actual: sampleRate)
+            throw ParakeetCoreMLTDTError.sampleRateMismatch(expected: config.expectedSampleRate, actual: sampleRate)
         }
         if samples.isEmpty {
             return Self.decodePieces(from: emittedTokenIDs, vocab: vocab)
         }
 
-        let (featureMatrix, frameCount) = featureExtractor.extract(samples: samples)
-        let clampedFrames = min(frameCount, encoderFrameCount)
+        // Streaming path: maintain a rolling causal context so tiny realtime chunks
+        // are decoded with sufficient left context.
+        streamingSampleHistory.append(contentsOf: samples)
+        if streamingSampleHistory.count > streamingHistorySampleLimit {
+            streamingSampleHistory.removeFirst(streamingSampleHistory.count - streamingHistorySampleLimit)
+        }
+
+        let (featureMatrix, frameCount) = featureExtractor.extract(samples: streamingSampleHistory)
+        let historyFrames = min(frameCount, encoderFrameCount)
+        let windowFrames = min(historyFrames, config.streamingHistoryFrames)
+        let clampedFrames = max(1, windowFrames)
+        let startFrame = max(0, frameCount - clampedFrames)
+        let approxNewFrames = max(1, Int(round(Double(samples.count) / Double(config.hopLength))))
+        let tailDecodeFrames = min(
+            clampedFrames,
+            max(config.streamingMinTailDecodeFrames, approxNewFrames)
+        )
         if debugLoggingEnabled {
             let preview = featureMatrix.prefix(10).map { String(format: "%.6f", $0) }.joined(separator: ", ")
-            fputs("[ParakeetSwift] feature frames=\(frameCount) clamped=\(clampedFrames) first10=[\(preview)]\n", stderr)
+            fputs(
+                "[ParakeetSwift] feature frames=\(frameCount) window=\(clampedFrames) start=\(startFrame) tail=\(tailDecodeFrames) first10=[\(preview)]\n",
+                stderr
+            )
         }
 
         try Self.fill(array: encoderAudioBuffer, with: 0)
@@ -215,7 +253,7 @@ public final class ParakeetCoreMLRNNTTranscriptionModel: TranscriptionModel {
             featureMatrix: featureMatrix,
             melBins: config.melBins,
             totalFrames: frameCount,
-            startFrame: 0,
+            startFrame: startFrame,
             sourceFrames: clampedFrames,
             destination: encoderAudioBuffer,
             copyFrames: clampedFrames
@@ -247,8 +285,8 @@ public final class ParakeetCoreMLRNNTTranscriptionModel: TranscriptionModel {
         try Self.fill(array: decoderEncoderBuffer, with: 0)
         let copiedFrames = try Self.copyTensorWindowToDecoderInput(
             source: encoderTensor,
-            sourceStartFrame: 0,
-            sourceFrameCount: steps,
+            sourceStartFrame: max(0, steps - min(steps, tailDecodeFrames)),
+            sourceFrameCount: min(steps, tailDecodeFrames),
             destination: decoderEncoderBuffer
         )
         if copiedFrames <= 0 {
@@ -271,7 +309,7 @@ public final class ParakeetCoreMLRNNTTranscriptionModel: TranscriptionModel {
         allowRightContext: Bool = true
     ) throws -> String {
         guard sampleRate == config.expectedSampleRate else {
-            throw ParakeetCoreMLRNNTError.sampleRateMismatch(expected: config.expectedSampleRate, actual: sampleRate)
+            throw ParakeetCoreMLTDTError.sampleRateMismatch(expected: config.expectedSampleRate, actual: sampleRate)
         }
         if samples.isEmpty { return "" }
 
@@ -369,16 +407,17 @@ public final class ParakeetCoreMLRNNTTranscriptionModel: TranscriptionModel {
         try? Self.fill(array: state2, with: 0)
         previousToken = blankID
         emittedTokenIDs.removeAll(keepingCapacity: true)
+        streamingSampleHistory.removeAll(keepingCapacity: true)
     }
 
     private func decodeChunk(decoderEncoderInput: MLMultiArray, encoderSteps: Int) throws -> [Int] {
         let targetInputName = "targets"
         let targetLengthName = "target_length"
         guard decoderInputSpecs[targetInputName] != nil else {
-            throw ParakeetCoreMLRNNTError.missingRequiredInput(targetInputName)
+            throw ParakeetCoreMLTDTError.missingRequiredInput(targetInputName)
         }
         guard decoderInputSpecs[targetLengthName] != nil else {
-            throw ParakeetCoreMLRNNTError.missingRequiredInput(targetLengthName)
+            throw ParakeetCoreMLTDTError.missingRequiredInput(targetLengthName)
         }
 
         let maxTokens = maxTokensForChunk(encoderSteps: encoderSteps)
@@ -389,47 +428,46 @@ public final class ParakeetCoreMLRNNTTranscriptionModel: TranscriptionModel {
         try Self.setScalarInt(targetLength, value: 1)
 
         var t = 0
+        var symbolsAtCurrentTime = 0
+
         while t < encoderSteps && tokenIDs.count < maxTokens {
-            var symbolsAdded = 0
-            var continueLoop = true
-            var skip = 1
+            try Self.setScalarInt(targets, value: previousToken)
 
-            while continueLoop && symbolsAdded < config.maxSymbolsPerStep && tokenIDs.count < maxTokens {
-                try Self.setScalarInt(targets, value: previousToken)
+            let feed: [String: Any] = [
+                decoderEncoderInputName: decoderEncoderInput,
+                targetInputName: targets,
+                targetLengthName: targetLength,
+                decoderStateInputNames[0]: state1,
+                decoderStateInputNames[1]: state2,
+            ]
+            let provider = try MLDictionaryFeatureProvider(dictionary: feed)
+            let output = try decoder.prediction(from: provider)
+            try inferDecoderOutputRolesIfNeeded(output: output, feed: feed)
 
-                let feed: [String: Any] = [
-                    decoderEncoderInputName: decoderEncoderInput,
-                    targetInputName: targets,
-                    targetLengthName: targetLength,
-                    decoderStateInputNames[0]: state1,
-                    decoderStateInputNames[1]: state2,
-                ]
-                let provider = try MLDictionaryFeatureProvider(dictionary: feed)
-                let output = try decoder.prediction(from: provider)
-                try inferDecoderOutputRolesIfNeeded(output: output, feed: feed)
+            guard let logitsName = decoderLogitsOutputName,
+                  let logits = output.featureValue(for: logitsName)?.multiArrayValue else {
+                throw ParakeetCoreMLTDTError.missingOutput("Decoder logits output not found.")
+            }
+            if debugLoggingEnabled && t == 0 && tokenIDs.isEmpty {
+                Self.debugLogitsCandidates(logits: logits, blankID: blankID)
+            }
 
-                guard let logitsName = decoderLogitsOutputName,
-                      let logits = output.featureValue(for: logitsName)?.multiArrayValue else {
-                    throw ParakeetCoreMLRNNTError.missingOutput("Decoder logits output not found.")
-                }
-                if debugLoggingEnabled && t == 0 && tokenIDs.isEmpty {
-                    Self.debugLogitsCandidates(logits: logits, blankID: blankID)
-                }
-                let stepLogits = try Self.extractStepLogits(logits: logits, tIndex: t)
+            // Reuse one decoder pass while no non-blank token is emitted.
+            var scanT = t
+            var emittedTokenInPass = false
+            while scanT < encoderSteps && tokenIDs.count < maxTokens {
+                let stepLogits = try Self.extractStepLogits(logits: logits, tIndex: scanT)
                 let tokenVocabSize = blankID + 1
                 if stepLogits.count < tokenVocabSize {
-                    throw ParakeetCoreMLRNNTError.invalidModelIO("Decoder logits smaller than vocab+blank.")
+                    throw ParakeetCoreMLTDTError.invalidModelIO("Decoder logits smaller than vocab+blank.")
                 }
 
                 let tokenID = Self.argmax(stepLogits[0..<tokenVocabSize])
                 let durationPart = stepLogits[tokenVocabSize..<stepLogits.count]
                 let durationIdx = durationPart.isEmpty ? 1 : Self.argmax(durationPart)
-                skip = config.durations.indices.contains(durationIdx) ? config.durations[durationIdx] : 1
+                var skip = config.durations.indices.contains(durationIdx) ? config.durations[durationIdx] : 1
                 if tokenID == blankID && skip == 0 {
                     skip = minNonZeroDuration
-                }
-                if skip == 0 {
-                    skip = 1
                 }
 
                 if tokenID != blankID {
@@ -441,25 +479,49 @@ public final class ParakeetCoreMLRNNTTranscriptionModel: TranscriptionModel {
                         state1 = next1
                         state2 = next2
                     } else {
-                        throw ParakeetCoreMLRNNTError.missingOutput("Decoder recurrent state outputs not found.")
+                        throw ParakeetCoreMLTDTError.missingOutput("Decoder recurrent state outputs not found.")
                     }
                     previousToken = tokenID
+                    emittedTokenInPass = true
+
+                    if debugLoggingEnabled && tokenIDs.count <= 16 {
+                        fputs(
+                            "[ParakeetSwift] t=\(scanT) token=\(tokenID) skip=\(skip) blank=\(blankID)\n",
+                            stderr
+                        )
+                    }
+
+                    if skip == 0 {
+                        symbolsAtCurrentTime += 1
+                        if symbolsAtCurrentTime >= config.maxSymbolsPerStep {
+                            t = scanT + 1
+                            symbolsAtCurrentTime = 0
+                        } else {
+                            t = scanT
+                        }
+                    } else {
+                        t = scanT + skip
+                        symbolsAtCurrentTime = 0
+                    }
+                    break
                 }
 
+                // Blank: state is unchanged, continue scanning same logits pass.
+                symbolsAtCurrentTime = 0
+                let nonZeroSkip = max(1, skip)
                 if debugLoggingEnabled && tokenIDs.count <= 16 {
                     fputs(
-                        "[ParakeetSwift] t=\(t) token=\(tokenID) skip=\(skip) blank=\(blankID)\n",
+                        "[ParakeetSwift] t=\(scanT) token=\(tokenID) skip=\(nonZeroSkip) blank=\(blankID)\n",
                         stderr
                     )
                 }
-
-                symbolsAdded += 1
-                t += skip
-                continueLoop = (skip == 0)
+                scanT += nonZeroSkip
+                t = scanT
             }
 
-            if symbolsAdded >= config.maxSymbolsPerStep {
-                t += 1
+            if !emittedTokenInPass {
+                // All remaining frames in this pass were blank; decoding done for this chunk.
+                break
             }
         }
 
@@ -551,7 +613,7 @@ private struct ModelInputSpec {
     let dataType: MLMultiArrayDataType
 }
 
-private extension ParakeetCoreMLRNNTTranscriptionModel {
+private extension ParakeetCoreMLTDTTranscriptionModel {
     static func loadModel(at url: URL, configuration: MLModelConfiguration) throws -> MLModel {
         let ext = url.pathExtension.lowercased()
         if ext == "mlmodelc" {
@@ -658,11 +720,11 @@ private extension ParakeetCoreMLRNNTTranscriptionModel {
         copyFrames: Int
     ) throws {
         guard destination.intShape.count == 3 else {
-            throw ParakeetCoreMLRNNTError.unsupportedArrayRank(destination.intShape.count)
+            throw ParakeetCoreMLTDTError.unsupportedArrayRank(destination.intShape.count)
         }
         let shape = destination.intShape
         guard shape[0] >= 1, shape[1] >= melBins, shape[2] >= copyFrames else {
-            throw ParakeetCoreMLRNNTError.invalidModelIO("Encoder input shape mismatch.")
+            throw ParakeetCoreMLTDTError.invalidModelIO("Encoder input shape mismatch.")
         }
         guard totalFrames > 0 else { return }
         let strides = destination.intStrides
@@ -733,7 +795,7 @@ private extension ParakeetCoreMLRNNTTranscriptionModel {
 
         guard let tensorName = bestName,
               let tensor = provider.featureValue(for: tensorName)?.multiArrayValue else {
-            throw ParakeetCoreMLRNNTError.missingOutput("Could not infer encoder tensor output.")
+            throw ParakeetCoreMLTDTError.missingOutput("Could not infer encoder tensor output.")
         }
         if debug {
             fputs("[ParakeetSwift] selected encoder tensor \(tensorName) shape=\(tensor.intShape) length=\(length.map(String.init) ?? "nil")\n", stderr)
@@ -755,7 +817,7 @@ private extension ParakeetCoreMLRNNTTranscriptionModel {
         let srcShape = source.intShape
         let dstShape = destination.intShape
         guard srcShape.count == 3, dstShape.count == 3 else {
-            throw ParakeetCoreMLRNNTError.invalidModelIO("Expected rank-3 tensors for decoder copy.")
+            throw ParakeetCoreMLTDTError.invalidModelIO("Expected rank-3 tensors for decoder copy.")
         }
         let srcStart = max(0, min(sourceStartFrame, srcShape[2]))
         let srcAvailable = max(0, srcShape[2] - srcStart)
@@ -807,7 +869,7 @@ private extension ParakeetCoreMLRNNTTranscriptionModel {
     static func slice3DTensor(_ source: MLMultiArray, startFrame: Int, endFrame: Int) throws -> MLMultiArray {
         let shape = source.intShape
         guard shape.count == 3 else {
-            throw ParakeetCoreMLRNNTError.unsupportedArrayRank(shape.count)
+            throw ParakeetCoreMLTDTError.unsupportedArrayRank(shape.count)
         }
         let start = max(0, min(startFrame, shape[2]))
         let end = max(start, min(endFrame, shape[2]))
@@ -848,7 +910,7 @@ private extension ParakeetCoreMLRNNTTranscriptionModel {
         case 1:
             return (0..<shape[0]).map { v in logits.floatValue(indices: [v]) }
         default:
-            throw ParakeetCoreMLRNNTError.unsupportedArrayRank(shape.count)
+            throw ParakeetCoreMLTDTError.unsupportedArrayRank(shape.count)
         }
     }
 
@@ -859,7 +921,7 @@ private extension ParakeetCoreMLRNNTTranscriptionModel {
         batchIndex: Int?
     ) throws -> [Float] {
         guard dims.count == 3 else {
-            throw ParakeetCoreMLRNNTError.unsupportedArrayRank(dims.count)
+            throw ParakeetCoreMLTDTError.unsupportedArrayRank(dims.count)
         }
 
         // Mirror Python reference logic:

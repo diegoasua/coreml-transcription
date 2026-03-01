@@ -4,7 +4,7 @@ set -euo pipefail
 DATASET="${DATASET:-timit}"
 RUN_NAME="${RUN_NAME:-parakeet-coreml-streaming}"
 NUM_SAMPLES="${NUM_SAMPLES:-}"
-PYTHON_TRANSCRIBER="${PYTHON_TRANSCRIBER:-scripts/parakeet_coreml_rnnt_transcriber.py}"
+PYTHON_TRANSCRIBER="${PYTHON_TRANSCRIBER:-scripts/parakeet_coreml_tdt_transcriber.py}"
 
 ARGS=(
   --dataset "${DATASET}"
