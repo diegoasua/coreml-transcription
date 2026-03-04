@@ -162,22 +162,25 @@ struct ContentView: View {
                 .font(.footnote)
                 .foregroundStyle(.secondary)
 
-            GroupBox("Confirmed") {
+            GroupBox("Transcript") {
                 ScrollView {
-                    Text(vm.confirmedText.isEmpty ? "..." : vm.confirmedText)
+                    if vm.confirmedText.isEmpty && vm.hypothesisText.isEmpty {
+                        Text("...")
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .textSelection(.enabled)
+                    } else {
+                        let draftTail = vm.hypothesisText.isEmpty
+                            ? ""
+                            : (vm.confirmedText.isEmpty ? vm.hypothesisText : " \(vm.hypothesisText)")
+                        Text(
+                            "\(Text(verbatim: vm.confirmedText))\(Text(verbatim: draftTail).foregroundStyle(.secondary))"
+                        )
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .textSelection(.enabled)
+                    }
                 }
-                .frame(minHeight: 140)
-            }
-
-            GroupBox("Draft (Hypothesis)") {
-                ScrollView {
-                    Text(vm.hypothesisText.isEmpty ? "..." : vm.hypothesisText)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .textSelection(.enabled)
-                }
-                .frame(minHeight: 80)
+                .frame(minHeight: 220)
             }
         }
         .padding(16)

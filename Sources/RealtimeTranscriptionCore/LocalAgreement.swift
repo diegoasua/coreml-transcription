@@ -11,29 +11,35 @@ public struct LocalAgreementConfig {
 public struct LocalAgreementStabilizer {
     private let config: LocalAgreementConfig
     private var confirmedWords: [String]
-    private var recentHypotheses: [[String]]
+    private var recentUnconfirmedHypotheses: [[String]]
 
     public init(config: LocalAgreementConfig = .init()) {
         self.config = config
         self.confirmedWords = []
-        self.recentHypotheses = []
+        self.recentUnconfirmedHypotheses = []
     }
 
     public mutating func push(partial: String) -> TranscriptState {
         let words = Self.tokenize(partial)
-        recentHypotheses.append(words)
-        if recentHypotheses.count > config.requiredAgreementCount {
-            recentHypotheses.removeFirst(recentHypotheses.count - config.requiredAgreementCount)
+        let tailWords = Self.unconfirmedTail(words: words, confirmedWords: confirmedWords)
+        recentUnconfirmedHypotheses.append(tailWords)
+        if recentUnconfirmedHypotheses.count > config.requiredAgreementCount {
+            recentUnconfirmedHypotheses.removeFirst(recentUnconfirmedHypotheses.count - config.requiredAgreementCount)
         }
 
-        if recentHypotheses.count == config.requiredAgreementCount {
-            let stablePrefix = Self.commonPrefix(in: recentHypotheses)
-            if stablePrefix.count > confirmedWords.count {
-                confirmedWords = Array(stablePrefix)
+        // LocalAgreement-n over unconfirmed tails:
+        // promote only the common prefix shared by the last n tails.
+        if recentUnconfirmedHypotheses.count == config.requiredAgreementCount {
+            let stableTailPrefix = Self.commonPrefix(in: recentUnconfirmedHypotheses)
+            if !stableTailPrefix.isEmpty {
+                confirmedWords.append(contentsOf: stableTailPrefix)
+                recentUnconfirmedHypotheses = recentUnconfirmedHypotheses.map { hypothesis in
+                    Array(hypothesis.dropFirst(min(stableTailPrefix.count, hypothesis.count)))
+                }
             }
         }
 
-        let hypothesisWords = words.dropFirst(min(words.count, confirmedWords.count))
+        let hypothesisWords = recentUnconfirmedHypotheses.last ?? []
         return TranscriptState(
             confirmed: confirmedWords.joined(separator: " "),
             hypothesis: hypothesisWords.joined(separator: " ")
@@ -41,19 +47,19 @@ public struct LocalAgreementStabilizer {
     }
 
     public mutating func flushSegment() -> TranscriptState {
-        guard let latest = recentHypotheses.last else {
+        guard let latest = recentUnconfirmedHypotheses.last else {
             return TranscriptState(confirmed: confirmedWords.joined(separator: " "), hypothesis: "")
         }
-        if latest.count > confirmedWords.count {
-            confirmedWords = latest
+        if !latest.isEmpty {
+            confirmedWords.append(contentsOf: latest)
         }
-        recentHypotheses.removeAll(keepingCapacity: true)
+        recentUnconfirmedHypotheses.removeAll(keepingCapacity: true)
         return TranscriptState(confirmed: confirmedWords.joined(separator: " "), hypothesis: "")
     }
 
     public mutating func resetAll() {
         confirmedWords.removeAll(keepingCapacity: true)
-        recentHypotheses.removeAll(keepingCapacity: true)
+        recentUnconfirmedHypotheses.removeAll(keepingCapacity: true)
     }
 
     private static func commonPrefix(in sequences: [[String]]) -> [String] {
@@ -76,5 +82,27 @@ public struct LocalAgreementStabilizer {
         text
             .split(whereSeparator: \.isWhitespace)
             .map(String.init)
+    }
+
+    private static func unconfirmedTail(words: [String], confirmedWords: [String]) -> [String] {
+        guard !words.isEmpty else { return [] }
+        guard !confirmedWords.isEmpty else { return words }
+
+        // Confirmed words are immutable once committed. Even if the model
+        // revises them retroactively, keep them frozen and expose only the tail.
+        let overlap = suffixPrefixOverlap(confirmedWords, words, maxOverlap: 64)
+        let drop = min(words.count, max(confirmedWords.count, overlap))
+        return Array(words.dropFirst(drop))
+    }
+
+    private static func suffixPrefixOverlap(_ lhs: [String], _ rhs: [String], maxOverlap: Int) -> Int {
+        let limit = min(maxOverlap, min(lhs.count, rhs.count))
+        guard limit > 0 else { return 0 }
+        for candidate in stride(from: limit, through: 1, by: -1) {
+            if Array(lhs.suffix(candidate)) == Array(rhs.prefix(candidate)) {
+                return candidate
+            }
+        }
+        return 0
     }
 }
