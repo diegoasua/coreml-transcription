@@ -2,6 +2,9 @@ import Foundation
 import RealtimeTranscriptionCore
 
 struct CLIArgs {
+    private static let env = ProcessInfo.processInfo.environment
+    private static let defaultStreamMode = (env["PARAKEET_STREAM_MODE"] ?? "rewrite-prefix").lowercased()
+
     var audioPath: String?
     var modelDir: String?
     var modelSuffix: String = ProcessInfo.processInfo.environment["PARAKEET_COREML_MODEL_SUFFIX"] ?? "odmbp-approx"
@@ -11,17 +14,25 @@ struct CLIArgs {
     var leftContextFrames: Int = Int(ProcessInfo.processInfo.environment["PARAKEET_ENCODER_LEFT_CONTEXT_FRAMES"] ?? "") ?? 300
     var rightContextFrames: Int = Int(ProcessInfo.processInfo.environment["PARAKEET_ENCODER_RIGHT_CONTEXT_FRAMES"] ?? "") ?? 120
     var allowRightContext: Bool = (ProcessInfo.processInfo.environment["PARAKEET_CLI_ALLOW_RIGHT_CONTEXT"] ?? "1") != "0"
-    var maxSymbolsPerStep: Int = Int(ProcessInfo.processInfo.environment["PARAKEET_TDT_MAX_SYMBOLS_PER_STEP"] ?? "") ?? 4
-    var maxTokensPerChunk: Int = Int(ProcessInfo.processInfo.environment["PARAKEET_TDT_MAX_TOKENS_PER_CHUNK"] ?? "") ?? 64
+    var maxSymbolsPerStep: Int = Int(ProcessInfo.processInfo.environment["PARAKEET_TDT_MAX_SYMBOLS_PER_STEP"] ?? "") ?? 10
+    var maxTokensPerChunk: Int = Int(ProcessInfo.processInfo.environment["PARAKEET_TDT_MAX_TOKENS_PER_CHUNK"] ?? "") ?? 0
+    var streamingHistoryFrames: Int = Int(ProcessInfo.processInfo.environment["PARAKEET_STREAM_HISTORY_FRAMES"] ?? "") ?? 300
+    var streamingMinTailFrames: Int = Int(ProcessInfo.processInfo.environment["PARAKEET_STREAM_MIN_TAIL_FRAMES"] ?? "") ?? 8
     var realtimeBench: Bool = false
-    var streamChunkMs: Int = Int(ProcessInfo.processInfo.environment["PARAKEET_STREAM_CHUNK_MS"] ?? "") ?? 160
-    var streamHopMs: Int = Int(ProcessInfo.processInfo.environment["PARAKEET_STREAM_HOP_MS"] ?? "") ?? 80
+    var streamChunkMs: Int = Int(ProcessInfo.processInfo.environment["PARAKEET_STREAM_CHUNK_MS"] ?? "") ??
+        (CLIArgs.defaultStreamMode == "rewrite-prefix" ? 500 : 160)
+    var streamHopMs: Int = Int(ProcessInfo.processInfo.environment["PARAKEET_STREAM_HOP_MS"] ?? "") ??
+        (CLIArgs.defaultStreamMode == "rewrite-prefix" ? 250 : 80)
     var streamAgreement: Int = Int(ProcessInfo.processInfo.environment["PARAKEET_STREAM_AGREEMENT"] ?? "") ?? 2
+    var streamDraftAgreement: Int = Int(ProcessInfo.processInfo.environment["PARAKEET_STREAM_DRAFT_AGREEMENT"] ?? "") ?? 1
     var reportEveryMs: Int = Int(ProcessInfo.processInfo.environment["PARAKEET_BENCH_REPORT_MS"] ?? "") ?? 200
-    var maxBatchMs: Int = Int(ProcessInfo.processInfo.environment["PARAKEET_STREAM_MAX_BATCH_MS"] ?? "") ?? 200
+    var maxBatchMs: Int = Int(ProcessInfo.processInfo.environment["PARAKEET_STREAM_MAX_BATCH_MS"] ?? "") ??
+        (CLIArgs.defaultStreamMode == "rewrite-prefix" ? 500 : 200)
     var latestFirst: Bool = (ProcessInfo.processInfo.environment["PARAKEET_STREAM_LATEST_FIRST"] ?? "1") != "0"
-    var backlogSoftSec: Double = Double(ProcessInfo.processInfo.environment["PARAKEET_STREAM_BACKLOG_SOFT_SEC"] ?? "") ?? 1.5
-    var backlogTargetSec: Double = Double(ProcessInfo.processInfo.environment["PARAKEET_STREAM_BACKLOG_TARGET_SEC"] ?? "") ?? 0.25
+    var backlogSoftSec: Double = Double(ProcessInfo.processInfo.environment["PARAKEET_STREAM_BACKLOG_SOFT_SEC"] ?? "") ??
+        (CLIArgs.defaultStreamMode == "rewrite-prefix" ? 5.0 : 1.5)
+    var backlogTargetSec: Double = Double(ProcessInfo.processInfo.environment["PARAKEET_STREAM_BACKLOG_TARGET_SEC"] ?? "") ??
+        (CLIArgs.defaultStreamMode == "rewrite-prefix" ? 1.5 : 0.25)
     var queuePassSec: Double = Double(ProcessInfo.processInfo.environment["PARAKEET_BENCH_QUEUE_PASS_SEC"] ?? "") ?? 0.5
     var firstTokenPassMs: Double = Double(ProcessInfo.processInfo.environment["PARAKEET_BENCH_FIRST_TOKEN_PASS_MS"] ?? "") ?? 300
     var confirmedPassMs: Double = Double(ProcessInfo.processInfo.environment["PARAKEET_BENCH_CONFIRMED_PASS_MS"] ?? "") ?? 1700
@@ -101,6 +112,11 @@ func parseArgs() -> CLIArgs {
         case "--stream-agreement":
             if i + 1 < argv.count {
                 args.streamAgreement = Int(argv[i + 1]) ?? args.streamAgreement
+                i += 1
+            }
+        case "--stream-draft-agreement":
+            if i + 1 < argv.count {
+                args.streamDraftAgreement = Int(argv[i + 1]) ?? args.streamDraftAgreement
                 i += 1
             }
         case "--report-every-ms":
@@ -382,7 +398,7 @@ func runRealtimeBenchmark(
     let benchVADEnd = Float(ProcessInfo.processInfo.environment["PARAKEET_VAD_END_DBFS"] ?? "") ?? -58
     let benchVADMinSpeech = Int(ProcessInfo.processInfo.environment["PARAKEET_VAD_MIN_SPEECH_MS"] ?? "") ?? 60
     let benchVADMinSilence = Int(ProcessInfo.processInfo.environment["PARAKEET_VAD_MIN_SILENCE_MS"] ?? "") ?? 400
-    let benchDecodeOnlyWhenSpeech = (ProcessInfo.processInfo.environment["PARAKEET_DECODE_ONLY_WHEN_SPEECH"] ?? "1") != "0"
+    let benchDecodeOnlyWhenSpeech = (ProcessInfo.processInfo.environment["PARAKEET_DECODE_ONLY_WHEN_SPEECH"] ?? "0") != "0"
     let benchFlushOnSpeechEnd = (ProcessInfo.processInfo.environment["PARAKEET_STREAM_FLUSH_ON_SPEECH_END"] ?? "0") != "0"
 
     var chunks: [[Float]] = []
@@ -406,6 +422,7 @@ func runRealtimeBenchmark(
         )),
         policy: .init(sampleRate: sampleRate, chunkMs: args.streamChunkMs, hopMs: args.streamHopMs),
         requiredAgreementCount: max(1, args.streamAgreement),
+        draftAgreementCount: max(1, args.streamDraftAgreement),
         decodeOnlyWhenSpeech: benchDecodeOnlyWhenSpeech,
         flushOnSpeechEnd: benchFlushOnSpeechEnd,
         maxSpeechChunkRunBeforeReset: nil,
@@ -424,11 +441,14 @@ func runRealtimeBenchmark(
 
     var prevIsSpeech = false
     var speechStartAudioSec: Double?
+    var speechBaselineDraft = ""
     var speechBaselineMerged = ""
     var speechBaselineConfirmed = ""
-    var speechFirstTokenRecorded = false
+    var speechDraftFirstTokenRecorded = false
+    var speechMergedFirstTokenRecorded = false
     var speechConfirmedRecorded = false
-    var firstTokenMs: [Double] = []
+    var draftFirstTokenMs: [Double] = []
+    var mergedFirstTokenMs: [Double] = []
     var confirmedMs: [Double] = []
     var corrections = 0
     var lastConfirmed = ""
@@ -471,9 +491,11 @@ func runRealtimeBenchmark(
                 _ = engine.finishStream()
                 prevIsSpeech = false
                 speechStartAudioSec = nil
+                speechBaselineDraft = ""
                 speechBaselineMerged = ""
                 speechBaselineConfirmed = ""
-                speechFirstTokenRecorded = false
+                speechDraftFirstTokenRecorded = false
+                speechMergedFirstTokenRecorded = false
                 speechConfirmedRecorded = false
             }
         }
@@ -481,7 +503,21 @@ func runRealtimeBenchmark(
         let batchIndexes: [Int]
         let maxBatchChunks = max(1, maxBatchSamples / hopSamples)
         if args.latestFirst {
-            batchIndexes = Array(queue.suffix(maxBatchChunks))
+            let keepCount = min(maxBatchChunks, queue.count)
+            let dropped = max(0, queue.count - keepCount)
+            if dropped > 0 {
+                droppedChunks += dropped
+                _ = engine.finishStream()
+                prevIsSpeech = false
+                speechStartAudioSec = nil
+                speechBaselineDraft = ""
+                speechBaselineMerged = ""
+                speechBaselineConfirmed = ""
+                speechDraftFirstTokenRecorded = false
+                speechMergedFirstTokenRecorded = false
+                speechConfirmedRecorded = false
+            }
+            batchIndexes = Array(queue.suffix(keepCount))
             queue.removeAll(keepingCapacity: true)
         } else {
             batchIndexes = Array(queue.prefix(maxBatchChunks))
@@ -505,25 +541,36 @@ func runRealtimeBenchmark(
         let latestAudioCursorSec = min(totalAudioSec, Double(latestChunk + 1) * hopSec)
 
         if let event = events.last {
+            let preEventConfirmed = lastConfirmed
+            let preEventDraft = lastHypothesis
+            let preEventMerged = lastMerged
             let merged = mergedTranscript(confirmed: event.transcript.confirmed, hypothesis: event.transcript.hypothesis)
             if debugText, merged != lastMerged {
                 let snippet = String(merged.prefix(160)).replacingOccurrences(of: "\n", with: " ")
                 logProgress("realtime-bench text-change: \(snippet)")
             }
-            lastMerged = merged
             if event.isSpeech, !prevIsSpeech {
                 speechStartAudioSec = latestAudioCursorSec
-                speechBaselineMerged = merged
-                speechBaselineConfirmed = event.transcript.confirmed
-                speechFirstTokenRecorded = false
+                speechBaselineDraft = preEventDraft
+                speechBaselineMerged = preEventMerged
+                speechBaselineConfirmed = preEventConfirmed
+                speechDraftFirstTokenRecorded = false
+                speechMergedFirstTokenRecorded = false
                 speechConfirmedRecorded = false
             }
             if event.isSpeech,
                let startAudio = speechStartAudioSec,
-               !speechFirstTokenRecorded,
+               !speechDraftFirstTokenRecorded,
+               event.transcript.hypothesis != speechBaselineDraft {
+                draftFirstTokenMs.append(max(0, (currentTimeSec - startAudio) * 1000.0))
+                speechDraftFirstTokenRecorded = true
+            }
+            if event.isSpeech,
+               let startAudio = speechStartAudioSec,
+               !speechMergedFirstTokenRecorded,
                merged != speechBaselineMerged {
-                firstTokenMs.append(max(0, (currentTimeSec - startAudio) * 1000.0))
-                speechFirstTokenRecorded = true
+                mergedFirstTokenMs.append(max(0, (currentTimeSec - startAudio) * 1000.0))
+                speechMergedFirstTokenRecorded = true
             }
             if event.isSpeech,
                let startAudio = speechStartAudioSec,
@@ -539,9 +586,11 @@ func runRealtimeBenchmark(
                 }
                 transcriptCursorSec = max(transcriptCursorSec, latestAudioCursorSec)
                 speechStartAudioSec = nil
+                speechBaselineDraft = ""
                 speechBaselineMerged = ""
                 speechBaselineConfirmed = ""
-                speechFirstTokenRecorded = false
+                speechDraftFirstTokenRecorded = false
+                speechMergedFirstTokenRecorded = false
                 speechConfirmedRecorded = false
             }
             if event.transcript.confirmed == lastConfirmed,
@@ -551,6 +600,7 @@ func runRealtimeBenchmark(
             }
             lastConfirmed = event.transcript.confirmed
             lastHypothesis = event.transcript.hypothesis
+            lastMerged = merged
             prevIsSpeech = event.isSpeech
         }
 
@@ -560,9 +610,10 @@ func runRealtimeBenchmark(
             let ingestedAudioSec = min(totalAudioSec, Double(arrivalIndex) * hopSec)
             let inferRTFx = ingestedAudioSec / max(totalInferSec, 1e-9)
             let wallRTFx = ingestedAudioSec / max(currentTimeSec, 1e-9)
-            let firstNow = firstTokenMs.last ?? -1
-            let firstAvg = firstTokenMs.isEmpty ? -1 : (firstTokenMs.reduce(0, +) / Double(firstTokenMs.count))
-            let firstWorst = firstTokenMs.max() ?? -1
+            let firstSeries = draftFirstTokenMs.isEmpty ? mergedFirstTokenMs : draftFirstTokenMs
+            let firstNow = firstSeries.last ?? -1
+            let firstAvg = firstSeries.isEmpty ? -1 : (firstSeries.reduce(0, +) / Double(firstSeries.count))
+            let firstWorst = firstSeries.max() ?? -1
             logProgress(
                 String(
                     format: "realtime-bench t=%.2fs audio=%.2fs transcript=%.2fs queue=%.2fs inf=%.2fx wall=%.2fx first=%.0fms avg=%.0f worst=%.0f drops=%d",
@@ -597,7 +648,10 @@ func runRealtimeBenchmark(
     let inferRTFx = totalAudioSec / max(totalInferSec, 1e-9)
     let wallRTFx = totalAudioSec / max(currentTimeSec, 1e-9)
 
-    let firstP95 = percentile(firstTokenMs, q: 0.95) ?? .infinity
+    let firstTokenSeries = draftFirstTokenMs.isEmpty ? mergedFirstTokenMs : draftFirstTokenMs
+    let firstP95 = percentile(firstTokenSeries, q: 0.95) ?? .infinity
+    let draftFirstP95 = percentile(draftFirstTokenMs, q: 0.95)
+    let mergedFirstP95 = percentile(mergedFirstTokenMs, q: 0.95)
     let confirmedP95 = percentile(confirmedMs, q: 0.95) ?? .infinity
     let correctionsPerMin = totalAudioSec > 0 ? (Double(corrections) / totalAudioSec) * 60.0 : 0.0
 
@@ -612,6 +666,7 @@ func runRealtimeBenchmark(
         "stream_chunk_ms": args.streamChunkMs,
         "stream_hop_ms": args.streamHopMs,
         "agreement": args.streamAgreement,
+        "draft_agreement": args.streamDraftAgreement,
         "latest_first": args.latestFirst,
         "max_batch_ms": args.maxBatchMs,
         "backlog_soft_sec": args.backlogSoftSec,
@@ -620,8 +675,12 @@ func runRealtimeBenchmark(
         "dropped_chunks": droppedChunks,
         "max_queue_sec": maxQueueSecObserved,
         "first_token_ms_p95": firstP95.isFinite ? firstP95 : NSNull(),
+        "draft_first_token_ms_p95": (draftFirstP95 != nil && draftFirstP95!.isFinite) ? draftFirstP95! : NSNull(),
+        "merged_first_token_ms_p95": (mergedFirstP95 != nil && mergedFirstP95!.isFinite) ? mergedFirstP95! : NSNull(),
         "confirmed_latency_ms_p95": confirmedP95.isFinite ? confirmedP95 : NSNull(),
-        "first_token_ms_avg": firstTokenMs.isEmpty ? NSNull() : (firstTokenMs.reduce(0, +) / Double(firstTokenMs.count)),
+        "first_token_ms_avg": firstTokenSeries.isEmpty ? NSNull() : (firstTokenSeries.reduce(0, +) / Double(firstTokenSeries.count)),
+        "draft_first_token_ms_avg": draftFirstTokenMs.isEmpty ? NSNull() : (draftFirstTokenMs.reduce(0, +) / Double(draftFirstTokenMs.count)),
+        "merged_first_token_ms_avg": mergedFirstTokenMs.isEmpty ? NSNull() : (mergedFirstTokenMs.reduce(0, +) / Double(mergedFirstTokenMs.count)),
         "confirmed_latency_ms_avg": confirmedMs.isEmpty ? NSNull() : (confirmedMs.reduce(0, +) / Double(confirmedMs.count)),
         "corrections": corrections,
         "corrections_per_min": correctionsPerMin,
@@ -650,7 +709,13 @@ func runRealtimeBenchmark(
         let url = URL(fileURLWithPath: outPath)
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try summaryData.write(to: url)
+        let confirmedURL = url.deletingPathExtension().appendingPathExtension("confirmed.txt")
+        let hypothesisURL = url.deletingPathExtension().appendingPathExtension("hypothesis.txt")
+        try finalState.confirmed.write(to: confirmedURL, atomically: true, encoding: .utf8)
+        try finalState.hypothesis.write(to: hypothesisURL, atomically: true, encoding: .utf8)
         logProgress("wrote realtime benchmark summary: \(url.path)")
+        logProgress("wrote realtime benchmark confirmed: \(confirmedURL.path)")
+        logProgress("wrote realtime benchmark hypothesis: \(hypothesisURL.path)")
     }
     print(String(decoding: summaryData, as: UTF8.self))
 }
@@ -670,7 +735,9 @@ func runAudioTranscription(args: CLIArgs) throws {
         modelSuffix: args.modelSuffix,
         config: .init(
             maxSymbolsPerStep: args.maxSymbolsPerStep,
-            maxTokensPerChunk: args.maxTokensPerChunk
+            maxTokensPerChunk: args.maxTokensPerChunk,
+            streamingHistoryFrames: args.streamingHistoryFrames,
+            streamingMinTailDecodeFrames: args.streamingMinTailFrames
         )
     )
     logProgress("models loaded")
@@ -686,7 +753,7 @@ func runAudioTranscription(args: CLIArgs) throws {
     let modelVar = model
     if args.realtimeBench {
         logProgress(
-            "realtime-bench chunk=\(args.streamChunkMs)ms hop=\(args.streamHopMs)ms batch=\(args.maxBatchMs)ms latest_first=\(args.latestFirst)"
+            "realtime-bench chunk=\(args.streamChunkMs)ms hop=\(args.streamHopMs)ms agreement=\(args.streamAgreement)/\(args.streamDraftAgreement) batch=\(args.maxBatchMs)ms latest_first=\(args.latestFirst)"
         )
         try runRealtimeBenchmark(
             model: modelVar,

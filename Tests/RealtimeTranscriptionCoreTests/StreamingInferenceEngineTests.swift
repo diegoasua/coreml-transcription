@@ -120,6 +120,38 @@ final class StreamingInferenceEngineTests: XCTestCase {
         XCTAssertFalse(model.seenCounts.isEmpty)
         XCTAssertTrue(model.seenCounts.allSatisfy { $0 == 50 })
     }
+
+    func testPreservesCommittedTranscriptAcrossSegments() throws {
+        let model = NonResettingMockModel(outputs: ["hello", "hello world", "how", "how are"])
+        let vad = MockVAD(decisions: [true, true, false, true, true, false], energyDBFS: -20)
+        var engine = StreamingInferenceEngine(
+            model: model,
+            vad: vad,
+            policy: .init(sampleRate: 1000, chunkMs: 100, hopMs: 100),
+            requiredAgreementCount: 2,
+            decodeOnlyWhenSpeech: true,
+            flushOnSpeechEnd: true,
+            ringBufferCapacity: 800
+        )
+
+        let samples = Array(repeating: Float(0.1), count: 600)
+        let events = try engine.process(samples: samples)
+        XCTAssertEqual(events.count, 6)
+
+        // First segment flush
+        XCTAssertTrue(events[2].didFlushSegment)
+        XCTAssertEqual(events[2].transcript.confirmed, "hello world")
+
+        // Second segment starts from committed prefix (not from empty transcript).
+        XCTAssertFalse(events[3].didFlushSegment)
+        XCTAssertEqual(events[3].transcript.confirmed, "hello world")
+        XCTAssertEqual(events[3].transcript.hypothesis, "how")
+
+        // Final flush includes both segments.
+        XCTAssertTrue(events[5].didFlushSegment)
+        XCTAssertEqual(events[5].transcript.confirmed, "hello world how are")
+        XCTAssertEqual(events[5].transcript.hypothesis, "")
+    }
 }
 
 private struct MockModel: TranscriptionModel {
@@ -173,4 +205,25 @@ private final class RecordingModel: TranscriptionModel {
     }
 
     func resetState() {}
+}
+
+private final class NonResettingMockModel: TranscriptionModel {
+    private let outputs: [String]
+    private var index: Int = 0
+
+    init(outputs: [String]) {
+        self.outputs = outputs
+    }
+
+    func transcribeChunk(_ samples: [Float], sampleRate: Int) throws -> String {
+        let safeIndex = min(index, max(outputs.count - 1, 0))
+        let value = outputs[safeIndex]
+        index += 1
+        return value
+    }
+
+    func resetState() {
+        // Intentionally no-op to simulate a model keeping streaming state
+        // across VAD segment boundaries.
+    }
 }

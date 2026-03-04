@@ -57,6 +57,7 @@ export TMPDIR
 
 if [[ "${SKIP_EXPORT}" == "1" ]]; then
   echo "[1/5] Skipping export (SKIP_EXPORT=1)"
+  echo "  note: if ONNX external data is missing/corrupt, rerun with SKIP_EXPORT=0"
 else
   echo "[1/5] Exporting NeMo model (${EXPORT_FORMATS}): ${MODEL_NAME}"
   "${PYTHON_BIN}" scripts/export_nemo_to_onnx.py \
@@ -80,9 +81,20 @@ for onnx_file in "${onnx_files[@]}"; do
   base_name="$(basename "${onnx_file}" .onnx)"
   manifest_file="${ARTIFACT_DIR}/${base_name}-manifest.json"
   echo "  - inspect ${onnx_file}"
-  "${PYTHON_BIN}" scripts/inspect_onnx.py \
+  if ! "${PYTHON_BIN}" scripts/inspect_onnx.py \
     --onnx "${onnx_file}" \
-    --write-manifest "${manifest_file}"
+    --write-manifest "${manifest_file}"; then
+    if [[ "${SKIP_EXPORT}" == "1" ]]; then
+      echo
+      echo "error: failed to inspect ONNX while SKIP_EXPORT=1."
+      echo "This usually means ONNX external tensor files are missing."
+      echo "fix:"
+      echo "  1) unset SKIP_EXPORT"
+      echo "  2) rerun export with TorchScript regeneration:"
+      echo "     SKIP_EXPORT=0 EXPORT_FORMATS=onnx,ts bash scripts/run_conversion.sh"
+    fi
+    exit 1
+  fi
 done
 
 shopt -s nullglob
@@ -97,25 +109,77 @@ fi
 echo "[3/5] Converting TorchScript -> CoreML (per component)"
 ENCODER_FRAMES="${ENCODER_FRAMES:-300}"
 DECODER_FRAMES="${DECODER_FRAMES:-75}"
+ENABLE_STATEFUL_DECODER="${ENABLE_STATEFUL_DECODER:-0}"
+DECODER_STATEFUL_INPUT_NAMES="${DECODER_STATEFUL_INPUT_NAMES:-input_states_1,input_states_2}"
+DECODER_STATEFUL_WRAPPER_NAMES="${DECODER_STATEFUL_WRAPPER_NAMES:-state_1,state_2}"
+ALLOW_STATEFUL_FALLBACK="${ALLOW_STATEFUL_FALLBACK:-0}"
 mlpackages=()
 for ts_file in "${torchscript_files[@]}"; do
   base_name="$(basename "${ts_file}")"
   base_name="${base_name%.*}"
+  if [[ "${base_name}" == *-stateful-wrapper ]]; then
+    echo "  - skip ${ts_file} (generated wrapper artifact)"
+    continue
+  fi
   manifest_file="${ARTIFACT_DIR}/${base_name}-manifest.json"
+  convert_ts_file="${ts_file}"
+  convert_manifest_file="${manifest_file}"
   output_mlpackage="${ARTIFACT_DIR}/${base_name}.mlpackage"
   if [[ ! -f "${manifest_file}" ]]; then
     echo "  - skip ${ts_file} (missing ${manifest_file})"
     continue
   fi
   echo "  - convert ${ts_file}"
-  "${PYTHON_BIN}" scripts/convert_torchscript_to_coreml.py \
-    --torchscript "${ts_file}" \
-    --manifest "${manifest_file}" \
-    --output "${output_mlpackage}" \
-    --target "${TARGET}" \
-    --compute-units all \
-    --encoder-frames "${ENCODER_FRAMES}" \
+  stateful_args=()
+  if [[ "${ENABLE_STATEFUL_DECODER}" == "1" && "${base_name}" == "decoder_joint-model" ]]; then
+    wrapped_ts="${ARTIFACT_DIR}/${base_name}-stateful-wrapper.ts"
+    wrapped_manifest="${ARTIFACT_DIR}/${base_name}-stateful-wrapper-manifest.json"
+    echo "    building stateful decoder wrapper TorchScript"
+    "${PYTHON_BIN}" scripts/make_stateful_decoder_torchscript.py \
+      --decoder-ts "${ts_file}" \
+      --manifest "${manifest_file}" \
+      --output-ts "${wrapped_ts}" \
+      --output-manifest "${wrapped_manifest}" \
+      --decoder-frames "${DECODER_FRAMES}"
+    convert_ts_file="${wrapped_ts}"
+    convert_manifest_file="${wrapped_manifest}"
+    stateful_args+=( --stateful-input-names "${DECODER_STATEFUL_WRAPPER_NAMES}" )
+    echo "    stateful decoder enabled (wrapper states: ${DECODER_STATEFUL_WRAPPER_NAMES})"
+  fi
+  convert_cmd=(
+    "${PYTHON_BIN}" scripts/convert_torchscript_to_coreml.py
+    --torchscript "${convert_ts_file}"
+    --manifest "${convert_manifest_file}"
+    --output "${output_mlpackage}"
+    --target "${TARGET}"
+    --compute-units all
+    --encoder-frames "${ENCODER_FRAMES}"
     --decoder-frames "${DECODER_FRAMES}"
+  )
+  if [[ ${#stateful_args[@]} -gt 0 ]]; then
+    convert_cmd+=( "${stateful_args[@]}" )
+  fi
+  if ! "${convert_cmd[@]}"; then
+    if [[ "${ENABLE_STATEFUL_DECODER}" == "1" && "${base_name}" == "decoder_joint-model" ]]; then
+      if [[ "${ALLOW_STATEFUL_FALLBACK}" == "1" ]]; then
+        echo "    warning: stateful decoder conversion failed; retrying original stateless decoder conversion (ALLOW_STATEFUL_FALLBACK=1)"
+        "${PYTHON_BIN}" scripts/convert_torchscript_to_coreml.py \
+          --torchscript "${ts_file}" \
+          --manifest "${manifest_file}" \
+          --output "${output_mlpackage}" \
+          --target "${TARGET}" \
+          --compute-units all \
+          --encoder-frames "${ENCODER_FRAMES}" \
+          --decoder-frames "${DECODER_FRAMES}"
+      else
+        echo "error: stateful decoder conversion failed and ALLOW_STATEFUL_FALLBACK=0."
+        echo "fix the stateful wrapper/conversion, or rerun with ALLOW_STATEFUL_FALLBACK=1 to force stateless fallback."
+        exit 1
+      fi
+    else
+      exit 1
+    fi
+  fi
   mlpackages+=( "${output_mlpackage}" )
 done
 

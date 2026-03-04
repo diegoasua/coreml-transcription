@@ -7,6 +7,9 @@ Policy: prioritize low transcript latency over completeness. Dropping stale audi
 - Reach stable realtime behavior for Parakeet TDT CoreML on macOS/iOS modern runtime.
 - Primary KPI: lips-to-screen latency and bounded queue; secondary KPI: correction rate.
 
+## Debug Log
+- Decoder-focused running notes: `docs/realtime-decoder-debug-log.md`
+
 ## Milestones
 
 ### M1. Deterministic Realtime Harness (completed)
@@ -39,6 +42,17 @@ Current status (2026-03-01):
 - Convert decoder model to use CoreML state API (iOS18+/macOS15+ target only).
 - Replace explicit recurrent state IO tensors in runtime with `MLState` prediction path.
 - Keep stateless path behind feature flag for A/B.
+
+Current status:
+- Runtime support implemented:
+  - if decoder has CoreML `stateDescriptionsByName` and `PARAKEET_USE_STATEFUL_DECODER != 0`,
+    use `prediction(from:using:)` with `MLState`.
+  - otherwise fallback to existing stateless recurrent-state tensors.
+- Conversion hook implemented:
+  - `scripts/convert_torchscript_to_coreml.py --stateful-input-names ...`
+  - `scripts/run_conversion.sh` supports:
+    - `ENABLE_STATEFUL_DECODER=1`
+    - `DECODER_STATEFUL_INPUT_NAMES=input_states_1,input_states_2`
 
 Success gate:
 - decoder step latency reduced materially vs stateless baseline

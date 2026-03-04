@@ -2,12 +2,20 @@ import Foundation
 
 public struct StreamingInferenceEvent: Equatable {
     public let transcript: TranscriptState
+    public let revision: Int
     public let isSpeech: Bool
     public let didFlushSegment: Bool
     public let energyDBFS: Float
 
-    public init(transcript: TranscriptState, isSpeech: Bool, didFlushSegment: Bool, energyDBFS: Float) {
+    public init(
+        transcript: TranscriptState,
+        revision: Int = 0,
+        isSpeech: Bool,
+        didFlushSegment: Bool,
+        energyDBFS: Float
+    ) {
         self.transcript = transcript
+        self.revision = revision
         self.isSpeech = isSpeech
         self.didFlushSegment = didFlushSegment
         self.energyDBFS = energyDBFS
@@ -35,6 +43,7 @@ public struct StreamingInferenceEngine<Model: TranscriptionModel, VAD: VoiceActi
         vad: VAD,
         policy: StreamingPolicy = .init(),
         requiredAgreementCount: Int = 2,
+        draftAgreementCount: Int = 1,
         decodeOnlyWhenSpeech: Bool = true,
         flushOnSpeechEnd: Bool = true,
         maxSpeechChunkRunBeforeReset: Int? = nil,
@@ -44,7 +53,10 @@ public struct StreamingInferenceEngine<Model: TranscriptionModel, VAD: VoiceActi
         self.model = model
         self.vad = vad
         self.policy = policy
-        self.textController = StreamingTextController(requiredAgreementCount: requiredAgreementCount)
+        self.textController = StreamingTextController(
+            requiredAgreementCount: requiredAgreementCount,
+            draftAgreementCount: draftAgreementCount
+        )
         self.decodeOnlyWhenSpeech = decodeOnlyWhenSpeech
         self.flushOnSpeechEnd = flushOnSpeechEnd
         self.maxSpeechChunkRunBeforeReset = maxSpeechChunkRunBeforeReset
@@ -80,6 +92,7 @@ public struct StreamingInferenceEngine<Model: TranscriptionModel, VAD: VoiceActi
                 events.append(
                     StreamingInferenceEvent(
                         transcript: state,
+                        revision: textController.revision,
                         isSpeech: decision.isSpeech,
                         didFlushSegment: false,
                         energyDBFS: decision.energyDBFS
@@ -131,6 +144,7 @@ public struct StreamingInferenceEngine<Model: TranscriptionModel, VAD: VoiceActi
                 events.append(
                     StreamingInferenceEvent(
                         transcript: state,
+                        revision: textController.revision,
                         isSpeech: decision.isSpeech,
                         didFlushSegment: true,
                         energyDBFS: decision.energyDBFS
@@ -147,6 +161,7 @@ public struct StreamingInferenceEngine<Model: TranscriptionModel, VAD: VoiceActi
                 events.append(
                     StreamingInferenceEvent(
                         transcript: state,
+                        revision: textController.revision,
                         isSpeech: false,
                         didFlushSegment: true,
                         energyDBFS: decision.energyDBFS

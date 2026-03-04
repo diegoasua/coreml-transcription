@@ -72,6 +72,11 @@ def _get_input_specs(model) -> list[InputSpec]:
     return specs
 
 
+def _get_state_names(model) -> list[str]:
+    proto = model.get_spec()
+    return [entry.name for entry in proto.description.state]
+
+
 def _random_tensor(shape: list[int], dtype):
     import numpy as np
 
@@ -179,6 +184,8 @@ def _prepare_decoder_feed(
     if "target_length" in feeds and "targets" in feeds:
         token_len = int(np.asarray(feeds["targets"]).shape[-1])
         feeds["target_length"] = np.array([token_len], dtype=np.asarray(feeds["target_length"]).dtype)
+    if "state_update_gate" in feeds:
+        feeds["state_update_gate"] = np.array([1.0], dtype=np.asarray(feeds["state_update_gate"]).dtype)
     return feeds
 
 
@@ -260,6 +267,8 @@ def run_benchmark(
 
     encoder_input_specs = _get_input_specs(encoder_model)
     decoder_input_specs = _get_input_specs(decoder_model)
+    decoder_state_names = _get_state_names(decoder_model)
+    decoder_is_stateful = len(decoder_state_names) > 0
 
     encoder_latencies: list[float] = []
     decoder_step_latencies: list[float] = []
@@ -286,11 +295,15 @@ def run_benchmark(
         target_input = None
         target_len_input = None
         state_map: dict[str, str] = {}
+        decoder_state = decoder_model.make_state() if decoder_is_stateful else None
 
         decoder_iter_lat = []
         for _ in range(decoder_steps):
             t2 = time.perf_counter()
-            dec_out = decoder_model.predict(dec_feed)
+            if decoder_state is not None:
+                dec_out = decoder_model.predict(dec_feed, state=decoder_state)
+            else:
+                dec_out = decoder_model.predict(dec_feed)
             t3 = time.perf_counter()
             step_ms = (t3 - t2) * 1000.0
             decoder_iter_lat.append(step_ms)
@@ -339,6 +352,8 @@ def run_benchmark(
         "decoder_steps": decoder_steps,
         "encoder_input_shapes": {spec.name: spec.shape for spec in encoder_input_specs},
         "decoder_input_shapes": {spec.name: spec.shape for spec in decoder_input_specs},
+        "decoder_stateful": decoder_is_stateful,
+        "decoder_state_names": decoder_state_names,
         "encoder_median_ms": enc_median,
         "encoder_p95_ms": enc_p95,
         "decoder_step_median_ms": dec_step_median,

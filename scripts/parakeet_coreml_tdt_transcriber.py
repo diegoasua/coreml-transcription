@@ -137,6 +137,11 @@ def _get_input_specs(model) -> list[_InputSpec]:
     return specs
 
 
+def _get_state_names(model) -> list[str]:
+    proto = model.get_spec()
+    return [entry.name for entry in proto.description.state]
+
+
 class ParakeetCoreMLTDT:
     def __init__(
         self,
@@ -224,8 +229,22 @@ class ParakeetCoreMLTDT:
         self._decoder_logits_output_name = None
         self._decoder_state_map: dict[str, str] = {}
         self._state_input_names = sorted([name for name in self.decoder_inputs_by_name if name.startswith("input_states")])
-        if len(self._state_input_names) < 2:
-            raise RuntimeError("Decoder model must expose at least two state inputs (input_states_*).")
+        self._decoder_state_names = _get_state_names(self.decoder)
+        self._decoder_has_runtime_state = len(self._decoder_state_names) > 0
+        self._decoder_uses_explicit_state_inputs = len(self._state_input_names) >= 2
+        self._decoder_runtime_state = None
+        if not self._decoder_uses_explicit_state_inputs and not self._decoder_has_runtime_state:
+            raise RuntimeError(
+                "Decoder model must expose explicit state inputs (input_states_*) "
+                "or CoreML runtime states (description.state)."
+            )
+        if self._decoder_has_runtime_state and not self._decoder_uses_explicit_state_inputs and self.beam_width > 1:
+            print(
+                "warning: stateful decoder runtime does not support beam branching in this script; "
+                "forcing PARAKEET_TDT_BEAM_WIDTH=1",
+            )
+            self.beam_width = 1
+            self.duration_beam_width = 1
 
         self._encoder_audio_input_name = "audio_signal" if "audio_signal" in self.encoder_inputs_by_name else next(
             iter(self.encoder_inputs_by_name.keys())
@@ -233,6 +252,30 @@ class ParakeetCoreMLTDT:
         self._encoder_length_input_name = "length" if "length" in self.encoder_inputs_by_name else None
         self._encoder_frame_count = int(self.encoder_inputs_by_name[self._encoder_audio_input_name].shape[-1])
         self._nemo_preprocessor = self._build_nemo_preprocessor()
+        self._trace_path = os.environ.get("PARAKEET_PY_DECODER_TRACE_PATH", "").strip()
+        self._trace_max_events = max(1, int(os.environ.get("PARAKEET_PY_DECODER_TRACE_MAX_EVENTS", "200000")))
+        self._trace_events_written = 0
+        self._trace_chunk_index = 0
+        self._trace_handle = None
+        if self._trace_path:
+            trace_file = Path(self._trace_path).expanduser()
+            trace_file.parent.mkdir(parents=True, exist_ok=True)
+            trace_reset = os.environ.get("PARAKEET_PY_DECODER_TRACE_RESET", "1") != "0"
+            if trace_reset and trace_file.exists():
+                trace_file.unlink()
+            self._trace_handle = trace_file.open("a", encoding="utf-8")
+
+    def _trace_decoder_event(self, event: dict[str, Any]) -> None:
+        if self._trace_handle is None:
+            return
+        if self._trace_events_written >= self._trace_max_events:
+            return
+        try:
+            self._trace_handle.write(json.dumps(event, ensure_ascii=True) + "\n")
+            self._trace_handle.flush()
+            self._trace_events_written += 1
+        except Exception:
+            pass
 
     def _build_nemo_preprocessor(self):
         try:
@@ -402,6 +445,9 @@ class ParakeetCoreMLTDT:
                 raise RuntimeError("Could not infer decoder logits output.")
             self._decoder_logits_output_name = candidate
 
+        if not self._decoder_uses_explicit_state_inputs:
+            return
+
         if not self._decoder_state_map:
             state_inputs = sorted([name for name in decoder_feed if name.startswith("input_states")])
             candidates = []
@@ -455,18 +501,40 @@ class ParakeetCoreMLTDT:
         decoder_encoder_input: np.ndarray,
         t_idx: int,
         prev_token: int,
-        state1: np.ndarray,
-        state2: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        state_name_1, state_name_2 = self._state_input_names[:2]
+        state1: np.ndarray | None,
+        state2: np.ndarray | None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None]:
         decoder_feed: dict[str, Any] = {
             self._decoder_encoder_input_name: decoder_encoder_input,
-            "targets": np.array([[prev_token]], dtype=np.int32),
-            "target_length": np.array([1], dtype=np.int32),
-            state_name_1: np.asarray(state1, dtype=np.float32),
-            state_name_2: np.asarray(state2, dtype=np.float32),
+            "targets": np.array(
+                [[prev_token]],
+                dtype=self.decoder_inputs_by_name.get("targets", _InputSpec("targets", [1, 1], np.int32)).dtype,
+            ),
         }
-        decoder_outputs = self.decoder.predict(decoder_feed)
+        if "target_length" in self.decoder_inputs_by_name:
+            decoder_feed["target_length"] = np.array(
+                [1],
+                dtype=self.decoder_inputs_by_name["target_length"].dtype,
+            )
+        if "state_update_gate" in self.decoder_inputs_by_name:
+            decoder_feed["state_update_gate"] = np.array(
+                [1.0],
+                dtype=self.decoder_inputs_by_name["state_update_gate"].dtype,
+            )
+
+        if self._decoder_uses_explicit_state_inputs:
+            if state1 is None or state2 is None:
+                raise RuntimeError("Explicit decoder state inputs require non-null state tensors.")
+            state_name_1, state_name_2 = self._state_input_names[:2]
+            decoder_feed[state_name_1] = np.asarray(state1, dtype=np.float32)
+            decoder_feed[state_name_2] = np.asarray(state2, dtype=np.float32)
+
+        if self._decoder_has_runtime_state and not self._decoder_uses_explicit_state_inputs:
+            if self._decoder_runtime_state is None:
+                self._decoder_runtime_state = self.decoder.make_state()
+            decoder_outputs = self.decoder.predict(decoder_feed, state=self._decoder_runtime_state)
+        else:
+            decoder_outputs = self.decoder.predict(decoder_feed)
         self._infer_decoder_output_roles(decoder_outputs, decoder_feed)
 
         logits = np.asarray(decoder_outputs[self._decoder_logits_output_name])  # type: ignore[index]
@@ -479,6 +547,10 @@ class ParakeetCoreMLTDT:
         token_logp = _log_softmax(token_logits)
         duration_logp = _log_softmax(duration_logits) if duration_logits.size > 0 else np.zeros(1, dtype=np.float32)
 
+        if not self._decoder_uses_explicit_state_inputs:
+            return token_logp, duration_logp, state1, state2
+
+        state_name_1, state_name_2 = self._state_input_names[:2]
         out_state_name_1 = self._decoder_state_map.get(state_name_1)
         out_state_name_2 = self._decoder_state_map.get(state_name_2)
         if out_state_name_1 is None or out_state_name_2 is None:
@@ -502,13 +574,16 @@ class ParakeetCoreMLTDT:
         self,
         decoder_encoder_input: np.ndarray,
         enc_steps: int,
-        state1: np.ndarray,
-        state2: np.ndarray,
+        state1: np.ndarray | None,
+        state2: np.ndarray | None,
         prev_token: int,
-    ) -> tuple[list[int], np.ndarray, np.ndarray, int]:
+        *,
+        chunk_index: int,
+    ) -> tuple[list[int], np.ndarray | None, np.ndarray | None, int]:
         t = 0
         max_tokens = self._chunk_max_tokens(enc_steps)
         output_token_ids: list[int] = []
+        step_index = 0
 
         while t < enc_steps and len(output_token_ids) < max_tokens:
             symbols_added = 0
@@ -516,6 +591,8 @@ class ParakeetCoreMLTDT:
             skip = 1
 
             while need_loop and symbols_added < self.max_symbols_per_step and len(output_token_ids) < max_tokens:
+                t_before = int(t)
+                prev_before = int(prev_token)
                 token_logp, duration_logp, next_state1, next_state2 = self._decoder_step(
                     decoder_encoder_input=decoder_encoder_input,
                     t_idx=t,
@@ -543,6 +620,24 @@ class ParakeetCoreMLTDT:
                     state2 = next_state2
                     prev_token = token_id
 
+                self._trace_decoder_event(
+                    {
+                        "source": "python",
+                        "kind": "step",
+                        "chunk_index": int(chunk_index),
+                        "step_index": int(step_index),
+                        "encoder_steps": int(enc_steps),
+                        "t": int(t_before),
+                        "token_id": int(token_id),
+                        "duration_idx": int(duration_idx),
+                        "skip": int(skip),
+                        "prev_token": int(prev_before),
+                        "emitted": bool(token_id != self.blank_id),
+                        "commit_state": 1,
+                    }
+                )
+                step_index += 1
+
                 symbols_added += 1
                 t += skip
                 need_loop = skip == 0
@@ -550,16 +645,34 @@ class ParakeetCoreMLTDT:
             if symbols_added >= self.max_symbols_per_step:
                 t += 1
 
-        return output_token_ids, np.asarray(state1, dtype=np.float32), np.asarray(state2, dtype=np.float32), prev_token
+        if state1 is not None:
+            state1 = np.asarray(state1, dtype=np.float32)
+        if state2 is not None:
+            state2 = np.asarray(state2, dtype=np.float32)
+        return output_token_ids, state1, state2, prev_token
 
     def _decode_chunk_beam(
         self,
         decoder_encoder_input: np.ndarray,
         enc_steps: int,
-        state1: np.ndarray,
-        state2: np.ndarray,
+        state1: np.ndarray | None,
+        state2: np.ndarray | None,
         prev_token: int,
-    ) -> tuple[list[int], np.ndarray, np.ndarray, int]:
+        *,
+        chunk_index: int,
+    ) -> tuple[list[int], np.ndarray | None, np.ndarray | None, int]:
+        if not self._decoder_uses_explicit_state_inputs:
+            raise RuntimeError("Beam decoding is only supported with explicit decoder state inputs.")
+        if state1 is None or state2 is None:
+            raise RuntimeError("Beam decoding requires non-null decoder state tensors.")
+        self._trace_decoder_event(
+            {
+                "source": "python",
+                "kind": "beam_chunk",
+                "chunk_index": int(chunk_index),
+                "encoder_steps": int(enc_steps),
+            }
+        )
         beam = max(1, self.beam_width)
         token_beam_k = max(1, min(beam, self.blank_id))
         duration_beam_k = max(1, min(self.duration_beam_width, len(self.duration_values)))
@@ -672,28 +785,52 @@ class ParakeetCoreMLTDT:
         self,
         encoder_tensor: np.ndarray,
         enc_steps: int,
-        state1: np.ndarray,
-        state2: np.ndarray,
+        state1: np.ndarray | None,
+        state2: np.ndarray | None,
         prev_token: int,
-    ) -> tuple[list[int], np.ndarray, np.ndarray, int]:
+    ) -> tuple[list[int], np.ndarray | None, np.ndarray | None, int]:
         enc_steps = max(0, min(enc_steps, int(self.decoder_inputs_by_name[self._decoder_encoder_input_name].shape[-1])))
         if enc_steps == 0:
-            return [], np.asarray(state1, dtype=np.float32), np.asarray(state2, dtype=np.float32), int(prev_token)
+            return [], state1, state2, int(prev_token)
 
+        chunk_index = int(self._trace_chunk_index)
+        self._trace_chunk_index += 1
         decoder_encoder_input = self._prepare_decoder_encoder_tensor(encoder_tensor)
         if self.beam_width > 1:
-            return self._decode_chunk_beam(decoder_encoder_input, enc_steps, state1, state2, prev_token)
-        return self._decode_chunk_greedy(decoder_encoder_input, enc_steps, state1, state2, prev_token)
+            return self._decode_chunk_beam(
+                decoder_encoder_input,
+                enc_steps,
+                state1,
+                state2,
+                prev_token,
+                chunk_index=chunk_index,
+            )
+        return self._decode_chunk_greedy(
+            decoder_encoder_input,
+            enc_steps,
+            state1,
+            state2,
+            prev_token,
+            chunk_index=chunk_index,
+        )
 
     def _transcribe_features(self, features: np.ndarray, allow_right_context: bool = True) -> str:
         total_frames = int(features.shape[-1])
         if total_frames <= 0:
             return ""
 
-        state1_shape = self.decoder_inputs_by_name[self._state_input_names[0]].shape
-        state2_shape = self.decoder_inputs_by_name[self._state_input_names[1]].shape
-        state1 = np.zeros(state1_shape, dtype=np.float32)
-        state2 = np.zeros(state2_shape, dtype=np.float32)
+        state1: np.ndarray | None
+        state2: np.ndarray | None
+        if self._decoder_uses_explicit_state_inputs:
+            state1_shape = self.decoder_inputs_by_name[self._state_input_names[0]].shape
+            state2_shape = self.decoder_inputs_by_name[self._state_input_names[1]].shape
+            state1 = np.zeros(state1_shape, dtype=np.float32)
+            state2 = np.zeros(state2_shape, dtype=np.float32)
+            self._decoder_runtime_state = None
+        else:
+            state1 = None
+            state2 = None
+            self._decoder_runtime_state = self.decoder.make_state() if self._decoder_has_runtime_state else None
         prev_token = self.blank_id
 
         max_context_total = max(0, self._encoder_frame_count - 1)

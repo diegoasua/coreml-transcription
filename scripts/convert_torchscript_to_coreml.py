@@ -5,10 +5,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+
+def _state_dtype_for(dtype: Any):
+    # CoreML state tensors currently require fp16.
+    if dtype in (np.float32, np.float64):
+        return np.float16
+    return dtype
 
 
 def _resolve_target(ct, raw_target: str):
@@ -45,10 +53,30 @@ def _dtype_from_manifest(dtype: str):
     key = dtype.upper()
     if key == "FLOAT":
         return np.float32
+    if key in {"FLOAT16", "FP16", "HALF"}:
+        return np.float16
     if key == "INT32":
         return np.int32
     if key == "INT64":
         return np.int64
+    return np.float32
+
+
+def _dtype_from_torch(torch_dtype):
+    import torch
+
+    if torch_dtype == torch.float16:
+        return np.float16
+    if torch_dtype == torch.float32:
+        return np.float32
+    if torch_dtype == torch.float64:
+        return np.float64
+    if torch_dtype == torch.int32:
+        return np.int32
+    if torch_dtype == torch.int64:
+        return np.int64
+    if torch_dtype == torch.int8:
+        return np.int8
     return np.float32
 
 
@@ -139,8 +167,20 @@ def _patch_coremltools_torch_cast_bug() -> None:
     during torch `int` op conversion.
     """
     from coremltools.converters.mil.frontend.torch import ops as torch_ops  # type: ignore
-    from coremltools.converters.mil.frontend.torch.ops import _get_inputs  # type: ignore
+    from coremltools.converters.mil.frontend.torch.ops import (  # type: ignore
+        _cast_to,
+        _get_inputs,
+        _get_kwinputs,
+        NUMPY_DTYPE_TO_TORCH_NUM,
+        NUM_TO_DTYPE_STRING,
+        NUM_TO_TORCH_DTYPE,
+        TorchFrontend,
+        dtype_to_32bit,
+        nptype_from_builtin,
+    )
     from coremltools.converters.mil.mil import Builder as mb  # type: ignore
+    from coremltools.converters.mil.mil import types  # type: ignore
+    import torch
 
     def patched_cast(context, node, dtype, dtype_name):
         inputs = _get_inputs(context, node, expected=1)
@@ -166,6 +206,99 @@ def _patch_coremltools_torch_cast_bug() -> None:
         context.add(res, node.name)
 
     torch_ops._cast = patched_cast
+    try:
+        # CoreMLTools 9 Torch frontend can receive string dtype tokens here.
+        NUM_TO_DTYPE_STRING["fp32"] = "fp32"
+        NUM_TO_DTYPE_STRING["float32"] = "fp32"
+        NUM_TO_DTYPE_STRING["fp16"] = "fp16"
+        NUM_TO_DTYPE_STRING["float16"] = "fp16"
+    except Exception:
+        pass
+
+    def _dtype_str_from_to_arg(dtype_arg):
+        mapping = {
+            "fp16": "fp16",
+            "float16": "fp16",
+            "half": "fp16",
+            "torch.float16": "fp16",
+            "fp32": "fp32",
+            "float32": "fp32",
+            "float": "fp32",
+            "torch.float32": "fp32",
+            "int32": "int32",
+            "torch.int32": "int32",
+            "bool": "bool",
+            "torch.bool": "bool",
+        }
+
+        if isinstance(dtype_arg, str):
+            return mapping.get(dtype_arg.lower(), "fp32")
+
+        try:
+            if dtype_arg in NUM_TO_DTYPE_STRING:
+                return NUM_TO_DTYPE_STRING[dtype_arg]
+        except Exception:
+            pass
+
+        key = str(dtype_arg).lower()
+        if key in mapping:
+            return mapping[key]
+        return "fp32"
+
+    def patched_to(context, node):
+        inputs = _get_inputs(
+            context, node, expected={TorchFrontend.TORCHSCRIPT: (1, 2, 3, 4, 5, 6, 7, 8)}
+        )
+        nargs = len(inputs)
+        _input = inputs[0]
+
+        if context.frontend == TorchFrontend.TORCHSCRIPT:
+            if nargs in (4, 5, 7, 8):
+                dtype = inputs[1]
+            elif nargs == 6:
+                dtype = inputs[2]
+            else:
+                dtype = None
+
+            if dtype is None:
+                context.add(_input, torch_name=node.name)
+                return
+            if types.is_scalar(dtype.sym_type) and dtype.val is not None:
+                dtype = dtype.val
+            else:
+                np_type = nptype_from_builtin(dtype.dtype)
+                dtype = NUMPY_DTYPE_TO_TORCH_NUM[np_type]
+        else:
+            if node.kind in ("to.dtype", "_to_copy") and nargs > 1:
+                dtype = inputs[1]
+            else:
+                dtype = None
+            if dtype is None:
+                context.add(_input, torch_name=node.name)
+                return
+
+        dtype = _get_kwinputs(context, node, "dtype", default=[dtype])[0]
+        if isinstance(dtype, type(_input)):
+            dtype = dtype.val
+
+        if dtype is None:
+            context.add(_input, torch_name=node.name)
+            return
+
+        if _input.can_be_folded_to_const() and not isinstance(dtype, str):
+            torch_dtype = dtype_to_32bit(NUM_TO_TORCH_DTYPE[dtype])
+            res = mb.const(val=torch.tensor(_input.val).type(torch_dtype).cpu().numpy())
+        else:
+            dtype_str = _dtype_str_from_to_arg(dtype)
+            res = _cast_to(_input, dtype_str, node.name)
+        context.add(res, node.name)
+
+    torch_ops.to = patched_to
+    try:
+        torch_ops._TORCH_OPS_REGISTRY.set_func_by_name("to", patched_to)
+        torch_ops._TORCH_OPS_REGISTRY.set_func_by_name("_to_copy", patched_to)
+    except Exception:
+        pass
 
 
 def convert(
@@ -177,6 +310,7 @@ def convert(
     component_name: str | None,
     encoder_frames: int,
     decoder_frames: int,
+    stateful_input_names: list[str] | None = None,
 ):
     import coremltools as ct  # type: ignore
     import torch
@@ -187,6 +321,9 @@ def convert(
 
     _patch_coremltools_torch_cast_bug()
 
+    model = torch.jit.load(str(torchscript_path), map_location="cpu")
+    model.eval()
+
     inputs = _load_tensor_specs(
         ct=ct,
         manifest_path=manifest_path,
@@ -195,17 +332,55 @@ def convert(
         decoder_frames=decoder_frames,
     )
 
-    model = torch.jit.load(str(torchscript_path), map_location="cpu")
-    model.eval()
+    inputs_for_convert = inputs
+    states_for_convert = None
+    if stateful_input_names:
+        desired = {name.strip() for name in stateful_input_names if name.strip()}
+        input_by_name = {spec.name: spec for spec in inputs}
+        buffer_by_name = {name: buf for name, buf in model.named_buffers()}
+        states_for_convert = []
+        unavailable: list[str] = []
+        for name in sorted(desired):
+            if name in input_by_name:
+                spec = input_by_name[name]
+                wrapped = ct.TensorType(shape=spec.shape, dtype=_state_dtype_for(spec.dtype))
+                states_for_convert.append(ct.StateType(wrapped_type=wrapped, name=name))
+            elif name in buffer_by_name:
+                buf = buffer_by_name[name]
+                wrapped = ct.TensorType(
+                    shape=tuple(int(x) for x in buf.shape),
+                    dtype=_state_dtype_for(_dtype_from_torch(buf.dtype)),
+                )
+                states_for_convert.append(ct.StateType(wrapped_type=wrapped, name=name))
+            else:
+                unavailable.append(name)
+        if unavailable:
+            print(
+                "[warning] requested stateful names not found in manifest inputs or TorchScript buffers; "
+                f"stateful conversion disabled. missing: {sorted(unavailable)}; "
+                f"available inputs: {sorted(input_by_name.keys())}; "
+                f"available buffers: {sorted(buffer_by_name.keys())}"
+            )
+            states_for_convert = None
 
-    converted = ct.convert(
-        model,
+    convert_kwargs = dict(
         source="pytorch",
-        inputs=inputs,
+        inputs=inputs_for_convert,
         minimum_deployment_target=target_enum,
         compute_units=compute_enum,
         convert_to="mlprogram",
     )
+    if states_for_convert:
+        convert_kwargs["states"] = states_for_convert
+    try:
+        converted = ct.convert(model, **convert_kwargs)
+    except Exception as exc:
+        if states_for_convert and os.environ.get("COREML_STATEFUL_FALLBACK", "0") == "1":
+            print(f"[warning] stateful conversion failed; retrying stateless conversion (COREML_STATEFUL_FALLBACK=1). reason: {exc}")
+            convert_kwargs.pop("states", None)
+            converted = ct.convert(model, **convert_kwargs)
+        else:
+            raise
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     converted.save(str(output_path))
@@ -230,21 +405,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--component-name", default=None, help="Optional component name override.")
     parser.add_argument("--encoder-frames", type=int, default=300, help="Fallback input time frames for encoder.")
     parser.add_argument("--decoder-frames", type=int, default=75, help="Fallback encoder-output frames for decoder.")
+    parser.add_argument(
+        "--stateful-input-names",
+        default="",
+        help="Comma-separated input tensor names to convert into CoreML states (advanced).",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    output_path = convert(
-        torchscript_path=args.torchscript,
-        manifest_path=args.manifest,
-        output_path=args.output,
-        target=args.target,
-        compute_units=args.compute_units,
-        component_name=args.component_name,
-        encoder_frames=args.encoder_frames,
-        decoder_frames=args.decoder_frames,
-    )
+    try:
+        output_path = convert(
+            torchscript_path=args.torchscript,
+            manifest_path=args.manifest,
+            output_path=args.output,
+            target=args.target,
+            compute_units=args.compute_units,
+            component_name=args.component_name,
+            encoder_frames=args.encoder_frames,
+            decoder_frames=args.decoder_frames,
+            stateful_input_names=[x for x in args.stateful_input_names.split(",") if x.strip()] if args.stateful_input_names else None,
+        )
+    except Exception as exc:
+        print(f"[error] CoreML conversion failed for {args.torchscript}: {exc}")
+        raise SystemExit(1) from exc
     print(f"CoreML conversion complete: {output_path}")
 
 

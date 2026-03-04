@@ -64,3 +64,22 @@ AUDIO_PATH=/path/to/audio.wav \
 RUN_NAME=rt-bench \
 bash scripts/run_realtime_bench_cli.sh
 ```
+
+## Stateful Decoder (Experimental)
+
+Runtime auto-uses CoreML stateful prediction when available:
+
+- requires decoder model with `stateDescriptionsByName`
+- can be disabled with `PARAKEET_USE_STATEFUL_DECODER=0`
+
+Conversion path for decoder:
+
+```bash
+ENABLE_STATEFUL_DECODER=1 \
+DECODER_STATEFUL_INPUT_NAMES=input_states_1,input_states_2 \
+bash scripts/run_conversion.sh
+```
+
+Notes:
+- This conversion mode depends on source TorchScript/state naming compatibility.
+- If conversion fails, runtime still works with the current stateless decoder path.

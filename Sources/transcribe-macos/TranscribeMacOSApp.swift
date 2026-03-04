@@ -171,7 +171,7 @@ struct ContentView: View {
                 .frame(minHeight: 140)
             }
 
-            GroupBox("Hypothesis") {
+            GroupBox("Draft (Hypothesis)") {
                 ScrollView {
                     Text(vm.hypothesisText.isEmpty ? "..." : vm.hypothesisText)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -192,11 +192,13 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
     @Published var confirmedText: String = ""
     @Published var hypothesisText: String = ""
     @Published var status: String = "Idle"
-    @Published var metrics: String = "RTFx(inf/wall)=0.0/0.0 | first-token=n/a"
+    @Published var metrics: String = "RTFx(inf/wall)=0.0/0.0 | draft=n/a | confirmed=n/a"
     @Published var isRunning: Bool = false
     @Published var isStarting: Bool = false
     @Published var modelDirectory: String = defaultParakeetModelDirectoryPath()
     @Published var modelSuffix: String = ProcessInfo.processInfo.environment["PARAKEET_COREML_MODEL_SUFFIX"] ?? "odmbp-approx"
+
+    private static let streamModeDefault = (ProcessInfo.processInfo.environment["PARAKEET_STREAM_MODE"] ?? "rewrite-prefix").lowercased()
 
     private typealias InferenceEngine = StreamingInferenceEngine<ParakeetCoreMLTDTTranscriptionModel, EnergyVAD>
     private var inferenceEngine: InferenceEngine?
@@ -206,10 +208,13 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
     private let audioEngine = AVAudioEngine()
     private var audioConverter: AVAudioConverter?
     private let targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16_000, channels: 1, interleaved: false)!
-    private let chunkMs = Int(ProcessInfo.processInfo.environment["PARAKEET_STREAM_CHUNK_MS"] ?? "") ?? 160
-    private let hopMs = Int(ProcessInfo.processInfo.environment["PARAKEET_STREAM_HOP_MS"] ?? "") ?? 80
+    private let chunkMs = Int(ProcessInfo.processInfo.environment["PARAKEET_STREAM_CHUNK_MS"] ?? "") ??
+        (MicTranscriptionViewModel.streamModeDefault == "rewrite-prefix" ? 500 : 160)
+    private let hopMs = Int(ProcessInfo.processInfo.environment["PARAKEET_STREAM_HOP_MS"] ?? "") ??
+        (MicTranscriptionViewModel.streamModeDefault == "rewrite-prefix" ? 250 : 80)
     private let agreementCount = Int(ProcessInfo.processInfo.environment["PARAKEET_STREAM_AGREEMENT"] ?? "") ?? 2
-    private let decodeOnlyWhenSpeech = (ProcessInfo.processInfo.environment["PARAKEET_DECODE_ONLY_WHEN_SPEECH"] ?? "1") != "0"
+    private let draftAgreementCount = Int(ProcessInfo.processInfo.environment["PARAKEET_STREAM_DRAFT_AGREEMENT"] ?? "") ?? 1
+    private let decodeOnlyWhenSpeech = (ProcessInfo.processInfo.environment["PARAKEET_DECODE_ONLY_WHEN_SPEECH"] ?? "0") != "0"
     private let flushOnSpeechEnd: Bool = {
         let env = ProcessInfo.processInfo.environment
         if let explicit = env["PARAKEET_STREAM_FLUSH_ON_SPEECH_END"], !explicit.isEmpty {
@@ -221,8 +226,8 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
     }()
     private let maxSpeechChunkRunBeforeReset = Int(ProcessInfo.processInfo.environment["PARAKEET_STREAM_MAX_SPEECH_CHUNKS"] ?? "") ?? 240
     private let maxStagnantSpeechChunks = Int(ProcessInfo.processInfo.environment["PARAKEET_STREAM_MAX_STAGNANT_CHUNKS"] ?? "") ?? 24
-    private let maxSymbolsPerStep = Int(ProcessInfo.processInfo.environment["PARAKEET_TDT_MAX_SYMBOLS_PER_STEP"] ?? "") ?? 4
-    private let maxTokensPerChunk = Int(ProcessInfo.processInfo.environment["PARAKEET_TDT_MAX_TOKENS_PER_CHUNK"] ?? "") ?? 64
+    private let maxSymbolsPerStep = Int(ProcessInfo.processInfo.environment["PARAKEET_TDT_MAX_SYMBOLS_PER_STEP"] ?? "") ?? 10
+    private let maxTokensPerChunk = Int(ProcessInfo.processInfo.environment["PARAKEET_TDT_MAX_TOKENS_PER_CHUNK"] ?? "") ?? 0
     private let streamingHistoryFrames = Int(ProcessInfo.processInfo.environment["PARAKEET_STREAM_HISTORY_FRAMES"] ?? "") ?? 300
     private let streamingMinTailDecodeFrames = Int(ProcessInfo.processInfo.environment["PARAKEET_STREAM_MIN_TAIL_FRAMES"] ?? "") ?? 8
     private let vadStartThresholdDBFS = Float(ProcessInfo.processInfo.environment["PARAKEET_VAD_START_DBFS"] ?? "") ?? -50
@@ -241,12 +246,18 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
         if let raw = env["PARAKEET_STREAM_BACKLOG_SOFT_SEC"], let sec = Double(raw), sec > 0 {
             return Int(sec * 16_000.0)
         }
+        if MicTranscriptionViewModel.streamModeDefault == "rewrite-prefix" {
+            return Int(5.0 * 16_000.0)
+        }
         return Int(1.5 * 16_000.0)
     }()
     private let backlogTargetSamples: Int = {
         let env = ProcessInfo.processInfo.environment
         if let raw = env["PARAKEET_STREAM_BACKLOG_TARGET_SEC"], let sec = Double(raw), sec > 0 {
             return Int(sec * 16_000.0)
+        }
+        if MicTranscriptionViewModel.streamModeDefault == "rewrite-prefix" {
+            return Int(1.5 * 16_000.0)
         }
         return Int(0.4 * 16_000.0)
     }()
@@ -256,6 +267,9 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
         if let raw = env["PARAKEET_STREAM_MAX_BATCH_SEC"], let sec = Double(raw), sec > 0 {
             return max(1, Int(sec * 16_000.0))
         }
+        if MicTranscriptionViewModel.streamModeDefault == "rewrite-prefix" {
+            return Int(0.5 * 16_000.0)
+        }
         // Keep UI responsive and avoid bursty "all-at-once" transcript updates.
         return Int(0.25 * 16_000.0)
     }()
@@ -263,9 +277,15 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
     private var totalInferenceSec: Double = 0
     private var runStartedAtSec: Double = 0
     private var currentSpeechStartedAtSec: Double?
-    private var currentSpeechBaselineText: String = ""
-    private var currentSpeechFirstTokenLatencyMs: Double?
-    private var firstTokenLatencyMsSamples: [Double] = []
+    private var currentSpeechBaselineDraft: String = ""
+    private var currentSpeechBaselineConfirmed: String = ""
+    private var currentSpeechDraftLatencyMs: Double?
+    private var currentSpeechConfirmedLatencyMs: Double?
+    private var draftLatencyMsSamples: [Double] = []
+    private var confirmedLatencyMsSamples: [Double] = []
+    private var previousEventWasSpeech = false
+    private var lastObservedConfirmedText = ""
+    private var lastObservedHypothesisText = ""
     private var modelLoadStartedAt: Date?
     private var modelLoadTimer: Timer?
     private let metricsLogEnabled = (ProcessInfo.processInfo.environment["PARAKEET_METRICS_LOG"] ?? "0") != "0"
@@ -363,6 +383,7 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
                         ),
                         policy: .init(sampleRate: 16_000, chunkMs: self.chunkMs, hopMs: self.hopMs),
                         requiredAgreementCount: self.agreementCount,
+                        draftAgreementCount: self.draftAgreementCount,
                         decodeOnlyWhenSpeech: self.decodeOnlyWhenSpeech,
                         flushOnSpeechEnd: self.flushOnSpeechEnd,
                         maxSpeechChunkRunBeforeReset: self.maxSpeechChunkRunBeforeReset,
@@ -400,9 +421,15 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
         stopModelLoadTicker()
         runStartedAtSec = 0
         currentSpeechStartedAtSec = nil
-        currentSpeechBaselineText = ""
-        currentSpeechFirstTokenLatencyMs = nil
-        firstTokenLatencyMsSamples.removeAll(keepingCapacity: false)
+        currentSpeechBaselineDraft = ""
+        currentSpeechBaselineConfirmed = ""
+        currentSpeechDraftLatencyMs = nil
+        currentSpeechConfirmedLatencyMs = nil
+        draftLatencyMsSamples.removeAll(keepingCapacity: false)
+        confirmedLatencyMsSamples.removeAll(keepingCapacity: false)
+        previousEventWasSpeech = false
+        lastObservedConfirmedText = ""
+        lastObservedHypothesisText = ""
 
         queue.sync {
             if var engine = inferenceEngine {
@@ -413,7 +440,7 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
                 DispatchQueue.main.async {
                     self.confirmedText = finalConfirmed
                     self.hypothesisText = finalHypothesis
-                    self.metrics = "RTFx(inf/wall)=0.0/0.0 | first-token=n/a"
+                    self.metrics = "RTFx(inf/wall)=0.0/0.0 | draft=n/a | confirmed=n/a"
                 }
             }
         }
@@ -427,9 +454,15 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
         stopModelLoadTicker()
         runStartedAtSec = 0
         currentSpeechStartedAtSec = nil
-        currentSpeechBaselineText = ""
-        currentSpeechFirstTokenLatencyMs = nil
-        firstTokenLatencyMsSamples.removeAll(keepingCapacity: false)
+        currentSpeechBaselineDraft = ""
+        currentSpeechBaselineConfirmed = ""
+        currentSpeechDraftLatencyMs = nil
+        currentSpeechConfirmedLatencyMs = nil
+        draftLatencyMsSamples.removeAll(keepingCapacity: false)
+        confirmedLatencyMsSamples.removeAll(keepingCapacity: false)
+        previousEventWasSpeech = false
+        lastObservedConfirmedText = ""
+        lastObservedHypothesisText = ""
         pendingLock.lock()
         pendingSamples.removeAll(keepingCapacity: false)
         processingScheduled = false
@@ -437,42 +470,80 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
 
         do {
             let inputNode = audioEngine.inputNode
-            let inputFormat = inputNode.inputFormat(forBus: 0)
             inputDeviceName = defaultInputDeviceName() ?? "unknown"
             fputs("[transcribe-macos] input device: \(inputDeviceName)\n", stderr)
-            fputs("[transcribe-macos] input format: \(Int(inputFormat.sampleRate)) Hz, channels \(inputFormat.channelCount)\n", stderr)
 
-            if enableVoiceProcessing {
-                do {
+            var activeVoiceProcessing = false
+
+            func configureInputPath(voiceProcessing: Bool) throws -> AVAudioFormat {
+                if voiceProcessing {
                     try inputNode.setVoiceProcessingEnabled(true)
                     inputNode.isVoiceProcessingBypassed = false
                     inputNode.isVoiceProcessingAGCEnabled = enableVoiceProcessingAGC
+                    activeVoiceProcessing = true
+                } else {
+                    if enableVoiceProcessing {
+                        do {
+                            try inputNode.setVoiceProcessingEnabled(false)
+                        } catch {
+                            fputs("[transcribe-macos] unable to disable voice processing cleanly: \(error)\n", stderr)
+                        }
+                    }
+                    activeVoiceProcessing = false
+                }
+
+                let inputFormat = inputNode.inputFormat(forBus: 0)
+                fputs(
+                    "[transcribe-macos] input format: \(Int(inputFormat.sampleRate)) Hz, channels \(inputFormat.channelCount), vp=\(activeVoiceProcessing ? "on" : "off")\n",
+                    stderr
+                )
+
+                guard let converter = AVAudioConverter(from: inputFormat, to: targetFormat) else {
+                    throw NSError(
+                        domain: "transcribe-macos",
+                        code: 10,
+                        userInfo: [NSLocalizedDescriptionKey: "Failed to create AVAudioConverter"]
+                    )
+                }
+                audioConverter = converter
+
+                inputNode.removeTap(onBus: 0)
+                inputNode.installTap(onBus: 0, bufferSize: 2048, format: inputFormat) { [weak self] buffer, _ in
+                    self?.handleAudioBuffer(buffer)
+                }
+                return inputFormat
+            }
+
+            if enableVoiceProcessing {
+                do {
+                    _ = try configureInputPath(voiceProcessing: true)
                 } catch {
                     fputs("[transcribe-macos] voice processing unavailable: \(error)\n", stderr)
+                    _ = try configureInputPath(voiceProcessing: false)
+                }
+            } else {
+                _ = try configureInputPath(voiceProcessing: false)
+            }
+
+            do {
+                try audioEngine.start()
+            } catch {
+                if activeVoiceProcessing {
+                    fputs("[transcribe-macos] audio start failed with voice processing (\(error)); retrying without voice processing\n", stderr)
+                    audioEngine.stop()
+                    _ = try configureInputPath(voiceProcessing: false)
+                    try audioEngine.start()
+                } else {
+                    throw error
                 }
             }
 
-            guard let converter = AVAudioConverter(from: inputFormat, to: targetFormat) else {
-                throw NSError(
-                    domain: "transcribe-macos",
-                    code: 10,
-                    userInfo: [NSLocalizedDescriptionKey: "Failed to create AVAudioConverter"]
-                )
-            }
-            audioConverter = converter
-
-            inputNode.removeTap(onBus: 0)
-            inputNode.installTap(onBus: 0, bufferSize: 2048, format: inputFormat) { [weak self] buffer, _ in
-                self?.handleAudioBuffer(buffer)
-            }
-
-            try audioEngine.start()
             isRunning = true
             isStarting = false
 #if DEBUG
-            status = "Listening... (DEBUG build; slower) chunk \(chunkMs)ms / hop \(hopMs)ms | mic \(inputDeviceName)"
+            status = "Listening... (DEBUG build; slower) chunk \(chunkMs)ms / hop \(hopMs)ms | mic \(inputDeviceName) | vp \(activeVoiceProcessing ? "on" : "off")"
 #else
-            status = "Listening... (chunk \(chunkMs)ms / hop \(hopMs)ms) | mic \(inputDeviceName)"
+            status = "Listening... (chunk \(chunkMs)ms / hop \(hopMs)ms) | mic \(inputDeviceName) | vp \(activeVoiceProcessing ? "on" : "off")"
 #endif
             activateAppWindow()
         } catch {
@@ -616,8 +687,13 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
                 let flushedHypothesis = flushed.hypothesis
                 inferenceEngine = engine
                 currentSpeechStartedAtSec = nil
-                currentSpeechBaselineText = ""
-                currentSpeechFirstTokenLatencyMs = nil
+                currentSpeechBaselineDraft = ""
+                currentSpeechBaselineConfirmed = ""
+                currentSpeechDraftLatencyMs = nil
+                currentSpeechConfirmedLatencyMs = nil
+                previousEventWasSpeech = false
+                lastObservedConfirmedText = flushedConfirmed
+                lastObservedHypothesisText = flushedHypothesis
                 DispatchQueue.main.async {
                     self.confirmedText = flushedConfirmed
                     self.hypothesisText = flushedHypothesis
@@ -640,42 +716,69 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
 
                 if let latest = events.last {
                     let now = CFAbsoluteTimeGetCurrent()
-                    if latest.didFlushSegment {
-                        if let observed = currentSpeechFirstTokenLatencyMs {
-                            firstTokenLatencyMsSamples.append(observed)
-                        }
-                        currentSpeechStartedAtSec = nil
-                        currentSpeechBaselineText = ""
-                        currentSpeechFirstTokenLatencyMs = nil
-                    } else if latest.isSpeech {
-                        let merged = mergedTranscript(confirmed: latest.transcript.confirmed, hypothesis: latest.transcript.hypothesis)
-                        if currentSpeechStartedAtSec == nil {
+                    for event in events {
+                        if event.isSpeech, !previousEventWasSpeech {
                             currentSpeechStartedAtSec = now
-                            currentSpeechBaselineText = merged
-                            currentSpeechFirstTokenLatencyMs = nil
-                        } else if currentSpeechFirstTokenLatencyMs == nil, merged != currentSpeechBaselineText {
-                            let latencyMs = (now - (currentSpeechStartedAtSec ?? now)) * 1000.0
-                            currentSpeechFirstTokenLatencyMs = latencyMs
-                            firstTokenLatencyMsSamples.append(latencyMs)
+                            currentSpeechBaselineDraft = lastObservedHypothesisText
+                            currentSpeechBaselineConfirmed = lastObservedConfirmedText
+                            currentSpeechDraftLatencyMs = nil
+                            currentSpeechConfirmedLatencyMs = nil
+                        }
+                        if event.isSpeech,
+                           let startedAt = currentSpeechStartedAtSec,
+                           currentSpeechDraftLatencyMs == nil,
+                           event.transcript.hypothesis != currentSpeechBaselineDraft {
+                            let latencyMs = (now - startedAt) * 1000.0
+                            currentSpeechDraftLatencyMs = latencyMs
+                            draftLatencyMsSamples.append(latencyMs)
                             if metricsLogEnabled {
-                                fputs(String(format: "[metrics] first-token-latency=%.1f ms\n", latencyMs), stderr)
+                                fputs(String(format: "[metrics] draft-first-token=%.1f ms\n", latencyMs), stderr)
                             }
                         }
+                        if event.isSpeech,
+                           let startedAt = currentSpeechStartedAtSec,
+                           currentSpeechConfirmedLatencyMs == nil,
+                           event.transcript.confirmed != currentSpeechBaselineConfirmed {
+                            let latencyMs = (now - startedAt) * 1000.0
+                            currentSpeechConfirmedLatencyMs = latencyMs
+                            confirmedLatencyMsSamples.append(latencyMs)
+                            if metricsLogEnabled {
+                                fputs(String(format: "[metrics] confirmed-latency=%.1f ms\n", latencyMs), stderr)
+                            }
+                        }
+                        if event.didFlushSegment, let startedAt = currentSpeechStartedAtSec {
+                            if currentSpeechConfirmedLatencyMs == nil {
+                                let latencyMs = (now - startedAt) * 1000.0
+                                currentSpeechConfirmedLatencyMs = latencyMs
+                                confirmedLatencyMsSamples.append(latencyMs)
+                                if metricsLogEnabled {
+                                    fputs(String(format: "[metrics] confirmed-latency-flush=%.1f ms\n", latencyMs), stderr)
+                                }
+                            }
+                            currentSpeechStartedAtSec = nil
+                            currentSpeechBaselineDraft = ""
+                            currentSpeechBaselineConfirmed = ""
+                            currentSpeechDraftLatencyMs = nil
+                            currentSpeechConfirmedLatencyMs = nil
+                        }
+                        previousEventWasSpeech = event.isSpeech
+                        lastObservedConfirmedText = event.transcript.confirmed
+                        lastObservedHypothesisText = event.transcript.hypothesis
                     }
 
-                    let firstTokenCurrent = currentSpeechFirstTokenLatencyMs ?? firstTokenLatencyMsSamples.last
-                    let firstTokenAvg = firstTokenLatencyMsSamples.isEmpty ? nil : firstTokenLatencyMsSamples.reduce(0, +) / Double(firstTokenLatencyMsSamples.count)
-                    let firstTokenWorst = firstTokenLatencyMsSamples.max()
-                    let firstTokenSummary: String
-                    if let current = firstTokenCurrent {
-                        if let avg = firstTokenAvg, let worst = firstTokenWorst {
-                            firstTokenSummary = String(format: "first-token %.0fms (avg %.0f / worst %.0f)", current, avg, worst)
-                        } else {
-                            firstTokenSummary = String(format: "first-token %.0fms", current)
-                        }
-                    } else {
-                        firstTokenSummary = "first-token n/a"
-                    }
+                    let draftCurrent = currentSpeechDraftLatencyMs ?? draftLatencyMsSamples.last
+                    let draftAvg = draftLatencyMsSamples.isEmpty ? nil : draftLatencyMsSamples.reduce(0, +) / Double(draftLatencyMsSamples.count)
+                    let draftP95 = Self.percentile(draftLatencyMsSamples, q: 0.95)
+                    let confirmedCurrent = currentSpeechConfirmedLatencyMs ?? confirmedLatencyMsSamples.last
+                    let confirmedAvg = confirmedLatencyMsSamples.isEmpty ? nil : confirmedLatencyMsSamples.reduce(0, +) / Double(confirmedLatencyMsSamples.count)
+                    let confirmedP95 = Self.percentile(confirmedLatencyMsSamples, q: 0.95)
+                    let metricsLine = String(
+                        format: "RTFx(inf/wall)=%.1f/%.1f | draft %@ | confirmed %@",
+                        inferRTFx,
+                        wallRTFx,
+                        Self.formatLatency(current: draftCurrent, avg: draftAvg, p95: draftP95),
+                        Self.formatLatency(current: confirmedCurrent, avg: confirmedAvg, p95: confirmedP95)
+                    )
 
                     // For UI responsiveness, prefer the newest non-flush event for
                     // display; flush events are still useful for finalization but
@@ -696,21 +799,24 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
                         self.confirmedText = latestConfirmed
                         self.hypothesisText = latestHypothesis
                         self.status = statusLine
-                        self.metrics = firstTokenSummary
+                        self.metrics = metricsLine
                     }
                 } else {
-                    let firstTokenAvg = firstTokenLatencyMsSamples.isEmpty ? nil : firstTokenLatencyMsSamples.reduce(0, +) / Double(firstTokenLatencyMsSamples.count)
-                    let firstTokenWorst = firstTokenLatencyMsSamples.max()
-                    let firstTokenSummary: String
-                    if let avg = firstTokenAvg, let worst = firstTokenWorst {
-                        firstTokenSummary = String(format: "first-token avg %.0fms / worst %.0fms", avg, worst)
-                    } else {
-                        firstTokenSummary = "first-token n/a"
-                    }
+                    let draftAvg = draftLatencyMsSamples.isEmpty ? nil : draftLatencyMsSamples.reduce(0, +) / Double(draftLatencyMsSamples.count)
+                    let draftP95 = Self.percentile(draftLatencyMsSamples, q: 0.95)
+                    let confirmedAvg = confirmedLatencyMsSamples.isEmpty ? nil : confirmedLatencyMsSamples.reduce(0, +) / Double(confirmedLatencyMsSamples.count)
+                    let confirmedP95 = Self.percentile(confirmedLatencyMsSamples, q: 0.95)
+                    let metricsLine = String(
+                        format: "RTFx(inf/wall)=%.1f/%.1f | draft %@ | confirmed %@",
+                        inferRTFx,
+                        wallRTFx,
+                        Self.formatLatency(current: nil, avg: draftAvg, p95: draftP95),
+                        Self.formatLatency(current: nil, avg: confirmedAvg, p95: confirmedP95)
+                    )
                     let statusLine = String(format: "Listening... | inf %.1fx | wall %.1fx | queue %.1fs", inferRTFx, wallRTFx, queuedAfterPopSec)
                     DispatchQueue.main.async {
                         self.status = statusLine
-                        self.metrics = firstTokenSummary
+                        self.metrics = metricsLine
                     }
                 }
             } catch {
@@ -729,6 +835,31 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
         if c.isEmpty { return h }
         if h.isEmpty { return c }
         return c + " " + h
+    }
+
+    private static func percentile(_ values: [Double], q: Double) -> Double? {
+        guard !values.isEmpty else { return nil }
+        let sorted = values.sorted()
+        if sorted.count == 1 { return sorted[0] }
+        let idx = max(0, min(Double(sorted.count - 1), q * Double(sorted.count - 1)))
+        let lo = Int(floor(idx))
+        let hi = Int(ceil(idx))
+        if lo == hi { return sorted[lo] }
+        let frac = idx - Double(lo)
+        return sorted[lo] * (1.0 - frac) + sorted[hi] * frac
+    }
+
+    private static func formatLatency(current: Double?, avg: Double?, p95: Double?) -> String {
+        if let current, let avg, let p95 {
+            return String(format: "%.0fms (avg %.0f p95 %.0f)", current, avg, p95)
+        }
+        if let avg, let p95 {
+            return String(format: "n/a (avg %.0f p95 %.0f)", avg, p95)
+        }
+        if let current {
+            return String(format: "%.0fms", current)
+        }
+        return "n/a"
     }
 
     private func startModelLoadTicker() {
