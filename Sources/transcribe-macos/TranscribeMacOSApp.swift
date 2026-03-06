@@ -237,8 +237,13 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
     private let vadEndThresholdDBFS = Float(ProcessInfo.processInfo.environment["PARAKEET_VAD_END_DBFS"] ?? "") ?? -58
     private let vadMinSpeechMs = Int(ProcessInfo.processInfo.environment["PARAKEET_VAD_MIN_SPEECH_MS"] ?? "") ?? 60
     private let vadMinSilenceMs = Int(ProcessInfo.processInfo.environment["PARAKEET_VAD_MIN_SILENCE_MS"] ?? "") ?? 400
-    private let enableVoiceProcessing = (ProcessInfo.processInfo.environment["PARAKEET_AUDIO_VOICE_PROCESSING"] ?? "1") != "0"
-    private let enableVoiceProcessingAGC = (ProcessInfo.processInfo.environment["PARAKEET_AUDIO_VOICE_PROCESSING_AGC"] ?? "1") != "0"
+    private let enableVoiceProcessing = (ProcessInfo.processInfo.environment["PARAKEET_AUDIO_VOICE_PROCESSING"] ?? "0") != "0"
+    private let enableVoiceProcessingAGC = (ProcessInfo.processInfo.environment["PARAKEET_AUDIO_VOICE_PROCESSING_AGC"] ?? "0") != "0"
+    private let forcedInputChannelIndex: Int? = {
+        let env = ProcessInfo.processInfo.environment
+        guard let raw = env["PARAKEET_AUDIO_INPUT_CHANNEL"], let parsed = Int(raw) else { return nil }
+        return max(0, parsed - 1)
+    }()
     private let pendingLock = NSLock()
     private var pendingSamples: [Float] = []
     private var processingScheduled = false
@@ -293,6 +298,7 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
     private var modelLoadTimer: Timer?
     private let metricsLogEnabled = (ProcessInfo.processInfo.environment["PARAKEET_METRICS_LOG"] ?? "0") != "0"
     private var inputDeviceName: String = "unknown"
+    private var selectedInputChannel: Int?
 
     func toggle() {
         if isRunning {
@@ -433,6 +439,7 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
         previousEventWasSpeech = false
         lastObservedConfirmedText = ""
         lastObservedHypothesisText = ""
+        selectedInputChannel = nil
 
         queue.sync {
             if var engine = inferenceEngine {
@@ -466,6 +473,7 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
         previousEventWasSpeech = false
         lastObservedConfirmedText = ""
         lastObservedHypothesisText = ""
+        selectedInputChannel = nil
         pendingLock.lock()
         pendingSamples.removeAll(keepingCapacity: false)
         processingScheduled = false
@@ -500,6 +508,17 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
                     "[transcribe-macos] input format: \(Int(inputFormat.sampleRate)) Hz, channels \(inputFormat.channelCount), vp=\(activeVoiceProcessing ? "on" : "off")\n",
                     stderr
                 )
+
+                if voiceProcessing, inputFormat.channelCount > 2 {
+                    throw NSError(
+                        domain: "transcribe-macos",
+                        code: 11,
+                        userInfo: [
+                            NSLocalizedDescriptionKey:
+                                "Voice processing yielded \(inputFormat.channelCount) channels; falling back to vp=off for compatibility"
+                        ]
+                    )
+                }
 
                 guard let converter = AVAudioConverter(from: inputFormat, to: targetFormat) else {
                     throw NSError(
@@ -559,6 +578,14 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
     }
 
     private func handleAudioBuffer(_ buffer: AVAudioPCMBuffer) {
+        if Int(buffer.format.channelCount) > 1,
+           let monoSamples = extractPreferredMonoSamples(from: buffer) {
+            if !monoSamples.isEmpty {
+                enqueueSamplesForProcessing(monoSamples)
+            }
+            return
+        }
+
         guard let converter = audioConverter else { return }
         let targetFrames = AVAudioFrameCount(Double(buffer.frameLength) * targetFormat.sampleRate / buffer.format.sampleRate + 64)
         guard let converted = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: targetFrames) else { return }
@@ -584,6 +611,85 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
 
         let samples = Array(UnsafeBufferPointer(start: channel, count: frameCount))
         enqueueSamplesForProcessing(samples)
+    }
+
+    private func extractPreferredMonoSamples(from buffer: AVAudioPCMBuffer) -> [Float]? {
+        guard let channels = buffer.floatChannelData else { return nil }
+        let channelCount = Int(buffer.format.channelCount)
+        let frameCount = Int(buffer.frameLength)
+        guard channelCount > 1, frameCount > 0 else { return nil }
+
+        let pickedChannel: Int
+        if let forced = forcedInputChannelIndex, forced < channelCount {
+            pickedChannel = forced
+            if selectedInputChannel != forced {
+                selectedInputChannel = forced
+                if metricsLogEnabled {
+                    fputs(
+                        "[transcribe-macos] forcing input channel \(forced + 1)/\(channelCount)\n",
+                        stderr
+                    )
+                }
+            }
+        } else if let selected = selectedInputChannel, selected >= 0, selected < channelCount {
+            pickedChannel = selected
+        } else {
+            var bestChannel = 0
+            var bestEnergy: Float = -.infinity
+            for idx in 0 ..< channelCount {
+                let ptr = channels[idx]
+                var energy: Float = 0
+                var i = 0
+                while i < frameCount {
+                    let v = ptr[i]
+                    energy += v * v
+                    i += 1
+                }
+                if energy > bestEnergy {
+                    bestEnergy = energy
+                    bestChannel = idx
+                }
+            }
+            selectedInputChannel = bestChannel
+            pickedChannel = bestChannel
+            if metricsLogEnabled {
+                fputs(
+                    "[transcribe-macos] selected input channel \(bestChannel + 1)/\(channelCount)\n",
+                    stderr
+                )
+            }
+        }
+
+        let src = channels[pickedChannel]
+        var mono = Array(UnsafeBufferPointer(start: src, count: frameCount))
+        let inputRate = buffer.format.sampleRate
+        let outputRate = targetFormat.sampleRate
+        if abs(inputRate - outputRate) > 1e-6 {
+            mono = Self.resampleLinear(mono, from: inputRate, to: outputRate)
+        }
+        return mono
+    }
+
+    private static func resampleLinear(_ input: [Float], from inputRate: Double, to outputRate: Double) -> [Float] {
+        guard !input.isEmpty else { return [] }
+        guard inputRate > 0, outputRate > 0 else { return input }
+        if abs(inputRate - outputRate) < 1e-6 { return input }
+
+        let ratio = outputRate / inputRate
+        let outputCount = max(1, Int((Double(input.count) * ratio).rounded()))
+        if input.count == 1 {
+            return Array(repeating: input[0], count: outputCount)
+        }
+
+        var output = Array(repeating: Float(0), count: outputCount)
+        for outIdx in 0 ..< outputCount {
+            let srcPos = Double(outIdx) / ratio
+            let lo = min(max(Int(floor(srcPos)), 0), input.count - 1)
+            let hi = min(lo + 1, input.count - 1)
+            let frac = Float(srcPos - Double(lo))
+            output[outIdx] = input[lo] * (1 - frac) + input[hi] * frac
+        }
+        return output
     }
 
     private func enqueueSamplesForProcessing(_ samples: [Float]) {
@@ -718,10 +824,15 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
                 inferenceEngine = engine
 
                 if let latest = events.last {
-                    let now = CFAbsoluteTimeGetCurrent()
-                    for event in events {
+                    let eventCount = max(1, events.count)
+                    for (eventIndex, event) in events.enumerated() {
+                        // Approximate when this event became available within the
+                        // batch processing window to avoid zero-latency artifacts.
+                        let progress = Double(eventIndex + 1) / Double(eventCount)
+                        let eventWallTime = started + elapsed * progress
+
                         if event.isSpeech, !previousEventWasSpeech {
-                            currentSpeechStartedAtSec = now
+                            currentSpeechStartedAtSec = eventWallTime
                             currentSpeechBaselineDraft = lastObservedHypothesisText
                             currentSpeechBaselineConfirmed = lastObservedConfirmedText
                             currentSpeechDraftLatencyMs = nil
@@ -731,7 +842,12 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
                            let startedAt = currentSpeechStartedAtSec,
                            currentSpeechDraftLatencyMs == nil,
                            event.transcript.hypothesis != currentSpeechBaselineDraft {
-                            let latencyMs = (now - startedAt) * 1000.0
+                            var latencyMs = max(0.0, (eventWallTime - startedAt) * 1000.0)
+                            if latencyMs < 1.0 {
+                                // Same-event speech start + token emission can look
+                                // like 0ms with batch timestamps; use hop as floor.
+                                latencyMs = Double(self.hopMs)
+                            }
                             currentSpeechDraftLatencyMs = latencyMs
                             draftLatencyMsSamples.append(latencyMs)
                             if metricsLogEnabled {
@@ -742,7 +858,7 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
                            let startedAt = currentSpeechStartedAtSec,
                            currentSpeechConfirmedLatencyMs == nil,
                            event.transcript.confirmed != currentSpeechBaselineConfirmed {
-                            let latencyMs = (now - startedAt) * 1000.0
+                            let latencyMs = max(0.0, (eventWallTime - startedAt) * 1000.0)
                             currentSpeechConfirmedLatencyMs = latencyMs
                             confirmedLatencyMsSamples.append(latencyMs)
                             if metricsLogEnabled {
@@ -751,7 +867,7 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
                         }
                         if event.didFlushSegment, let startedAt = currentSpeechStartedAtSec {
                             if currentSpeechConfirmedLatencyMs == nil {
-                                let latencyMs = (now - startedAt) * 1000.0
+                                let latencyMs = max(0.0, (eventWallTime - startedAt) * 1000.0)
                                 currentSpeechConfirmedLatencyMs = latencyMs
                                 confirmedLatencyMsSamples.append(latencyMs)
                                 if metricsLogEnabled {

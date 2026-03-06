@@ -45,8 +45,8 @@ backlog_target_sec="${PARAKEET_STREAM_BACKLOG_TARGET_SEC:-$default_backlog_targe
 latest_first="${PARAKEET_STREAM_LATEST_FIRST:-$default_latest_first}"
 max_symbols_per_step="${PARAKEET_TDT_MAX_SYMBOLS_PER_STEP:-10}"
 max_tokens_per_chunk="${PARAKEET_TDT_MAX_TOKENS_PER_CHUNK:-0}"
-voice_processing="${PARAKEET_AUDIO_VOICE_PROCESSING:-1}"
-voice_processing_agc="${PARAKEET_AUDIO_VOICE_PROCESSING_AGC:-1}"
+voice_processing="${PARAKEET_AUDIO_VOICE_PROCESSING:-0}"
+voice_processing_agc="${PARAKEET_AUDIO_VOICE_PROCESSING_AGC:-0}"
 
 encoder="$model_dir/encoder-model-$suffix.mlpackage"
 decoder="$model_dir/decoder_joint-model-$suffix.mlpackage"

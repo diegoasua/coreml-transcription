@@ -229,10 +229,19 @@ class ParakeetCoreMLTDT:
         self._decoder_logits_output_name = None
         self._decoder_state_map: dict[str, str] = {}
         self._state_input_names = sorted([name for name in self.decoder_inputs_by_name if name.startswith("input_states")])
+        self._state_update_gate_input_name = "state_update_gate" if "state_update_gate" in self.decoder_inputs_by_name else None
+        self._step_index_input_name = "step_index" if "step_index" in self.decoder_inputs_by_name else None
         self._decoder_state_names = _get_state_names(self.decoder)
         self._decoder_has_runtime_state = len(self._decoder_state_names) > 0
         self._decoder_uses_explicit_state_inputs = len(self._state_input_names) >= 2
         self._decoder_runtime_state = None
+        self._stateful_commit_policy = os.environ.get("PARAKEET_STATEFUL_COMMIT_POLICY", "emit_prevtoken").strip().lower()
+        if self._stateful_commit_policy not in {"always", "emit_prevtoken", "emit_token", "auto_nonblank"}:
+            print(
+                "warning: unsupported PARAKEET_STATEFUL_COMMIT_POLICY="
+                f"{self._stateful_commit_policy!r}; falling back to 'emit_prevtoken'",
+            )
+            self._stateful_commit_policy = "emit_prevtoken"
         if not self._decoder_uses_explicit_state_inputs and not self._decoder_has_runtime_state:
             raise RuntimeError(
                 "Decoder model must expose explicit state inputs (input_states_*) "
@@ -245,6 +254,28 @@ class ParakeetCoreMLTDT:
             )
             self.beam_width = 1
             self.duration_beam_width = 1
+        if (
+            self._decoder_has_runtime_state
+            and not self._decoder_uses_explicit_state_inputs
+            and self._stateful_commit_policy != "always"
+            and self._state_update_gate_input_name is None
+        ):
+            print(
+                "warning: runtime-stateful decoder does not expose state_update_gate; "
+                "falling back to PARAKEET_STATEFUL_COMMIT_POLICY='always'",
+            )
+            self._stateful_commit_policy = "always"
+        if (
+            self._decoder_has_runtime_state
+            and not self._decoder_uses_explicit_state_inputs
+            and self._stateful_commit_policy == "auto_nonblank"
+            and self._step_index_input_name is None
+        ):
+            print(
+                "warning: runtime-stateful decoder does not expose step_index; "
+                "falling back to PARAKEET_STATEFUL_COMMIT_POLICY='always'",
+            )
+            self._stateful_commit_policy = "always"
 
         self._encoder_audio_input_name = "audio_signal" if "audio_signal" in self.encoder_inputs_by_name else next(
             iter(self.encoder_inputs_by_name.keys())
@@ -496,18 +527,20 @@ class ParakeetCoreMLTDT:
             return int(self.duration_values[duration_idx])
         return 1
 
-    def _decoder_step(
+    def _build_decoder_feed(
         self,
+        *,
         decoder_encoder_input: np.ndarray,
+        token: int,
         t_idx: int,
-        prev_token: int,
         state1: np.ndarray | None,
         state2: np.ndarray | None,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None]:
+        gate_value: float | None,
+    ) -> dict[str, Any]:
         decoder_feed: dict[str, Any] = {
             self._decoder_encoder_input_name: decoder_encoder_input,
             "targets": np.array(
-                [[prev_token]],
+                [[token]],
                 dtype=self.decoder_inputs_by_name.get("targets", _InputSpec("targets", [1, 1], np.int32)).dtype,
             ),
         }
@@ -516,10 +549,17 @@ class ParakeetCoreMLTDT:
                 [1],
                 dtype=self.decoder_inputs_by_name["target_length"].dtype,
             )
-        if "state_update_gate" in self.decoder_inputs_by_name:
-            decoder_feed["state_update_gate"] = np.array(
-                [1.0],
-                dtype=self.decoder_inputs_by_name["state_update_gate"].dtype,
+        if self._state_update_gate_input_name is not None:
+            if gate_value is None:
+                gate_value = 1.0
+            decoder_feed[self._state_update_gate_input_name] = np.array(
+                [float(gate_value)],
+                dtype=self.decoder_inputs_by_name[self._state_update_gate_input_name].dtype,
+            )
+        if self._step_index_input_name is not None:
+            decoder_feed[self._step_index_input_name] = np.array(
+                [int(t_idx)],
+                dtype=self.decoder_inputs_by_name[self._step_index_input_name].dtype,
             )
 
         if self._decoder_uses_explicit_state_inputs:
@@ -528,6 +568,49 @@ class ParakeetCoreMLTDT:
             state_name_1, state_name_2 = self._state_input_names[:2]
             decoder_feed[state_name_1] = np.asarray(state1, dtype=np.float32)
             decoder_feed[state_name_2] = np.asarray(state2, dtype=np.float32)
+        return decoder_feed
+
+    def _commit_runtime_decoder_state(self, *, decoder_encoder_input: np.ndarray, token: int) -> None:
+        if not self._decoder_has_runtime_state or self._decoder_uses_explicit_state_inputs:
+            return
+        if self._state_update_gate_input_name is None:
+            return
+        if self._decoder_runtime_state is None:
+            self._decoder_runtime_state = self.decoder.make_state()
+        decoder_feed = self._build_decoder_feed(
+            decoder_encoder_input=decoder_encoder_input,
+            token=token,
+            t_idx=0,
+            state1=None,
+            state2=None,
+            gate_value=1.0,
+        )
+        _ = self.decoder.predict(decoder_feed, state=self._decoder_runtime_state)
+
+    def _decoder_step(
+        self,
+        decoder_encoder_input: np.ndarray,
+        t_idx: int,
+        prev_token: int,
+        state1: np.ndarray | None,
+        state2: np.ndarray | None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None]:
+        gate_value: float | None = None
+        if self._decoder_has_runtime_state and not self._decoder_uses_explicit_state_inputs:
+            if self._stateful_commit_policy in {"emit_prevtoken", "emit_token"}:
+                gate_value = 0.0
+            elif self._stateful_commit_policy == "auto_nonblank":
+                gate_value = 2.0
+            elif self._state_update_gate_input_name is not None:
+                gate_value = 1.0
+        decoder_feed = self._build_decoder_feed(
+            decoder_encoder_input=decoder_encoder_input,
+            token=prev_token,
+            t_idx=t_idx,
+            state1=state1,
+            state2=state2,
+            gate_value=gate_value,
+        )
 
         if self._decoder_has_runtime_state and not self._decoder_uses_explicit_state_inputs:
             if self._decoder_runtime_state is None:
@@ -616,6 +699,16 @@ class ParakeetCoreMLTDT:
 
                 if token_id != self.blank_id:
                     output_token_ids.append(token_id)
+                    if (
+                        self._decoder_has_runtime_state
+                        and not self._decoder_uses_explicit_state_inputs
+                        and self._stateful_commit_policy in {"emit_prevtoken", "emit_token"}
+                    ):
+                        commit_token = prev_before if self._stateful_commit_policy == "emit_prevtoken" else token_id
+                        self._commit_runtime_decoder_state(
+                            decoder_encoder_input=decoder_encoder_input,
+                            token=commit_token,
+                        )
                     state1 = next_state1
                     state2 = next_state2
                     prev_token = token_id

@@ -57,6 +57,26 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
         case incremental
     }
 
+    private enum StatefulCommitPolicy {
+        case always
+        case emitPrevToken
+        case emitToken
+        case autoNonBlank
+
+        init(raw: String) {
+            switch raw {
+            case "always":
+                self = .always
+            case "emit_token":
+                self = .emitToken
+            case "auto_nonblank":
+                self = .autoNonBlank
+            default:
+                self = .emitPrevToken
+            }
+        }
+    }
+
     private let encoder: MLModel
     private let decoder: MLModel
     private let config: ParakeetCoreMLTDTConfig
@@ -80,6 +100,8 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
     private let decoderEncoderInputDataType: MLMultiArrayDataType
     private let decoderFrameCount: Int
     private let decoderStateUpdateGateInputName: String?
+    private let decoderStepIndexInputName: String?
+    private let statefulCommitPolicy: StatefulCommitPolicy
     private let streamingFinalizeDraftEnabled: Bool
     private let streamingEmitDraftEnabled: Bool
     private let streamingDeterministicCursorEnabled: Bool
@@ -105,6 +127,7 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
     private var decoderTargetsBuffer: MLMultiArray
     private var decoderTargetLengthBuffer: MLMultiArray
     private var decoderStateUpdateGateBuffer: MLMultiArray?
+    private var decoderStepIndexBuffer: MLMultiArray?
     private var decoderState: MLState?
     private var previousToken: Int
     private var committedTokenIDs: [Int]
@@ -258,11 +281,43 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
         )
         self.streamingPrefixAllowRightContext =
             (ProcessInfo.processInfo.environment["PARAKEET_STREAM_PREFIX_ALLOW_RIGHT_CONTEXT"] ?? "0") == "1"
+        let statefulCommitPolicyRaw =
+            (ProcessInfo.processInfo.environment["PARAKEET_STATEFUL_COMMIT_POLICY"] ?? "emit_prevtoken").lowercased()
         if let gateInput = decoderInputs["state_update_gate"] ??
             decoderInputs.values.first(where: { $0.name.lowercased().contains("state_update_gate") }) {
             self.decoderStateUpdateGateInputName = gateInput.name
         } else {
             self.decoderStateUpdateGateInputName = nil
+        }
+        if let stepInput = decoderInputs["step_index"] ??
+            decoderInputs.values.first(where: { $0.name.lowercased().contains("step_index") }) {
+            self.decoderStepIndexInputName = stepInput.name
+        } else {
+            self.decoderStepIndexInputName = nil
+        }
+        let requestedCommitPolicy = StatefulCommitPolicy(raw: statefulCommitPolicyRaw)
+        if useStatefulDecoderRuntime,
+           (requestedCommitPolicy == .emitPrevToken || requestedCommitPolicy == .emitToken || requestedCommitPolicy == .autoNonBlank),
+           decoderStateUpdateGateInputName == nil {
+            if debugLoggingEnabled {
+                fputs(
+                    "[ParakeetSwift] warning: stateful commit policy requires state_update_gate; falling back to always\n",
+                    stderr
+                )
+            }
+            self.statefulCommitPolicy = .always
+        } else if useStatefulDecoderRuntime,
+                  requestedCommitPolicy == .autoNonBlank,
+                  decoderStepIndexInputName == nil {
+            if debugLoggingEnabled {
+                fputs(
+                    "[ParakeetSwift] warning: auto_nonblank requires step_index input; falling back to always\n",
+                    stderr
+                )
+            }
+            self.statefulCommitPolicy = .always
+        } else {
+            self.statefulCommitPolicy = requestedCommitPolicy
         }
 
         let stateSpec1 = decoderStateInputNames.indices.contains(0) ? decoderInputs[decoderStateInputNames[0]] : nil
@@ -305,6 +360,15 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
         } else {
             self.decoderStateUpdateGateBuffer = nil
         }
+        if let stepName = decoderStepIndexInputName, let stepSpec = decoderInputs[stepName] {
+            self.decoderStepIndexBuffer = try Self.makeArray(
+                shape: stepSpec.shape,
+                dataType: stepSpec.dataType
+            )
+            try Self.setScalarInt(self.decoderStepIndexBuffer!, value: 0)
+        } else {
+            self.decoderStepIndexBuffer = nil
+        }
         if #available(macOS 15.0, iOS 18.0, *), useStatefulDecoderRuntime {
             self.decoderState = decoder.makeState()
         } else {
@@ -335,6 +399,14 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
         if debugLoggingEnabled {
             let mode = useStatefulDecoderRuntime ? "stateful" : "stateless"
             fputs("[ParakeetSwift] decoder runtime mode=\(mode)\n", stderr)
+            let commitPolicy: String
+            switch statefulCommitPolicy {
+            case .always: commitPolicy = "always"
+            case .emitPrevToken: commitPolicy = "emit_prevtoken"
+            case .emitToken: commitPolicy = "emit_token"
+            case .autoNonBlank: commitPolicy = "auto_nonblank"
+            }
+            fputs("[ParakeetSwift] stateful commit policy=\(commitPolicy)\n", stderr)
             let streamMode = streamingMode == .rewritePrefix ? "rewrite-prefix" : "incremental"
             fputs("[ParakeetSwift] streaming mode=\(streamMode)\n", stderr)
         }
@@ -826,10 +898,28 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
                     targetInputName: targets,
                     targetLengthName: targetLength,
                 ]
+                if let stepName = decoderStepIndexInputName,
+                   let stepArray = decoderStepIndexBuffer {
+                    try Self.setScalarInt(stepArray, value: t)
+                    feed[stepName] = stepArray
+                }
                 if useStatefulDecoderRuntime,
                    let gateName = decoderStateUpdateGateInputName,
                    let gateArray = decoderStateUpdateGateBuffer {
-                    try Self.setScalarGate(gateArray, value: 0)
+                    let firstPassGateValue: Int
+                    if !commitState {
+                        firstPassGateValue = 0
+                    } else {
+                        switch statefulCommitPolicy {
+                        case .always:
+                            firstPassGateValue = 1
+                        case .autoNonBlank:
+                            firstPassGateValue = 2
+                        case .emitPrevToken, .emitToken:
+                            firstPassGateValue = 0
+                        }
+                    }
+                    try Self.setScalarGate(gateArray, value: firstPassGateValue)
                     feed[gateName] = gateArray
                 }
                 if !useStatefulDecoderRuntime {
@@ -880,14 +970,25 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
                            let gateArray = decoderStateUpdateGateBuffer,
                            #available(macOS 15.0, iOS 18.0, *),
                            let state = decoderState {
-                            try Self.setScalarInt(targets, value: tokenID)
-                            try Self.setScalarGate(gateArray, value: 1)
-                            var advanceFeed = feed
-                            advanceFeed[targetInputName] = targets
-                            advanceFeed[gateName] = gateArray
-                            let advanceProvider = try MLDictionaryFeatureProvider(dictionary: advanceFeed)
-                            _ = try decoder.prediction(from: advanceProvider, using: state)
-                            try Self.setScalarGate(gateArray, value: 0)
+                            if statefulCommitPolicy == .emitPrevToken || statefulCommitPolicy == .emitToken {
+                                let advanceToken: Int
+                                switch statefulCommitPolicy {
+                                case .emitPrevToken:
+                                    advanceToken = prevTokenBefore
+                                case .emitToken:
+                                    advanceToken = tokenID
+                                case .always, .autoNonBlank:
+                                    advanceToken = prevTokenBefore
+                                }
+                                try Self.setScalarInt(targets, value: advanceToken)
+                                try Self.setScalarGate(gateArray, value: 1)
+                                var advanceFeed = feed
+                                advanceFeed[targetInputName] = targets
+                                advanceFeed[gateName] = gateArray
+                                let advanceProvider = try MLDictionaryFeatureProvider(dictionary: advanceFeed)
+                                _ = try decoder.prediction(from: advanceProvider, using: state)
+                                try Self.setScalarGate(gateArray, value: 0)
+                            }
                         }
                     } else {
                         if let stateOutput1 = decoderStateOutputByInputName[decoderStateInputNames[0]],

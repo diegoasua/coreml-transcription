@@ -71,6 +71,11 @@ Runtime auto-uses CoreML stateful prediction when available:
 
 - requires decoder model with `stateDescriptionsByName`
 - can be disabled with `PARAKEET_USE_STATEFUL_DECODER=0`
+- state commit policy is configurable with `PARAKEET_STATEFUL_COMMIT_POLICY`:
+  - `emit_prevtoken` (default): commit only on emitted non-blank tokens using previous token context.
+  - `emit_token`: commit only on emitted non-blank tokens using emitted token context.
+  - `auto_nonblank`: single-pass commit only on emitted non-blank tokens (requires decoder `step_index` input).
+  - `always`: commit every step.
 
 Conversion path for decoder:
 
