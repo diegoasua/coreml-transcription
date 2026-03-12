@@ -5,6 +5,47 @@ public enum StreamingSchedulerSupport {
         text.split(whereSeparator: \.isWhitespace).count
     }
 
+    public static func catchUpBatchCount(
+        queuedUnitCount: Int,
+        baseBatchCount: Int,
+        catchUpTargetUnitCount: Int,
+        minContextUnitCount: Int
+    ) -> Int {
+        guard queuedUnitCount > 0 else {
+            return 0
+        }
+        let target = max(baseBatchCount, catchUpTargetUnitCount, minContextUnitCount)
+        return min(queuedUnitCount, target)
+    }
+
+    public static func latestFirstCatchUpTailCount(
+        queuedUnitCount: Int,
+        baseBatchCount: Int,
+        catchUpTargetUnitCount: Int,
+        minContextUnitCount: Int
+    ) -> Int {
+        catchUpBatchCount(
+            queuedUnitCount: queuedUnitCount,
+            baseBatchCount: baseBatchCount,
+            catchUpTargetUnitCount: catchUpTargetUnitCount,
+            minContextUnitCount: minContextUnitCount
+        )
+    }
+
+    public static func shouldUseLatestFirstCatchUp(
+        latestFirstEnabled: Bool,
+        protectOnset: Bool,
+        queuedSampleCount: Int,
+        catchUpTriggerSamples: Int
+    ) -> Bool {
+        guard latestFirstEnabled,
+              !protectOnset,
+              catchUpTriggerSamples > 0 else {
+            return false
+        }
+        return queuedSampleCount > catchUpTriggerSamples
+    }
+
     public static func shouldProtectLatestFirstOnset(
         elapsedSec: Double?,
         currentConfirmed: String,

@@ -470,6 +470,12 @@ func runRealtimeBenchmark(
     let benchVADMinSilence = Int(ProcessInfo.processInfo.environment["PARAKEET_VAD_MIN_SILENCE_MS"] ?? "") ?? 400
     let benchDecodeOnlyWhenSpeech = (ProcessInfo.processInfo.environment["PARAKEET_DECODE_ONLY_WHEN_SPEECH"] ?? "0") != "0"
     let benchFlushOnSpeechEnd = (ProcessInfo.processInfo.environment["PARAKEET_STREAM_FLUSH_ON_SPEECH_END"] ?? "0") != "0"
+    let benchMaxSpeechChunks = Int(
+        ProcessInfo.processInfo.environment["PARAKEET_STREAM_MAX_SPEECH_CHUNKS"] ?? ""
+    ) ?? 80
+    let benchMaxStagnantChunks = Int(
+        ProcessInfo.processInfo.environment["PARAKEET_STREAM_MAX_STAGNANT_CHUNKS"] ?? ""
+    ) ?? 24
     let traceWriter = args.traceOutputPath.flatMap(JSONLTraceWriter.init(path:))
 
     var chunks: [[Float]] = []
@@ -496,8 +502,8 @@ func runRealtimeBenchmark(
         draftAgreementCount: max(1, args.streamDraftAgreement),
         decodeOnlyWhenSpeech: benchDecodeOnlyWhenSpeech,
         flushOnSpeechEnd: benchFlushOnSpeechEnd,
-        maxSpeechChunkRunBeforeReset: nil,
-        maxStagnantSpeechChunks: 0,
+        maxSpeechChunkRunBeforeReset: benchMaxSpeechChunks > 0 ? benchMaxSpeechChunks : nil,
+        maxStagnantSpeechChunks: benchMaxStagnantChunks > 0 ? benchMaxStagnantChunks : nil,
         ringBufferCapacity: sampleRate * 12
     )
 
@@ -579,20 +585,34 @@ func runRealtimeBenchmark(
             }
         }
 
+        let shouldUseLatestFirstCatchUp = StreamingSchedulerSupport.shouldUseLatestFirstCatchUp(
+            latestFirstEnabled: args.latestFirst,
+            protectOnset: protectLatestFirstOnset,
+            queuedSampleCount: queueSamples,
+            catchUpTriggerSamples: backlogTargetSamples
+        )
         let batchIndexes: [Int]
-        if args.latestFirst && !protectLatestFirstOnset {
-            let keepCount = min(maxBatchChunks, queue.count)
-            let batchChunkCount = queue.count > keepCount
-                ? min(queue.count, max(keepCount, latestResyncContextChunks))
-                : keepCount
-            let dropped = max(0, queue.count - batchChunkCount)
-            if dropped > 0 {
-                droppedChunks += dropped
-                shouldResyncBeforeBatch = true
-                preserveHypothesisOnResync = args.latestFirst
+        if shouldUseLatestFirstCatchUp {
+            let targetChunkCount = max(1, Int(ceil(Double(backlogTargetSamples) / Double(hopSamples))))
+            let batchChunkCount = StreamingSchedulerSupport.catchUpBatchCount(
+                queuedUnitCount: queue.count,
+                baseBatchCount: maxBatchChunks,
+                catchUpTargetUnitCount: targetChunkCount,
+                minContextUnitCount: latestResyncContextChunks
+            )
+            if queueSamples > backlogSoftSamples {
+                let dropped = max(0, queue.count - batchChunkCount)
+                if dropped > 0 {
+                    droppedChunks += dropped
+                    shouldResyncBeforeBatch = true
+                    preserveHypothesisOnResync = args.latestFirst
+                }
+                batchIndexes = Array(queue.suffix(batchChunkCount))
+                queue.removeAll(keepingCapacity: true)
+            } else {
+                batchIndexes = Array(queue.prefix(batchChunkCount))
+                queue.removeFirst(batchIndexes.count)
             }
-            batchIndexes = Array(queue.suffix(batchChunkCount))
-            queue.removeAll(keepingCapacity: true)
         } else {
             batchIndexes = Array(queue.prefix(maxBatchChunks))
             queue.removeFirst(batchIndexes.count)

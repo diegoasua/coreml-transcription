@@ -37,7 +37,7 @@ public struct StreamingInferenceEngine<Model: TranscriptionModel, VAD: VoiceActi
     private let maxSpeechChunkRunBeforeReset: Int?
     private let maxStagnantSpeechChunks: Int?
     private var previouslyInSpeech: Bool
-    private var speechChunkRunCount: Int
+    private var activeSegmentChunkCount: Int
     private var stagnantSpeechChunkCount: Int
     private var lastSpeechFingerprint: String
 
@@ -68,7 +68,7 @@ public struct StreamingInferenceEngine<Model: TranscriptionModel, VAD: VoiceActi
         self.ringBufferCapacity = capacity
         self.ringBuffer = AudioRingBuffer(capacity: capacity)
         self.previouslyInSpeech = false
-        self.speechChunkRunCount = 0
+        self.activeSegmentChunkCount = 0
         self.stagnantSpeechChunkCount = 0
         self.lastSpeechFingerprint = ""
     }
@@ -105,13 +105,13 @@ public struct StreamingInferenceEngine<Model: TranscriptionModel, VAD: VoiceActi
             }
 
             var shouldForceFlush = false
-            if decision.isSpeech {
-                speechChunkRunCount += 1
-                if let maxRun = maxSpeechChunkRunBeforeReset, maxRun > 0, speechChunkRunCount >= maxRun {
+            if shouldDecode {
+                activeSegmentChunkCount += 1
+                if let maxRun = maxSpeechChunkRunBeforeReset,
+                   maxRun > 0,
+                   activeSegmentChunkCount >= maxRun {
                     shouldForceFlush = true
                 }
-            } else {
-                speechChunkRunCount = 0
             }
 
             // Decoder-stagnation guard: if decoded transcript stops evolving for too many
@@ -142,7 +142,7 @@ public struct StreamingInferenceEngine<Model: TranscriptionModel, VAD: VoiceActi
             if shouldForceFlush {
                 let state = textController.endSegment()
                 model.resetState()
-                speechChunkRunCount = 0
+                activeSegmentChunkCount = 0
                 stagnantSpeechChunkCount = 0
                 lastSpeechFingerprint = ""
                 events.append(
@@ -159,7 +159,7 @@ public struct StreamingInferenceEngine<Model: TranscriptionModel, VAD: VoiceActi
             if flushOnSpeechEnd, !decision.isSpeech, previouslyInSpeech {
                 let state = textController.endSegment()
                 model.resetState()
-                speechChunkRunCount = 0
+                activeSegmentChunkCount = 0
                 stagnantSpeechChunkCount = 0
                 lastSpeechFingerprint = ""
                 events.append(
@@ -196,7 +196,7 @@ public struct StreamingInferenceEngine<Model: TranscriptionModel, VAD: VoiceActi
         vad.reset()
         ringBuffer = AudioRingBuffer(capacity: ringBufferCapacity)
         previouslyInSpeech = false
-        speechChunkRunCount = 0
+        activeSegmentChunkCount = 0
         stagnantSpeechChunkCount = 0
         lastSpeechFingerprint = ""
     }

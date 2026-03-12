@@ -102,6 +102,28 @@ final class StreamingInferenceEngineTests: XCTestCase {
         XCTAssertEqual(events.count, 4)
     }
 
+    func testForceFlushOnDecodedChunkRunEvenWithoutSpeechVAD() throws {
+        let model = MockModel(outputs: ["alpha", "alpha beta", "gamma"])
+        let vad = MockVAD(decisions: [false, false, false], energyDBFS: -60)
+        var engine = StreamingInferenceEngine(
+            model: model,
+            vad: vad,
+            policy: .init(sampleRate: 1000, chunkMs: 100, hopMs: 100),
+            requiredAgreementCount: 1,
+            decodeOnlyWhenSpeech: false,
+            flushOnSpeechEnd: false,
+            maxSpeechChunkRunBeforeReset: 2,
+            maxStagnantSpeechChunks: nil,
+            ringBufferCapacity: 400
+        )
+
+        let samples = Array(repeating: Float(0.1), count: 300)
+        let events = try engine.process(samples: samples)
+
+        XCTAssertEqual(events.filter(\.didFlushSegment).count, 1)
+        XCTAssertTrue(events.contains(where: { $0.didFlushSegment && $0.transcript.confirmed == "alpha beta" }))
+    }
+
     func testDecodesHopSliceWhenChunkOverlaps() throws {
         let model = RecordingModel()
         let vad = MockVAD(decisions: Array(repeating: true, count: 16), energyDBFS: -20)
