@@ -703,7 +703,9 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
             throw ParakeetCoreMLTDTError.sampleRateMismatch(expected: config.expectedSampleRate, actual: sampleRate)
         }
         if streamingMode == .rewritePrefix {
-            return try transcribeChunkRewritePrefix(samples, sampleRate: sampleRate)
+            return try autoreleasepool {
+                try transcribeChunkRewritePrefix(samples, sampleRate: sampleRate)
+            }
         }
         if samples.isEmpty {
             return Self.decodePieces(from: committedTokenIDs + draftTokenIDs, vocab: vocab)
@@ -1376,46 +1378,48 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
             }
         }
 
-        let encoderProvider = try MLDictionaryFeatureProvider(dictionary: encoderFeed)
-        let encoderOutput = try encoder.prediction(from: encoderProvider)
-        let (rawEncoderTensor, rawEncoderLength) = try Self.pickEncoderTensorAndLength(from: encoderOutput, debug: false)
-        let rawSteps = max(0, min(rawEncoderLength ?? plan.key.actualFrames, decoderFrameCount))
-        if rawSteps <= 0 {
+        return try autoreleasepool {
+            let encoderProvider = try MLDictionaryFeatureProvider(dictionary: encoderFeed)
+            let encoderOutput = try encoder.prediction(from: encoderProvider)
+            let (rawEncoderTensor, rawEncoderLength) = try Self.pickEncoderTensorAndLength(from: encoderOutput, debug: false)
+            let rawSteps = max(0, min(rawEncoderLength ?? plan.key.actualFrames, decoderFrameCount))
+            if rawSteps <= 0 {
+                return .init(
+                    key: plan.key,
+                    encoderSteps: 0,
+                    decoderInputTensor: try Self.makeArray(shape: decoderEncoderInputShape, dataType: decoderEncoderInputDataType),
+                    tokenIDs: [],
+                    decoderCheckpoint: nil
+                )
+            }
+
+            let (sourceStartOut, sourceCopyFrames) = Self.projectLongformWindowToEncoderSteps(
+                rawSteps: rawSteps,
+                inputStart: plan.key.inputStart,
+                centerStart: plan.key.centerStart,
+                actualFrames: plan.key.actualFrames,
+                centerFrames: plan.key.centerFrames,
+                hopFrames: hopFrames
+            )
+            let encoderSteps = max(0, min(rawSteps - sourceStartOut, sourceCopyFrames))
+            let decoderInputTensor = try Self.makeArray(shape: decoderEncoderInputShape, dataType: decoderEncoderInputDataType)
+            try Self.fill(array: decoderInputTensor, with: 0)
+            if encoderSteps > 0 {
+                _ = try Self.copyTensorWindowToDecoderInput(
+                    source: rawEncoderTensor,
+                    sourceStartFrame: sourceStartOut,
+                    sourceFrameCount: encoderSteps,
+                    destination: decoderInputTensor
+                )
+            }
             return .init(
                 key: plan.key,
-                encoderSteps: 0,
-                decoderInputTensor: try Self.makeArray(shape: decoderEncoderInputShape, dataType: decoderEncoderInputDataType),
+                encoderSteps: encoderSteps,
+                decoderInputTensor: decoderInputTensor,
                 tokenIDs: [],
                 decoderCheckpoint: nil
             )
         }
-
-        let (sourceStartOut, sourceCopyFrames) = Self.projectLongformWindowToEncoderSteps(
-            rawSteps: rawSteps,
-            inputStart: plan.key.inputStart,
-            centerStart: plan.key.centerStart,
-            actualFrames: plan.key.actualFrames,
-            centerFrames: plan.key.centerFrames,
-            hopFrames: hopFrames
-        )
-        let encoderSteps = max(0, min(rawSteps - sourceStartOut, sourceCopyFrames))
-        let decoderInputTensor = try Self.makeArray(shape: decoderEncoderInputShape, dataType: decoderEncoderInputDataType)
-        try Self.fill(array: decoderInputTensor, with: 0)
-        if encoderSteps > 0 {
-            _ = try Self.copyTensorWindowToDecoderInput(
-                source: rawEncoderTensor,
-                sourceStartFrame: sourceStartOut,
-                sourceFrameCount: encoderSteps,
-                destination: decoderInputTensor
-            )
-        }
-        return .init(
-            key: plan.key,
-            encoderSteps: encoderSteps,
-            decoderInputTensor: decoderInputTensor,
-            tokenIDs: [],
-            decoderCheckpoint: nil
-        )
     }
 
     private func updatePrefixAdaptiveStride(decodeSec: Double) {
