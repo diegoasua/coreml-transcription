@@ -8,6 +8,8 @@ run_name="${RUN_NAME:-parakeet-realtime-bench}"
 audio="${AUDIO_PATH:-}"
 model_dir="${PARAKEET_COREML_MODEL_DIR:-$repo_root/artifacts/parakeet-tdt-0.6b-v2}"
 suffix="${PARAKEET_COREML_MODEL_SUFFIX:-odmbp-approx}"
+encoder_suffix="${PARAKEET_COREML_ENCODER_SUFFIX:-}"
+decoder_suffix="${PARAKEET_COREML_DECODER_SUFFIX:-}"
 stream_mode="${PARAKEET_STREAM_MODE:-rewrite-prefix}"
 out_dir="${OUT_DIR:-$repo_root/artifacts/realtime-bench-runs/$run_name}"
 out_json="$out_dir/summary.json"
@@ -31,7 +33,19 @@ mkdir -p "$out_dir"
 echo "Running realtime bench"
 echo "  audio:    $audio"
 echo "  model:    $model_dir (suffix=$suffix)"
+if [[ -n "$encoder_suffix" || -n "$decoder_suffix" ]]; then
+  echo "  encoder:  ${encoder_suffix:-$suffix}"
+  echo "  decoder:  ${decoder_suffix:-$suffix}"
+fi
 echo "  output:   $out_json"
+
+extra_suffix_args=()
+if [[ -n "$encoder_suffix" ]]; then
+  extra_suffix_args+=( --encoder-suffix "$encoder_suffix" )
+fi
+if [[ -n "$decoder_suffix" ]]; then
+  extra_suffix_args+=( --decoder-suffix "$decoder_suffix" )
+fi
 
 if [[ "$stream_mode" == "rewrite-prefix" ]]; then
   default_chunk_ms=500
@@ -49,28 +63,36 @@ else
   default_backlog_target_sec=0.25
 fi
 
+cmd=(
+  swift run -c release transcribe-cli
+  --audio "$audio"
+  --model-dir "$model_dir"
+  --suffix "$suffix"
+)
+if (( ${#extra_suffix_args[@]} > 0 )); then
+  cmd+=( "${extra_suffix_args[@]}" )
+fi
+cmd+=(
+  --realtime-bench
+  --stream-chunk-ms "${PARAKEET_STREAM_CHUNK_MS:-$default_chunk_ms}"
+  --stream-hop-ms "${PARAKEET_STREAM_HOP_MS:-$default_hop_ms}"
+  --stream-agreement "${PARAKEET_STREAM_AGREEMENT:-2}"
+  --stream-draft-agreement "${PARAKEET_STREAM_DRAFT_AGREEMENT:-1}"
+  --max-symbols-per-step "${PARAKEET_TDT_MAX_SYMBOLS_PER_STEP:-10}"
+  --max-tokens-per-chunk "${PARAKEET_TDT_MAX_TOKENS_PER_CHUNK:-0}"
+  --report-every-ms "${PARAKEET_BENCH_REPORT_MS:-200}"
+  --max-batch-ms "${PARAKEET_STREAM_MAX_BATCH_MS:-$default_max_batch_ms}"
+  --queue-pass-sec "${PARAKEET_BENCH_QUEUE_PASS_SEC:-0.5}"
+  --first-token-pass-ms "${PARAKEET_BENCH_FIRST_TOKEN_PASS_MS:-300}"
+  --confirmed-pass-ms "${PARAKEET_BENCH_CONFIRMED_PASS_MS:-1700}"
+  --backlog-soft-sec "${PARAKEET_STREAM_BACKLOG_SOFT_SEC:-$default_backlog_soft_sec}"
+  --backlog-target-sec "${PARAKEET_STREAM_BACKLOG_TARGET_SEC:-$default_backlog_target_sec}"
+  --metrics-output "$out_json"
+)
 PARAKEET_STREAM_MODE="$stream_mode" \
 PARAKEET_STREAM_LATEST_FIRST="${PARAKEET_STREAM_LATEST_FIRST:-$default_latest_first}" \
 PARAKEET_DECODE_ONLY_WHEN_SPEECH="${PARAKEET_DECODE_ONLY_WHEN_SPEECH:-0}" \
-swift run -c release transcribe-cli \
-  --audio "$audio" \
-  --model-dir "$model_dir" \
-  --suffix "$suffix" \
-  --realtime-bench \
-  --stream-chunk-ms "${PARAKEET_STREAM_CHUNK_MS:-$default_chunk_ms}" \
-  --stream-hop-ms "${PARAKEET_STREAM_HOP_MS:-$default_hop_ms}" \
-  --stream-agreement "${PARAKEET_STREAM_AGREEMENT:-2}" \
-  --stream-draft-agreement "${PARAKEET_STREAM_DRAFT_AGREEMENT:-1}" \
-  --max-symbols-per-step "${PARAKEET_TDT_MAX_SYMBOLS_PER_STEP:-10}" \
-  --max-tokens-per-chunk "${PARAKEET_TDT_MAX_TOKENS_PER_CHUNK:-0}" \
-  --report-every-ms "${PARAKEET_BENCH_REPORT_MS:-200}" \
-  --max-batch-ms "${PARAKEET_STREAM_MAX_BATCH_MS:-$default_max_batch_ms}" \
-  --queue-pass-sec "${PARAKEET_BENCH_QUEUE_PASS_SEC:-0.5}" \
-  --first-token-pass-ms "${PARAKEET_BENCH_FIRST_TOKEN_PASS_MS:-300}" \
-  --confirmed-pass-ms "${PARAKEET_BENCH_CONFIRMED_PASS_MS:-1700}" \
-  --backlog-soft-sec "${PARAKEET_STREAM_BACKLOG_SOFT_SEC:-$default_backlog_soft_sec}" \
-  --backlog-target-sec "${PARAKEET_STREAM_BACKLOG_TARGET_SEC:-$default_backlog_target_sec}" \
-  --metrics-output "$out_json"
+  "${cmd[@]}"
 
 if [[ -n "$reference_path" ]]; then
   confirmed_txt="${out_json%.json}.confirmed.txt"

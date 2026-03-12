@@ -51,13 +51,122 @@ public struct ParakeetCoreMLTDTConfig {
     }
 }
 
+public struct ParakeetStreamingDiagnostic: Sendable {
+    public struct MergeDiagnostic: Sendable {
+        public let strategy: String
+        public let alignmentStart: Int?
+        public let matchLength: Int
+        public let baseTokenCount: Int
+        public let nextTokenCount: Int
+        public let mergedTokenCount: Int
+        public let baseTailTokenIDs: [Int]
+        public let nextTokenIDs: [Int]
+        public let mergedTailTokenIDs: [Int]
+        public let baseTailText: String
+        public let nextText: String
+        public let mergedTailText: String
+
+        public var jsonObject: [String: Any] {
+            [
+                "strategy": strategy,
+                "alignment_start": alignmentStart as Any,
+                "match_length": matchLength,
+                "base_token_count": baseTokenCount,
+                "next_token_count": nextTokenCount,
+                "merged_token_count": mergedTokenCount,
+                "base_tail_token_ids": baseTailTokenIDs,
+                "next_token_ids": nextTokenIDs,
+                "merged_tail_token_ids": mergedTailTokenIDs,
+                "base_tail_text": baseTailText,
+                "next_text": nextText,
+                "merged_tail_text": mergedTailText,
+            ]
+        }
+    }
+
+    public let callIndex: Int
+    public let inputSamples: Int
+    public let historySamples: Int
+    public let droppedSamples: Int
+    public let frameCount: Int
+    public let windowFrames: Int
+    public let windowStartFrame: Int
+    public let encoderSteps: Int
+    public let approxNewFrames: Int
+    public let approxNewSteps: Int
+    public let decodeStrategy: String
+    public let decodeSourceStartStep: Int
+    public let decodeRequestedFrames: Int
+    public let decodeCopiedFrames: Int
+    public let decodedCursorBefore: Int
+    public let decodedCursorAfter: Int
+    public let featureExtractMs: Double
+    public let encoderPrepareMs: Double
+    public let encoderPredictMs: Double
+    public let decodeMs: Double
+    public let mergeMs: Double
+    public let totalModelMs: Double
+    public let committedTokenCountBefore: Int
+    public let committedTokenCountAfter: Int
+    public let draftTokenCountAfter: Int
+    public let schedulerPendingStepBudget: Double
+    public let useStatefulDecoderRuntime: Bool
+    public let streamingDeterministicCursorEnabled: Bool
+    public let streamingRollingStatelessEnabled: Bool
+    public let streamingFinalizeDraftEnabled: Bool
+    public let mergeDiagnostic: MergeDiagnostic?
+
+    public var jsonObject: [String: Any] {
+        [
+            "call_index": callIndex,
+            "input_samples": inputSamples,
+            "history_samples": historySamples,
+            "dropped_samples": droppedSamples,
+            "frame_count": frameCount,
+            "window_frames": windowFrames,
+            "window_start_frame": windowStartFrame,
+            "encoder_steps": encoderSteps,
+            "approx_new_frames": approxNewFrames,
+            "approx_new_steps": approxNewSteps,
+            "decode_strategy": decodeStrategy,
+            "decode_source_start_step": decodeSourceStartStep,
+            "decode_requested_frames": decodeRequestedFrames,
+            "decode_copied_frames": decodeCopiedFrames,
+            "decoded_cursor_before": decodedCursorBefore,
+            "decoded_cursor_after": decodedCursorAfter,
+            "feature_extract_ms": featureExtractMs,
+            "encoder_prepare_ms": encoderPrepareMs,
+            "encoder_predict_ms": encoderPredictMs,
+            "decode_ms": decodeMs,
+            "merge_ms": mergeMs,
+            "total_model_ms": totalModelMs,
+            "committed_token_count_before": committedTokenCountBefore,
+            "committed_token_count_after": committedTokenCountAfter,
+            "draft_token_count_after": draftTokenCountAfter,
+            "scheduler_pending_step_budget": schedulerPendingStepBudget,
+            "use_stateful_decoder_runtime": useStatefulDecoderRuntime,
+            "streaming_deterministic_cursor_enabled": streamingDeterministicCursorEnabled,
+            "streaming_rolling_stateless_enabled": streamingRollingStatelessEnabled,
+            "streaming_finalize_draft_enabled": streamingFinalizeDraftEnabled,
+            "merge": mergeDiagnostic?.jsonObject as Any,
+        ]
+    }
+}
+
 public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
-    private enum StreamingMode {
+    enum StreamingMode {
         case rewritePrefix
         case incremental
     }
 
-    private enum StatefulCommitPolicy {
+    struct LongformWindowCacheKey: Equatable {
+        let centerStart: Int
+        let inputStart: Int
+        let actualFrames: Int
+        let centerFrames: Int
+    }
+
+    enum StatefulCommitPolicy {
         case always
         case emitPrevToken
         case emitToken
@@ -74,6 +183,89 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
             default:
                 self = .emitPrevToken
             }
+        }
+
+        func firstPassGateValue(commitState: Bool, canAutoCommitNonBlank: Bool) -> Int {
+            guard commitState else { return 0 }
+            switch self {
+            case .always:
+                return 1
+            case .autoNonBlank:
+                return 2
+            case .emitPrevToken:
+                return canAutoCommitNonBlank ? 2 : 0
+            case .emitToken:
+                return 0
+            }
+        }
+
+        func requiresExplicitAdvanceAfterEmit(canAutoCommitNonBlank: Bool) -> Bool {
+            switch self {
+            case .emitPrevToken:
+                return !canAutoCommitNonBlank
+            case .emitToken:
+                return true
+            case .always, .autoNonBlank:
+                return false
+            }
+        }
+    }
+
+    struct LongformWindowPlan {
+        let key: LongformWindowCacheKey
+    }
+
+    private struct RewritePrefixDecoderCheckpoint {
+        let previousToken: Int
+        let state1: MLMultiArray
+        let state2: MLMultiArray
+    }
+
+    private struct RewritePrefixEncoderWindowCacheEntry {
+        let key: LongformWindowCacheKey
+        let encoderSteps: Int
+        let decoderInputTensor: MLMultiArray
+        var tokenIDs: [Int]
+        var decoderCheckpoint: RewritePrefixDecoderCheckpoint?
+    }
+
+    private struct RewritePrefixEncoderWindowCache {
+        var leftContextFrames: Int = -1
+        var rightContextFrames: Int = -1
+        var allowRightContext: Bool = false
+        var encoderFrameCount: Int = -1
+        var hopFrames: Int = -1
+        var entries: [RewritePrefixEncoderWindowCacheEntry] = []
+
+        mutating func reset() {
+            leftContextFrames = -1
+            rightContextFrames = -1
+            allowRightContext = false
+            encoderFrameCount = -1
+            hopFrames = -1
+            entries.removeAll(keepingCapacity: true)
+        }
+
+        mutating func configure(
+            leftContextFrames: Int,
+            rightContextFrames: Int,
+            allowRightContext: Bool,
+            encoderFrameCount: Int,
+            hopFrames: Int
+        ) {
+            guard self.leftContextFrames != leftContextFrames ||
+                    self.rightContextFrames != rightContextFrames ||
+                    self.allowRightContext != allowRightContext ||
+                    self.encoderFrameCount != encoderFrameCount ||
+                    self.hopFrames != hopFrames else {
+                return
+            }
+            reset()
+            self.leftContextFrames = leftContextFrames
+            self.rightContextFrames = rightContextFrames
+            self.allowRightContext = allowRightContext
+            self.encoderFrameCount = encoderFrameCount
+            self.hopFrames = hopFrames
         }
     }
 
@@ -107,6 +299,10 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
     private let streamingDeterministicCursorEnabled: Bool
     private let streamingRollingStatelessEnabled: Bool
     private let streamingRollingDecodeFrames: Int
+    private let streamingAnchoredRollingDecodeFrames: Int
+    private let streamingAnchoredRollingStepMultiplier: Int
+    private let streamingRollingAnchorMinTokenCount: Int
+    private let streamingRollingAnchorRequiredStablePasses: Int
     private let streamingMode: StreamingMode
     private let streamingPrefixDecodeStrideSamples: Int
     private let streamingPrefixAdaptiveEnabled: Bool
@@ -115,6 +311,12 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
     private let streamingPrefixAdaptiveMaxStrideSamples: Int
     private let streamingPrefixAdaptiveEWMAAlpha: Double
     private let streamingPrefixMaxSamples: Int
+    private let streamingPrefixOnsetStrideSamples: Int
+    private let streamingPrefixOnsetMaxSamples: Int
+    private let streamingPrefixOnsetMinWordCount: Int
+    private let rewritePrefixEncoderCacheEnabled: Bool
+    private let rewritePrefixDecoderResumeOnsetMaxSamples: Int
+    private let rewritePrefixDecoderResumeMinWordCount: Int
     private let streamingPrefixLeftContextFrames: Int
     private let streamingPrefixRightContextFrames: Int
     private let streamingPrefixAllowRightContext: Bool
@@ -135,17 +337,27 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
     private var streamingSampleHistory: [Float]
     private let streamingHistorySampleLimit: Int
     private var streamingPrefixSamples: [Float]
-    private var streamingPrefixLastDecodeSampleCount: Int
+    private var streamingPrefixPendingNewSampleCount: Int
+    private var streamingPrefixHasTrimmedHistory: Bool
     private var streamingPrefixLastText: String
     private var streamingPrefixAdaptiveDecodeSecEWMA: Double
     private var streamingPrefixAdaptiveRequiredSamples: Int
+    private var rewritePrefixEncoderWindowCache: RewritePrefixEncoderWindowCache
     private var streamingDecodedFrameCursor: Int
+    private var streamingEncoderStepScheduler: StreamingEncoderStepScheduler
+    private var streamingRollingAnchorStablePassCount: Int
+    private var streamingRollingAnchorActive: Bool
+    private var streamingDiagnosticCallIndex: Int
+    private var streamingFeatureCache: StreamingMelFeatureCache
     private let decoderTraceWriter: DecoderTraceWriter?
+    private let decoderTraceTopK: Int
+    private let blankDurationTieMargin: Float
     private var decoderTraceChunkIndex: Int
     private let debugLoggingEnabled: Bool
 
     private let featureExtractor: MelFeatureExtractor
     private let minNonZeroDuration: Int
+    public private(set) var lastStreamingDiagnostic: ParakeetStreamingDiagnostic?
 
     public init(
         modelDirectory: URL,
@@ -163,6 +375,8 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
         let tracePath = ProcessInfo.processInfo.environment["PARAKEET_DECODER_TRACE_PATH"] ?? ""
         let traceMaxEvents = Int(ProcessInfo.processInfo.environment["PARAKEET_DECODER_TRACE_MAX_EVENTS"] ?? "") ?? 200_000
         let traceReset = (ProcessInfo.processInfo.environment["PARAKEET_DECODER_TRACE_RESET"] ?? "1") != "0"
+        self.decoderTraceTopK = max(0, Int(ProcessInfo.processInfo.environment["PARAKEET_DECODER_TRACE_TOPK"] ?? "") ?? 0)
+        self.blankDurationTieMargin = max(0, Float(ProcessInfo.processInfo.environment["PARAKEET_BLANK_DURATION_TIE_MARGIN"] ?? "0.0") ?? 0.0)
         self.decoderTraceWriter = DecoderTraceWriter(
             path: tracePath,
             maxEvents: max(1, traceMaxEvents),
@@ -231,10 +445,26 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
         self.streamingDeterministicCursorEnabled =
             (ProcessInfo.processInfo.environment["PARAKEET_STREAM_DETERMINISTIC_CURSOR"] ?? "1") != "0"
         self.streamingRollingStatelessEnabled =
-            (ProcessInfo.processInfo.environment["PARAKEET_STREAM_ROLLING_STATELESS"] ?? "0") != "0"
+            (ProcessInfo.processInfo.environment["PARAKEET_STREAM_ROLLING_STATELESS"] ?? "1") != "0"
         self.streamingRollingDecodeFrames = max(
             config.streamingMinTailDecodeFrames,
             Int(ProcessInfo.processInfo.environment["PARAKEET_STREAM_ROLLING_DECODE_FRAMES"] ?? "") ?? 48
+        )
+        self.streamingAnchoredRollingDecodeFrames = max(
+            config.streamingMinTailDecodeFrames,
+            Int(ProcessInfo.processInfo.environment["PARAKEET_STREAM_ANCHORED_ROLLING_DECODE_FRAMES"] ?? "") ?? 12
+        )
+        self.streamingAnchoredRollingStepMultiplier = max(
+            1,
+            Int(ProcessInfo.processInfo.environment["PARAKEET_STREAM_ANCHORED_ROLLING_STEP_MULTIPLIER"] ?? "") ?? 4
+        )
+        self.streamingRollingAnchorMinTokenCount = max(
+            2,
+            Int(ProcessInfo.processInfo.environment["PARAKEET_STREAM_ROLLING_ANCHOR_MIN_TOKENS"] ?? "") ?? 6
+        )
+        self.streamingRollingAnchorRequiredStablePasses = max(
+            1,
+            Int(ProcessInfo.processInfo.environment["PARAKEET_STREAM_ROLLING_ANCHOR_STABLE_PASSES"] ?? "") ?? 2
         )
         let modeRaw = (ProcessInfo.processInfo.environment["PARAKEET_STREAM_MODE"] ?? "rewrite-prefix").lowercased()
         self.streamingMode = modeRaw == "incremental" ? .incremental : .rewritePrefix
@@ -271,6 +501,32 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
         )
         let maxSec = Double(ProcessInfo.processInfo.environment["PARAKEET_STREAM_PREFIX_MAX_SEC"] ?? "") ?? 0.0
         self.streamingPrefixMaxSamples = maxSec <= 0 ? 0 : max(1, Int(round(maxSec * Double(config.expectedSampleRate))))
+        let onsetStrideSec = Double(ProcessInfo.processInfo.environment["PARAKEET_STREAM_PREFIX_ONSET_STRIDE_SEC"] ?? "") ?? 0.0
+        let resolvedOnsetStrideSec = onsetStrideSec > 0 ? onsetStrideSec : strideSec
+        self.streamingPrefixOnsetStrideSamples = max(
+            1,
+            Int(round(resolvedOnsetStrideSec * Double(config.expectedSampleRate)))
+        )
+        let onsetMaxSec = Double(ProcessInfo.processInfo.environment["PARAKEET_STREAM_PREFIX_ONSET_MAX_SEC"] ?? "") ?? 0.0
+        self.streamingPrefixOnsetMaxSamples = onsetMaxSec <= 0 ? 0 : max(
+            1,
+            Int(round(onsetMaxSec * Double(config.expectedSampleRate)))
+        )
+        self.streamingPrefixOnsetMinWordCount = max(
+            0,
+            Int(ProcessInfo.processInfo.environment["PARAKEET_STREAM_PREFIX_ONSET_MIN_WORDS"] ?? "") ?? 0
+        )
+        self.rewritePrefixEncoderCacheEnabled =
+            (ProcessInfo.processInfo.environment["PARAKEET_STREAM_PREFIX_ENCODER_CACHE"] ?? "1") != "0"
+        let resumeOnsetMaxSec = Double(ProcessInfo.processInfo.environment["PARAKEET_STREAM_PREFIX_RESUME_ONSET_MAX_SEC"] ?? "") ?? 0.0
+        self.rewritePrefixDecoderResumeOnsetMaxSamples = resumeOnsetMaxSec <= 0 ? 0 : max(
+            1,
+            Int(round(resumeOnsetMaxSec * Double(config.expectedSampleRate)))
+        )
+        self.rewritePrefixDecoderResumeMinWordCount = max(
+            0,
+            Int(ProcessInfo.processInfo.environment["PARAKEET_STREAM_PREFIX_RESUME_MIN_WORDS"] ?? "") ?? 0
+        )
         self.streamingPrefixLeftContextFrames = max(
             0,
             Int(ProcessInfo.processInfo.environment["PARAKEET_STREAM_PREFIX_LEFT_CONTEXT_FRAMES"] ?? "") ?? max(300, config.streamingHistoryFrames)
@@ -382,11 +638,18 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
             config.streamingHistoryFrames * config.hopLength + config.windowLength
         )
         self.streamingPrefixSamples = []
-        self.streamingPrefixLastDecodeSampleCount = 0
+        self.streamingPrefixPendingNewSampleCount = 0
+        self.streamingPrefixHasTrimmedHistory = false
         self.streamingPrefixLastText = ""
         self.streamingPrefixAdaptiveDecodeSecEWMA = 0
         self.streamingPrefixAdaptiveRequiredSamples = self.streamingPrefixDecodeStrideSamples
+        self.rewritePrefixEncoderWindowCache = RewritePrefixEncoderWindowCache()
         self.streamingDecodedFrameCursor = 0
+        self.streamingEncoderStepScheduler = StreamingEncoderStepScheduler()
+        self.streamingRollingAnchorStablePassCount = 0
+        self.streamingRollingAnchorActive = false
+        self.streamingDiagnosticCallIndex = 0
+        self.lastStreamingDiagnostic = nil
 
         self.featureExtractor = MelFeatureExtractor(
             sampleRate: config.expectedSampleRate,
@@ -395,6 +658,7 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
             hopLength: config.hopLength,
             melBins: config.melBins
         )
+        self.streamingFeatureCache = StreamingMelFeatureCache(extractor: self.featureExtractor)
         self.minNonZeroDuration = config.durations.filter { $0 > 0 }.min() ?? 1
         if debugLoggingEnabled {
             let mode = useStatefulDecoderRuntime ? "stateful" : "stateless"
@@ -416,14 +680,18 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
     public convenience init(
         modelDirectory: URL,
         modelSuffix: String = "odmbp-approx",
+        encoderModelSuffix: String? = nil,
+        decoderModelSuffix: String? = nil,
         vocabFileName: String = "vocab.txt",
         config: ParakeetCoreMLTDTConfig = .init(),
         progress: ((String) -> Void)? = nil
     ) throws {
+        let resolvedEncoderSuffix = encoderModelSuffix ?? modelSuffix
+        let resolvedDecoderSuffix = decoderModelSuffix ?? modelSuffix
         try self.init(
             modelDirectory: modelDirectory,
-            encoderModelName: "encoder-model-\(modelSuffix).mlpackage",
-            decoderModelName: "decoder_joint-model-\(modelSuffix).mlpackage",
+            encoderModelName: "encoder-model-\(resolvedEncoderSuffix).mlpackage",
+            decoderModelName: "decoder_joint-model-\(resolvedDecoderSuffix).mlpackage",
             vocabFileName: vocabFileName,
             config: config,
             progress: progress
@@ -440,20 +708,40 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
         if samples.isEmpty {
             return Self.decodePieces(from: committedTokenIDs + draftTokenIDs, vocab: vocab)
         }
+        let diagnosticCallIndex = streamingDiagnosticCallIndex
+        streamingDiagnosticCallIndex += 1
+        let chunkStartTime = CFAbsoluteTimeGetCurrent()
 
         // Streaming path: maintain a rolling causal context so tiny realtime chunks
         // are decoded with sufficient left context.
         streamingSampleHistory.append(contentsOf: samples)
-        if streamingSampleHistory.count > streamingHistorySampleLimit {
-            streamingSampleHistory.removeFirst(streamingSampleHistory.count - streamingHistorySampleLimit)
+        let droppedSamples = max(0, streamingSampleHistory.count - streamingHistorySampleLimit)
+        if droppedSamples > 0 {
+            streamingSampleHistory.removeFirst(droppedSamples)
         }
 
-        let (featureMatrix, frameCount) = featureExtractor.extract(samples: streamingSampleHistory)
+        let featureExtractStartTime = CFAbsoluteTimeGetCurrent()
+        let (featureMatrix, frameCount) = streamingFeatureCache.extract(
+            samples: streamingSampleHistory,
+            droppedSampleCount: droppedSamples
+        )
+        let featureExtractMs = (CFAbsoluteTimeGetCurrent() - featureExtractStartTime) * 1000.0
         let historyFrames = min(frameCount, encoderFrameCount)
         let windowFrames = min(historyFrames, config.streamingHistoryFrames)
         let clampedFrames = max(1, windowFrames)
         let startFrame = max(0, frameCount - clampedFrames)
         let approxNewFrames = max(1, Int(round(Double(samples.count) / Double(config.hopLength))))
+        let committedTokenCountBefore = committedTokenIDs.count
+        let decodedCursorBefore = streamingDecodedFrameCursor
+        var decodeStrategy = "none"
+        var decodeSourceStartStep = 0
+        var decodeRequestedFrames = 0
+        var decodeCopiedFrames = 0
+        var mergeDiagnostic: ParakeetStreamingDiagnostic.MergeDiagnostic?
+        var encoderPrepareMs = 0.0
+        var encoderPredictMs = 0.0
+        var decodeMs = 0.0
+        var mergeMs = 0.0
         if debugLoggingEnabled {
             let decodeWindowEstimate = max(config.streamingMinTailDecodeFrames * 4, approxNewFrames * 6)
             let preview = featureMatrix.prefix(10).map { String(format: "%.6f", $0) }.joined(separator: ", ")
@@ -463,6 +751,7 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
             )
         }
 
+        let encoderPrepareStartTime = CFAbsoluteTimeGetCurrent()
         try Self.fill(array: encoderAudioBuffer, with: 0)
         try Self.copyFeatureWindowToEncoderInput(
             featureMatrix: featureMatrix,
@@ -487,13 +776,43 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
         }
 
         let encoderProvider = try MLDictionaryFeatureProvider(dictionary: encoderFeed)
+        encoderPrepareMs = (CFAbsoluteTimeGetCurrent() - encoderPrepareStartTime) * 1000.0
+        let encoderPredictStartTime = CFAbsoluteTimeGetCurrent()
         let encoderOutput = try encoder.prediction(from: encoderProvider)
+        encoderPredictMs = (CFAbsoluteTimeGetCurrent() - encoderPredictStartTime) * 1000.0
         let (encoderTensor, encoderLength) = try Self.pickEncoderTensorAndLength(
             from: encoderOutput,
             debug: debugLoggingEnabled
         )
         let steps = max(0, min(encoderLength ?? clampedFrames, decoderFrameCount))
         if steps == 0 {
+            updateStreamingDiagnostic(
+                callIndex: diagnosticCallIndex,
+                inputSamples: samples.count,
+                historySamples: streamingSampleHistory.count,
+                droppedSamples: droppedSamples,
+                frameCount: frameCount,
+                windowFrames: clampedFrames,
+                windowStartFrame: startFrame,
+                encoderSteps: steps,
+                approxNewFrames: approxNewFrames,
+                approxNewSteps: 0,
+                decodeStrategy: "no-encoder-steps",
+                decodeSourceStartStep: 0,
+                decodeRequestedFrames: 0,
+                decodeCopiedFrames: 0,
+                decodedCursorBefore: decodedCursorBefore,
+                decodedCursorAfter: streamingDecodedFrameCursor,
+                featureExtractMs: featureExtractMs,
+                encoderPrepareMs: encoderPrepareMs,
+                encoderPredictMs: encoderPredictMs,
+                decodeMs: decodeMs,
+                mergeMs: mergeMs,
+                totalModelMs: (CFAbsoluteTimeGetCurrent() - chunkStartTime) * 1000.0,
+                committedTokenCountBefore: committedTokenCountBefore,
+                committedTokenCountAfter: committedTokenIDs.count,
+                draftTokenCountAfter: draftTokenIDs.count
+            )
             return Self.decodePieces(from: committedTokenIDs + draftTokenIDs, vocab: vocab)
         }
 
@@ -501,15 +820,14 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
             1,
             Int(ProcessInfo.processInfo.environment["PARAKEET_STREAM_MIN_NEW_ENCODER_STEPS"] ?? "") ?? 1
         )
-        let useEncoderStepAdvance = (ProcessInfo.processInfo.environment["PARAKEET_STREAM_USE_ENCODER_STEP_ADVANCE"] ?? "0") == "1"
+        let useEncoderStepAdvance = (ProcessInfo.processInfo.environment["PARAKEET_STREAM_USE_ENCODER_STEP_ADVANCE"] ?? "1") != "0"
         let approxNewSteps: Int
         if useEncoderStepAdvance {
-            // Experimental: convert newly arrived feature-frame progress into
-            // encoder-step progress. Keep opt-in until streaming state/cursor
-            // interactions are fully validated.
-            approxNewSteps = max(
-                minNewEncoderSteps,
-                Int(round(Double(approxNewFrames) * Double(steps) / Double(max(1, clampedFrames))))
+            approxNewSteps = streamingEncoderStepScheduler.consumeStepBudget(
+                newFeatureFrames: approxNewFrames,
+                encoderSteps: steps,
+                windowFrames: clampedFrames,
+                minNewSteps: minNewEncoderSteps
             )
         } else {
             // Legacy default: historically tuned in feature-frame units.
@@ -521,55 +839,175 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
         )
 
         if streamingRollingStatelessEnabled {
-            // Streaming quality mode: decode a rolling tail window from a fresh decoder
-            // state each hop to avoid recurrent-state drift from tiny incremental slices.
-            let decodeFrames = min(steps, max(streamingRollingDecodeFrames, approxNewSteps))
-            if decodeFrames > 0 {
+            let baseTokenIDs = committedTokenIDs
+            let shouldUseAnchoredTail = streamingRollingAnchorActive || droppedSamples > 0
+
+            func decodeRollingWindow(startStep: Int, requestedFrames: Int) throws -> ([Int], Int) {
+                guard requestedFrames > 0 else { return ([], 0) }
                 try Self.fill(array: decoderEncoderBuffer, with: 0)
                 let copiedFrames = try Self.copyTensorWindowToDecoderInput(
                     source: encoderTensor,
-                    sourceStartFrame: max(0, steps - decodeFrames),
-                    sourceFrameCount: decodeFrames,
+                    sourceStartFrame: startStep,
+                    sourceFrameCount: requestedFrames,
                     destination: decoderEncoderBuffer
                 )
+                guard copiedFrames > 0 else { return ([], 0) }
+                try resetDecoderContextForStreamingWindow()
+                let decodeStartTime = CFAbsoluteTimeGetCurrent()
+                let tokenIDs = try decodeChunk(
+                    decoderEncoderInput: decoderEncoderBuffer,
+                    encoderSteps: copiedFrames,
+                    commitState: false
+                )
+                decodeMs += (CFAbsoluteTimeGetCurrent() - decodeStartTime) * 1000.0
+                return (tokenIDs, copiedFrames)
+            }
+
+            if shouldUseAnchoredTail {
+                let anchoredFrames = Self.anchoredRollingDecodeFrameCount(
+                    encoderSteps: steps,
+                    approxNewSteps: approxNewSteps,
+                    baseDecodeFrames: streamingAnchoredRollingDecodeFrames,
+                    stepMultiplier: streamingAnchoredRollingStepMultiplier,
+                    minTailFrames: config.streamingMinTailDecodeFrames
+                )
+                decodeStrategy = droppedSamples > 0 ? "rolling-stateless-trimmed-tail" : "rolling-stateless-anchored-tail"
+                decodeSourceStartStep = max(0, steps - anchoredFrames)
+                decodeRequestedFrames = anchoredFrames
+
+                let (chunkTokenIDs, copiedFrames) = try decodeRollingWindow(
+                    startStep: decodeSourceStartStep,
+                    requestedFrames: decodeRequestedFrames
+                )
+                decodeCopiedFrames = copiedFrames
+
                 if copiedFrames > 0 {
-                    try resetDecoderContextForStreamingWindow()
-                    let chunkTokenIDs = try decodeChunk(
-                        decoderEncoderInput: decoderEncoderBuffer,
-                        encoderSteps: copiedFrames,
-                        commitState: true
+                    let mergeStartTime = CFAbsoluteTimeGetCurrent()
+                    let mergeResult = Self.refineRollingWindowMergeResult(
+                        Self._mergeWindowHypothesisWithResult(base: baseTokenIDs, next: chunkTokenIDs),
+                        base: baseTokenIDs,
+                        next: chunkTokenIDs,
+                        vocab: vocab
                     )
-                    committedTokenIDs = Self.appendWithOverlap(base: committedTokenIDs, next: chunkTokenIDs)
+                    mergeDiagnostic = makeStreamingMergeDiagnostic(
+                        result: mergeResult,
+                        base: baseTokenIDs,
+                        next: chunkTokenIDs,
+                        merged: mergeResult.merged
+                    )
+                    mergeMs += (CFAbsoluteTimeGetCurrent() - mergeStartTime) * 1000.0
+
+                    if Self.shouldAcceptRollingTailMerge(
+                        result: mergeResult,
+                        baseCount: baseTokenIDs.count,
+                        nextCount: chunkTokenIDs.count
+                    ) {
+                        committedTokenIDs = mergeResult.merged
+                    } else {
+                        // Tail decode drifted too far. Re-run the full available prefix
+                        // immediately and reset anchor state instead of carrying a bad merge.
+                        decodeStrategy = "rolling-stateless-full-fallback"
+                        streamingRollingAnchorActive = false
+                        streamingRollingAnchorStablePassCount = 0
+                        decodeSourceStartStep = 0
+                        decodeRequestedFrames = steps
+                        let (fallbackTokenIDs, fallbackCopiedFrames) = try decodeRollingWindow(
+                            startStep: 0,
+                            requestedFrames: steps
+                        )
+                        decodeCopiedFrames = fallbackCopiedFrames
+                        if fallbackCopiedFrames > 0 {
+                            committedTokenIDs = fallbackTokenIDs
+                        }
+                    }
+                }
+            } else {
+                decodeStrategy = "rolling-stateless-full-prefix"
+                decodeSourceStartStep = 0
+                decodeRequestedFrames = steps
+                let (chunkTokenIDs, copiedFrames) = try decodeRollingWindow(
+                    startStep: 0,
+                    requestedFrames: steps
+                )
+                decodeCopiedFrames = copiedFrames
+                if copiedFrames > 0 {
+                    committedTokenIDs = chunkTokenIDs
+                    if Self.shouldPromoteRollingAnchor(
+                        previous: baseTokenIDs,
+                        current: chunkTokenIDs,
+                        minTokenCount: streamingRollingAnchorMinTokenCount
+                    ) {
+                        streamingRollingAnchorStablePassCount += 1
+                        if streamingRollingAnchorStablePassCount >= streamingRollingAnchorRequiredStablePasses {
+                            streamingRollingAnchorActive = true
+                            decodeStrategy = "rolling-stateless-anchor-established"
+                        }
+                    } else {
+                        streamingRollingAnchorStablePassCount = 0
+                    }
                 }
             }
             draftTokenIDs.removeAll(keepingCapacity: true)
+            updateStreamingDiagnostic(
+                callIndex: diagnosticCallIndex,
+                inputSamples: samples.count,
+                historySamples: streamingSampleHistory.count,
+                droppedSamples: droppedSamples,
+                frameCount: frameCount,
+                windowFrames: clampedFrames,
+                windowStartFrame: startFrame,
+                encoderSteps: steps,
+                approxNewFrames: approxNewFrames,
+                approxNewSteps: approxNewSteps,
+                decodeStrategy: decodeStrategy,
+                decodeSourceStartStep: decodeSourceStartStep,
+                decodeRequestedFrames: decodeRequestedFrames,
+                decodeCopiedFrames: decodeCopiedFrames,
+                decodedCursorBefore: decodedCursorBefore,
+                decodedCursorAfter: streamingDecodedFrameCursor,
+                featureExtractMs: featureExtractMs,
+                encoderPrepareMs: encoderPrepareMs,
+                encoderPredictMs: encoderPredictMs,
+                decodeMs: decodeMs,
+                mergeMs: mergeMs,
+                totalModelMs: (CFAbsoluteTimeGetCurrent() - chunkStartTime) * 1000.0,
+                committedTokenCountBefore: committedTokenCountBefore,
+                committedTokenCountAfter: committedTokenIDs.count,
+                draftTokenCountAfter: draftTokenIDs.count,
+                mergeDiagnostic: mergeDiagnostic
+            )
             return Self.decodePieces(from: committedTokenIDs, vocab: vocab)
         }
 
         if !streamingFinalizeDraftEnabled {
             if streamingDeterministicCursorEnabled {
+                decodeStrategy = "deterministic-cursor"
                 // Decode each encoder frame once using a global cursor.
                 let windowGlobalEnd = max(steps, streamingDecodedFrameCursor + approxNewSteps)
                 let windowGlobalStart = max(0, windowGlobalEnd - steps)
                 var decodeGlobalStart = max(streamingDecodedFrameCursor, windowGlobalStart)
                 decodeGlobalStart = min(decodeGlobalStart, windowGlobalEnd)
                 let decodeFrames = max(0, windowGlobalEnd - decodeGlobalStart)
+                decodeSourceStartStep = max(0, decodeGlobalStart - windowGlobalStart)
+                decodeRequestedFrames = decodeFrames
 
                 if decodeFrames > 0 {
                     try Self.fill(array: decoderEncoderBuffer, with: 0)
-                    let sourceStart = max(0, decodeGlobalStart - windowGlobalStart)
                     let copiedFrames = try Self.copyTensorWindowToDecoderInput(
                         source: encoderTensor,
-                        sourceStartFrame: sourceStart,
+                        sourceStartFrame: decodeSourceStartStep,
                         sourceFrameCount: decodeFrames,
                         destination: decoderEncoderBuffer
                     )
+                    decodeCopiedFrames = copiedFrames
                     if copiedFrames > 0 {
+                        let decodeStartTime = CFAbsoluteTimeGetCurrent()
                         let chunkTokenIDs = try decodeChunk(
                             decoderEncoderInput: decoderEncoderBuffer,
                             encoderSteps: copiedFrames,
                             commitState: true
                         )
+                        decodeMs += (CFAbsoluteTimeGetCurrent() - decodeStartTime) * 1000.0
                         committedTokenIDs.append(contentsOf: chunkTokenIDs)
                         streamingDecodedFrameCursor = decodeGlobalStart + copiedFrames
                     } else {
@@ -579,34 +1017,72 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
                     streamingDecodedFrameCursor = windowGlobalEnd
                 }
             } else {
+                decodeStrategy = "tail-overlap"
                 // Legacy mode: decode recent tail and overlap-merge token chunks.
                 let tailDecodeFrames = min(steps, max(config.streamingMinTailDecodeFrames, approxNewSteps))
+                decodeSourceStartStep = max(0, steps - tailDecodeFrames)
+                decodeRequestedFrames = tailDecodeFrames
                 try Self.fill(array: decoderEncoderBuffer, with: 0)
                 let copiedFrames = try Self.copyTensorWindowToDecoderInput(
                     source: encoderTensor,
-                    sourceStartFrame: max(0, steps - tailDecodeFrames),
+                    sourceStartFrame: decodeSourceStartStep,
                     sourceFrameCount: tailDecodeFrames,
                     destination: decoderEncoderBuffer
                 )
+                decodeCopiedFrames = copiedFrames
                 if copiedFrames > 0 {
+                    let decodeStartTime = CFAbsoluteTimeGetCurrent()
                     let chunkTokenIDs = try decodeChunk(
                         decoderEncoderInput: decoderEncoderBuffer,
                         encoderSteps: copiedFrames,
                         commitState: true
                     )
+                    decodeMs += (CFAbsoluteTimeGetCurrent() - decodeStartTime) * 1000.0
+                    let mergeStartTime = CFAbsoluteTimeGetCurrent()
                     committedTokenIDs = Self.appendWithOverlap(base: committedTokenIDs, next: chunkTokenIDs)
+                    mergeMs += (CFAbsoluteTimeGetCurrent() - mergeStartTime) * 1000.0
                 }
             }
 
             draftTokenIDs.removeAll(keepingCapacity: true)
+            updateStreamingDiagnostic(
+                callIndex: diagnosticCallIndex,
+                inputSamples: samples.count,
+                historySamples: streamingSampleHistory.count,
+                droppedSamples: droppedSamples,
+                frameCount: frameCount,
+                windowFrames: clampedFrames,
+                windowStartFrame: startFrame,
+                encoderSteps: steps,
+                approxNewFrames: approxNewFrames,
+                approxNewSteps: approxNewSteps,
+                decodeStrategy: decodeStrategy,
+                decodeSourceStartStep: decodeSourceStartStep,
+                decodeRequestedFrames: decodeRequestedFrames,
+                decodeCopiedFrames: decodeCopiedFrames,
+                decodedCursorBefore: decodedCursorBefore,
+                decodedCursorAfter: streamingDecodedFrameCursor,
+                featureExtractMs: featureExtractMs,
+                encoderPrepareMs: encoderPrepareMs,
+                encoderPredictMs: encoderPredictMs,
+                decodeMs: decodeMs,
+                mergeMs: mergeMs,
+                totalModelMs: (CFAbsoluteTimeGetCurrent() - chunkStartTime) * 1000.0,
+                committedTokenCountBefore: committedTokenCountBefore,
+                committedTokenCountAfter: committedTokenIDs.count,
+                draftTokenCountAfter: draftTokenIDs.count
+            )
             return Self.decodePieces(from: committedTokenIDs, vocab: vocab)
         }
 
+        decodeStrategy = "finalize-tail"
         // Strict-causal finalized path: commit only newly advanced tail frames.
         // The previous overlap-based finalized window caused repeated commits in
         // realtime because old context frames were being re-committed.
         let finalizedSteps = min(steps, max(config.streamingMinTailDecodeFrames, approxNewSteps))
         let finalizedStart = max(0, steps - finalizedSteps)
+        decodeSourceStartStep = finalizedStart
+        decodeRequestedFrames = finalizedSteps
 
         if finalizedSteps > 0 {
             try Self.fill(array: decoderEncoderBuffer, with: 0)
@@ -616,13 +1092,18 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
                 sourceFrameCount: finalizedSteps,
                 destination: decoderEncoderBuffer
             )
+            decodeCopiedFrames = finalCopied
             if finalCopied > 0 {
+                let decodeStartTime = CFAbsoluteTimeGetCurrent()
                 let finalizedTokenIDs = try decodeChunk(
                     decoderEncoderInput: decoderEncoderBuffer,
                     encoderSteps: finalCopied,
                     commitState: true
                 )
+                decodeMs += (CFAbsoluteTimeGetCurrent() - decodeStartTime) * 1000.0
+                let mergeStartTime = CFAbsoluteTimeGetCurrent()
                 committedTokenIDs = Self.appendWithOverlap(base: committedTokenIDs, next: finalizedTokenIDs)
+                mergeMs += (CFAbsoluteTimeGetCurrent() - mergeStartTime) * 1000.0
             }
         }
 
@@ -642,11 +1123,13 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
                     destination: decoderEncoderBuffer
                 )
                 if draftCopied > 0 {
+                    let decodeStartTime = CFAbsoluteTimeGetCurrent()
                     draftTokenIDs = try decodeChunk(
                         decoderEncoderInput: decoderEncoderBuffer,
                         encoderSteps: draftCopied,
                         commitState: false
                     )
+                    decodeMs += (CFAbsoluteTimeGetCurrent() - decodeStartTime) * 1000.0
                 }
             }
         }
@@ -654,46 +1137,285 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
         if streamingEmitDraftEnabled {
             return Self.decodePieces(from: committedTokenIDs + draftTokenIDs, vocab: vocab)
         }
+        updateStreamingDiagnostic(
+            callIndex: diagnosticCallIndex,
+            inputSamples: samples.count,
+            historySamples: streamingSampleHistory.count,
+            droppedSamples: droppedSamples,
+            frameCount: frameCount,
+            windowFrames: clampedFrames,
+            windowStartFrame: startFrame,
+            encoderSteps: steps,
+            approxNewFrames: approxNewFrames,
+            approxNewSteps: approxNewSteps,
+            decodeStrategy: decodeStrategy,
+            decodeSourceStartStep: decodeSourceStartStep,
+            decodeRequestedFrames: decodeRequestedFrames,
+            decodeCopiedFrames: decodeCopiedFrames,
+            decodedCursorBefore: decodedCursorBefore,
+            decodedCursorAfter: streamingDecodedFrameCursor,
+            featureExtractMs: featureExtractMs,
+            encoderPrepareMs: encoderPrepareMs,
+            encoderPredictMs: encoderPredictMs,
+            decodeMs: decodeMs,
+            mergeMs: mergeMs,
+            totalModelMs: (CFAbsoluteTimeGetCurrent() - chunkStartTime) * 1000.0,
+            committedTokenCountBefore: committedTokenCountBefore,
+            committedTokenCountAfter: committedTokenIDs.count,
+            draftTokenCountAfter: draftTokenIDs.count
+        )
         return Self.decodePieces(from: committedTokenIDs, vocab: vocab)
     }
 
     private func transcribeChunkRewritePrefix(_ samples: [Float], sampleRate: Int) throws -> String {
         if !samples.isEmpty {
             streamingPrefixSamples.append(contentsOf: samples)
+            streamingPrefixPendingNewSampleCount += samples.count
             if streamingPrefixMaxSamples > 0, streamingPrefixSamples.count > streamingPrefixMaxSamples {
                 let drop = streamingPrefixSamples.count - streamingPrefixMaxSamples
                 streamingPrefixSamples.removeFirst(drop)
-                streamingPrefixLastDecodeSampleCount = min(streamingPrefixLastDecodeSampleCount, streamingPrefixSamples.count)
+                streamingPrefixHasTrimmedHistory = true
+                rewritePrefixEncoderWindowCache.reset()
             }
         }
         if streamingPrefixSamples.isEmpty {
             return streamingPrefixLastText
         }
 
-        let newSamples = streamingPrefixSamples.count - streamingPrefixLastDecodeSampleCount
-        let requiredSamples = max(streamingPrefixDecodeStrideSamples, streamingPrefixAdaptiveRequiredSamples)
-        let shouldDecode = streamingPrefixLastText.isEmpty || newSamples >= requiredSamples
+        let requiredSamples = Self.rewritePrefixRequiredSamples(
+            stableRequiredSamples: max(streamingPrefixDecodeStrideSamples, streamingPrefixAdaptiveRequiredSamples),
+            onsetStrideSamples: streamingPrefixOnsetStrideSamples,
+            onsetMaxSamples: streamingPrefixOnsetMaxSamples,
+            onsetMinWordCount: streamingPrefixOnsetMinWordCount,
+            currentText: streamingPrefixLastText,
+            bufferedSamples: streamingPrefixSamples.count
+        )
+        let shouldDecode = Self.shouldDecodeRewritePrefix(
+            hasPreviousText: !streamingPrefixLastText.isEmpty,
+            pendingNewSamples: streamingPrefixPendingNewSampleCount,
+            requiredSamples: requiredSamples
+        )
         if !shouldDecode {
             return streamingPrefixLastText
         }
 
         // `transcribeLongform` performs a model-state reset internally.
-        // Preserve stream prefix buffers around that internal reset.
+        // Preserve rewrite-prefix bookkeeping around that internal reset.
         let prefixCopy = streamingPrefixSamples
+        let priorMergedText = streamingPrefixLastText
+        let hadTrimmedHistory = streamingPrefixHasTrimmedHistory
+        let adaptiveDecodeSecEWMA = streamingPrefixAdaptiveDecodeSecEWMA
+        let adaptiveRequiredSamples = streamingPrefixAdaptiveRequiredSamples
         let started = CFAbsoluteTimeGetCurrent()
-        let text = try transcribeLongform(
-            prefixCopy,
-            sampleRate: sampleRate,
-            leftContextFrames: streamingPrefixLeftContextFrames,
-            rightContextFrames: streamingPrefixRightContextFrames,
-            allowRightContext: streamingPrefixAllowRightContext
+        let allowDecoderResume = Self.shouldAllowRewritePrefixDecoderResume(
+            currentText: streamingPrefixLastText,
+            bufferedSamples: prefixCopy.count,
+            onsetMaxSamples: rewritePrefixDecoderResumeOnsetMaxSamples,
+            minWordCount: rewritePrefixDecoderResumeMinWordCount
         )
+        let text: String
+        if rewritePrefixEncoderCacheEnabled {
+            text = try transcribeLongformRewritePrefixCached(
+                prefixCopy,
+                sampleRate: sampleRate,
+                leftContextFrames: streamingPrefixLeftContextFrames,
+                rightContextFrames: streamingPrefixRightContextFrames,
+                allowRightContext: streamingPrefixAllowRightContext,
+                allowDecoderResume: allowDecoderResume
+            )
+        } else {
+            text = try transcribeLongform(
+                prefixCopy,
+                sampleRate: sampleRate,
+                leftContextFrames: streamingPrefixLeftContextFrames,
+                rightContextFrames: streamingPrefixRightContextFrames,
+                allowRightContext: streamingPrefixAllowRightContext
+            )
+        }
         let decodeSec = max(0, CFAbsoluteTimeGetCurrent() - started)
         streamingPrefixSamples = prefixCopy
-        streamingPrefixLastDecodeSampleCount = streamingPrefixSamples.count
-        streamingPrefixLastText = text
+        streamingPrefixHasTrimmedHistory = hadTrimmedHistory
+        streamingPrefixAdaptiveDecodeSecEWMA = adaptiveDecodeSecEWMA
+        streamingPrefixAdaptiveRequiredSamples = adaptiveRequiredSamples
+        streamingPrefixPendingNewSampleCount = 0
+        streamingPrefixLastText = Self.mergeRewritePrefixTranscript(
+            previous: priorMergedText,
+            currentWindow: text,
+            hasTrimmedHistory: hadTrimmedHistory
+        )
         updatePrefixAdaptiveStride(decodeSec: decodeSec)
-        return text
+        return streamingPrefixLastText
+    }
+
+    private func transcribeLongformRewritePrefixCached(
+        _ samples: [Float],
+        sampleRate: Int,
+        leftContextFrames: Int,
+        rightContextFrames: Int,
+        allowRightContext: Bool = true,
+        allowDecoderResume: Bool
+    ) throws -> String {
+        guard sampleRate == config.expectedSampleRate else {
+            throw ParakeetCoreMLTDTError.sampleRateMismatch(expected: config.expectedSampleRate, actual: sampleRate)
+        }
+        if samples.isEmpty { return "" }
+
+        resetDecodeSequenceState()
+        let (featureMatrix, totalFrames) = featureExtractor.extract(samples: samples)
+        if totalFrames <= 0 { return "" }
+
+        let maxContextTotal = max(0, encoderFrameCount - 1)
+        let leftCtx = min(max(0, leftContextFrames), maxContextTotal)
+        let configuredRightCtx = allowRightContext ? max(0, rightContextFrames) : 0
+        let rightCtx = min(configuredRightCtx, max(0, maxContextTotal - leftCtx))
+        let hopFrames = max(1, encoderFrameCount - leftCtx - rightCtx)
+        let plans = Self.makeLongformWindowPlans(
+            totalFrames: totalFrames,
+            encoderFrameCount: encoderFrameCount,
+            leftContextFrames: leftCtx,
+            rightContextFrames: rightCtx,
+            allowRightContext: allowRightContext
+        )
+
+        rewritePrefixEncoderWindowCache.configure(
+            leftContextFrames: leftCtx,
+            rightContextFrames: rightCtx,
+            allowRightContext: allowRightContext,
+            encoderFrameCount: encoderFrameCount,
+            hopFrames: hopFrames
+        )
+
+        let reuseCount = Self.matchingLongformWindowPrefixCount(
+            previous: rewritePrefixEncoderWindowCache.entries.map(\.key),
+            current: plans.map(\.key)
+        )
+        var entries = Array(rewritePrefixEncoderWindowCache.entries.prefix(reuseCount))
+        if entries.count < plans.count {
+            entries.reserveCapacity(plans.count)
+        }
+
+        for plan in plans.dropFirst(reuseCount) {
+            let entry = try buildRewritePrefixEncoderCacheEntry(
+                plan: plan,
+                featureMatrix: featureMatrix,
+                totalFrames: totalFrames,
+                hopFrames: hopFrames
+            )
+            entries.append(entry)
+        }
+        rewritePrefixEncoderWindowCache.entries = entries
+
+        var allTokenIDs: [Int] = []
+        var decodeStartIndex = 0
+        if allowDecoderResume, !useStatefulDecoderRuntime {
+            let resumableCount = Self.resumableLongformWindowPrefixCount(
+                hasCheckpoints: entries.map { $0.decoderCheckpoint != nil },
+                reuseCount: reuseCount
+            )
+            if resumableCount > 0,
+               let checkpoint = entries[resumableCount - 1].decoderCheckpoint {
+                try restoreRewritePrefixDecoderCheckpoint(checkpoint)
+                let reusedTokenCapacity = entries[..<resumableCount].reduce(0) { $0 + $1.tokenIDs.count }
+                allTokenIDs.reserveCapacity(reusedTokenCapacity + max(64, (entries.count - resumableCount) * 16))
+                for idx in 0..<resumableCount {
+                    allTokenIDs.append(contentsOf: entries[idx].tokenIDs)
+                }
+                decodeStartIndex = resumableCount
+            }
+        }
+
+        for idx in decodeStartIndex..<entries.count {
+            let entry = entries[idx]
+            guard entry.encoderSteps > 0 else { continue }
+            let chunkTokenIDs = try decodeChunk(
+                decoderEncoderInput: entry.decoderInputTensor,
+                encoderSteps: entry.encoderSteps,
+                commitState: true
+            )
+            entries[idx].tokenIDs = chunkTokenIDs
+            if allowDecoderResume, !useStatefulDecoderRuntime {
+                entries[idx].decoderCheckpoint = try makeRewritePrefixDecoderCheckpoint()
+            } else {
+                entries[idx].decoderCheckpoint = nil
+            }
+            allTokenIDs.append(contentsOf: chunkTokenIDs)
+        }
+        rewritePrefixEncoderWindowCache.entries = entries
+
+        committedTokenIDs = allTokenIDs
+        draftTokenIDs.removeAll(keepingCapacity: true)
+        return Self.decodePieces(from: allTokenIDs, vocab: vocab)
+    }
+
+    private func buildRewritePrefixEncoderCacheEntry(
+        plan: LongformWindowPlan,
+        featureMatrix: [Float],
+        totalFrames: Int,
+        hopFrames: Int
+    ) throws -> RewritePrefixEncoderWindowCacheEntry {
+        try Self.fill(array: encoderAudioBuffer, with: 0)
+        try Self.copyFeatureWindowToEncoderInput(
+            featureMatrix: featureMatrix,
+            melBins: config.melBins,
+            totalFrames: totalFrames,
+            startFrame: plan.key.inputStart,
+            sourceFrames: plan.key.actualFrames,
+            destination: encoderAudioBuffer,
+            copyFrames: plan.key.actualFrames
+        )
+
+        var encoderFeed: [String: Any] = [encoderAudioInputName: encoderAudioBuffer]
+        if let lengthName = encoderLengthInputName {
+            if let lengthArray = encoderLengthBuffer {
+                try Self.setScalarInt(lengthArray, value: plan.key.actualFrames)
+                encoderFeed[lengthName] = lengthArray
+            } else if let lengthType = encoderLengthDataType {
+                let lengthArray = try Self.makeArray(shape: [1], dataType: lengthType)
+                try Self.setScalarInt(lengthArray, value: plan.key.actualFrames)
+                encoderFeed[lengthName] = lengthArray
+            }
+        }
+
+        let encoderProvider = try MLDictionaryFeatureProvider(dictionary: encoderFeed)
+        let encoderOutput = try encoder.prediction(from: encoderProvider)
+        let (rawEncoderTensor, rawEncoderLength) = try Self.pickEncoderTensorAndLength(from: encoderOutput, debug: false)
+        let rawSteps = max(0, min(rawEncoderLength ?? plan.key.actualFrames, decoderFrameCount))
+        if rawSteps <= 0 {
+            return .init(
+                key: plan.key,
+                encoderSteps: 0,
+                decoderInputTensor: try Self.makeArray(shape: decoderEncoderInputShape, dataType: decoderEncoderInputDataType),
+                tokenIDs: [],
+                decoderCheckpoint: nil
+            )
+        }
+
+        let (sourceStartOut, sourceCopyFrames) = Self.projectLongformWindowToEncoderSteps(
+            rawSteps: rawSteps,
+            inputStart: plan.key.inputStart,
+            centerStart: plan.key.centerStart,
+            actualFrames: plan.key.actualFrames,
+            centerFrames: plan.key.centerFrames,
+            hopFrames: hopFrames
+        )
+        let encoderSteps = max(0, min(rawSteps - sourceStartOut, sourceCopyFrames))
+        let decoderInputTensor = try Self.makeArray(shape: decoderEncoderInputShape, dataType: decoderEncoderInputDataType)
+        try Self.fill(array: decoderInputTensor, with: 0)
+        if encoderSteps > 0 {
+            _ = try Self.copyTensorWindowToDecoderInput(
+                source: rawEncoderTensor,
+                sourceStartFrame: sourceStartOut,
+                sourceFrameCount: encoderSteps,
+                destination: decoderInputTensor
+            )
+        }
+        return .init(
+            key: plan.key,
+            encoderSteps: encoderSteps,
+            decoderInputTensor: decoderInputTensor,
+            tokenIDs: [],
+            decoderCheckpoint: nil
+        )
     }
 
     private func updatePrefixAdaptiveStride(decodeSec: Double) {
@@ -724,6 +1446,40 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
         streamingPrefixAdaptiveRequiredSamples = max(streamingPrefixDecodeStrideSamples, clamped)
     }
 
+    private func resetDecodeSequenceState() {
+        if #available(macOS 15.0, iOS 18.0, *), useStatefulDecoderRuntime {
+            decoderState = decoder.makeState()
+        } else {
+            try? Self.fill(array: state1, with: 0)
+            try? Self.fill(array: state2, with: 0)
+        }
+        previousToken = blankID
+        committedTokenIDs.removeAll(keepingCapacity: true)
+        draftTokenIDs.removeAll(keepingCapacity: true)
+        streamingSampleHistory.removeAll(keepingCapacity: true)
+        streamingDecodedFrameCursor = 0
+        streamingEncoderStepScheduler.reset()
+        streamingRollingAnchorStablePassCount = 0
+        streamingRollingAnchorActive = false
+        streamingFeatureCache.reset()
+        lastStreamingDiagnostic = nil
+        decoderTraceChunkIndex = 0
+    }
+
+    private func makeRewritePrefixDecoderCheckpoint() throws -> RewritePrefixDecoderCheckpoint {
+        .init(
+            previousToken: previousToken,
+            state1: try Self.cloneArray(state1),
+            state2: try Self.cloneArray(state2)
+        )
+    }
+
+    private func restoreRewritePrefixDecoderCheckpoint(_ checkpoint: RewritePrefixDecoderCheckpoint) throws {
+        try Self.copyArrayContents(source: checkpoint.state1, destination: state1)
+        try Self.copyArrayContents(source: checkpoint.state2, destination: state2)
+        previousToken = checkpoint.previousToken
+    }
+
     public func transcribeLongform(
         _ samples: [Float],
         sampleRate: Int,
@@ -736,7 +1492,7 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
         }
         if samples.isEmpty { return "" }
 
-        resetState()
+        resetDecodeSequenceState()
         let (featureMatrix, totalFrames) = featureExtractor.extract(samples: samples)
         if totalFrames <= 0 { return "" }
 
@@ -784,23 +1540,17 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
             var sourceCopyFrames = rawSteps
 
             if (leftCtx > 0 || rightCtx > 0), actualFrames > 0 {
-                let leftIn = centerStart - inputStart
                 let centerIn = min(hopFrames, totalFrames - centerStart)
-                let scale = Double(rawSteps) / Double(actualFrames)
-                var leftOut = Int((Double(leftIn) * scale).rounded())
-                var centerOut = Int((Double(centerIn) * scale).rounded())
-
-                leftOut = max(0, min(leftOut, rawSteps))
-                centerOut = max(1, centerOut)
-
-                let endOut: Int
-                if centerStart + centerIn >= totalFrames {
-                    endOut = rawSteps
-                } else {
-                    endOut = max(leftOut, min(rawSteps, leftOut + centerOut))
-                }
-                sourceStartOut = leftOut
-                sourceCopyFrames = max(0, endOut - leftOut)
+                let projected = Self.projectLongformWindowToEncoderSteps(
+                    rawSteps: rawSteps,
+                    inputStart: inputStart,
+                    centerStart: centerStart,
+                    actualFrames: actualFrames,
+                    centerFrames: centerIn,
+                    hopFrames: hopFrames
+                )
+                sourceStartOut = projected.start
+                sourceCopyFrames = projected.count
             }
 
             if sourceCopyFrames <= 0 { continue }
@@ -828,23 +1578,103 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
     }
 
     public func resetState() {
-        if #available(macOS 15.0, iOS 18.0, *), useStatefulDecoderRuntime {
-            decoderState = decoder.makeState()
-        } else {
-            try? Self.fill(array: state1, with: 0)
-            try? Self.fill(array: state2, with: 0)
-        }
-        previousToken = blankID
-        committedTokenIDs.removeAll(keepingCapacity: true)
-        draftTokenIDs.removeAll(keepingCapacity: true)
-        streamingSampleHistory.removeAll(keepingCapacity: true)
+        resetDecodeSequenceState()
         streamingPrefixSamples.removeAll(keepingCapacity: true)
-        streamingPrefixLastDecodeSampleCount = 0
+        streamingPrefixPendingNewSampleCount = 0
+        streamingPrefixHasTrimmedHistory = false
         streamingPrefixLastText = ""
         streamingPrefixAdaptiveDecodeSecEWMA = 0
         streamingPrefixAdaptiveRequiredSamples = streamingPrefixDecodeStrideSamples
-        streamingDecodedFrameCursor = 0
-        decoderTraceChunkIndex = 0
+        rewritePrefixEncoderWindowCache.reset()
+        lastStreamingDiagnostic = nil
+    }
+
+    private func updateStreamingDiagnostic(
+        callIndex: Int,
+        inputSamples: Int,
+        historySamples: Int,
+        droppedSamples: Int,
+        frameCount: Int,
+        windowFrames: Int,
+        windowStartFrame: Int,
+        encoderSteps: Int,
+        approxNewFrames: Int,
+        approxNewSteps: Int,
+        decodeStrategy: String,
+        decodeSourceStartStep: Int,
+        decodeRequestedFrames: Int,
+        decodeCopiedFrames: Int,
+        decodedCursorBefore: Int,
+        decodedCursorAfter: Int,
+        featureExtractMs: Double,
+        encoderPrepareMs: Double,
+        encoderPredictMs: Double,
+        decodeMs: Double,
+        mergeMs: Double,
+        totalModelMs: Double,
+        committedTokenCountBefore: Int,
+        committedTokenCountAfter: Int,
+        draftTokenCountAfter: Int,
+        mergeDiagnostic: ParakeetStreamingDiagnostic.MergeDiagnostic? = nil
+    ) {
+        lastStreamingDiagnostic = ParakeetStreamingDiagnostic(
+            callIndex: callIndex,
+            inputSamples: inputSamples,
+            historySamples: historySamples,
+            droppedSamples: droppedSamples,
+            frameCount: frameCount,
+            windowFrames: windowFrames,
+            windowStartFrame: windowStartFrame,
+            encoderSteps: encoderSteps,
+            approxNewFrames: approxNewFrames,
+            approxNewSteps: approxNewSteps,
+            decodeStrategy: decodeStrategy,
+            decodeSourceStartStep: decodeSourceStartStep,
+            decodeRequestedFrames: decodeRequestedFrames,
+            decodeCopiedFrames: decodeCopiedFrames,
+            decodedCursorBefore: decodedCursorBefore,
+            decodedCursorAfter: decodedCursorAfter,
+            featureExtractMs: featureExtractMs,
+            encoderPrepareMs: encoderPrepareMs,
+            encoderPredictMs: encoderPredictMs,
+            decodeMs: decodeMs,
+            mergeMs: mergeMs,
+            totalModelMs: totalModelMs,
+            committedTokenCountBefore: committedTokenCountBefore,
+            committedTokenCountAfter: committedTokenCountAfter,
+            draftTokenCountAfter: draftTokenCountAfter,
+            schedulerPendingStepBudget: streamingEncoderStepScheduler.pendingBudget,
+            useStatefulDecoderRuntime: useStatefulDecoderRuntime,
+            streamingDeterministicCursorEnabled: streamingDeterministicCursorEnabled,
+            streamingRollingStatelessEnabled: streamingRollingStatelessEnabled,
+            streamingFinalizeDraftEnabled: streamingFinalizeDraftEnabled,
+            mergeDiagnostic: mergeDiagnostic
+        )
+    }
+
+    private func makeStreamingMergeDiagnostic(
+        result: WindowMergeResult,
+        base: [Int],
+        next: [Int],
+        merged: [Int]
+    ) -> ParakeetStreamingDiagnostic.MergeDiagnostic {
+        let baseTail = Array(base.suffix(64))
+        let nextTokens = Array(next.prefix(96))
+        let mergedTail = Array(merged.suffix(96))
+        return ParakeetStreamingDiagnostic.MergeDiagnostic(
+            strategy: result.strategy,
+            alignmentStart: result.alignmentStart,
+            matchLength: result.matchLength,
+            baseTokenCount: base.count,
+            nextTokenCount: next.count,
+            mergedTokenCount: merged.count,
+            baseTailTokenIDs: baseTail,
+            nextTokenIDs: nextTokens,
+            mergedTailTokenIDs: mergedTail,
+            baseTailText: Self.decodePieces(from: baseTail, vocab: vocab),
+            nextText: Self.decodePieces(from: nextTokens, vocab: vocab),
+            mergedTailText: Self.decodePieces(from: mergedTail, vocab: vocab)
+        )
     }
 
     private func resetDecoderContextForStreamingWindow() throws {
@@ -883,6 +1713,10 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
         let chunkIndex = decoderTraceChunkIndex
         decoderTraceChunkIndex += 1
         var traceStepIndex = 0
+        let canAutoCommitNonBlank =
+            useStatefulDecoderRuntime &&
+            decoderStateUpdateGateInputName != nil &&
+            decoderStepIndexInputName != nil
 
         var t = 0
         while t < encoderSteps && tokenIDs.count < maxTokens {
@@ -906,19 +1740,10 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
                 if useStatefulDecoderRuntime,
                    let gateName = decoderStateUpdateGateInputName,
                    let gateArray = decoderStateUpdateGateBuffer {
-                    let firstPassGateValue: Int
-                    if !commitState {
-                        firstPassGateValue = 0
-                    } else {
-                        switch statefulCommitPolicy {
-                        case .always:
-                            firstPassGateValue = 1
-                        case .autoNonBlank:
-                            firstPassGateValue = 2
-                        case .emitPrevToken, .emitToken:
-                            firstPassGateValue = 0
-                        }
-                    }
+                    let firstPassGateValue = statefulCommitPolicy.firstPassGateValue(
+                        commitState: commitState,
+                        canAutoCommitNonBlank: canAutoCommitNonBlank
+                    )
                     try Self.setScalarGate(gateArray, value: firstPassGateValue)
                     feed[gateName] = gateArray
                 }
@@ -954,7 +1779,13 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
                 let tokenID = Self.argmax(tokenScores)
                 let durationPart = Array(stepLogits[tokenVocabSize..<stepLogits.count])
                 let durationScores = durationPart.isEmpty ? [0] : Self.logSoftmax(durationPart)
-                let durationIdx = Self.argmax(durationScores)
+                let durationIdx = Self.selectDurationIndex(
+                    scores: durationScores,
+                    tokenID: tokenID,
+                    blankID: blankID,
+                    durations: config.durations,
+                    blankTieMargin: blankDurationTieMargin
+                )
                 var skip = config.durations.indices.contains(durationIdx) ? config.durations[durationIdx] : 1
                 if tokenID == blankID && skip == 0 {
                     skip = minNonZeroDuration
@@ -969,8 +1800,10 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
                            let gateName = decoderStateUpdateGateInputName,
                            let gateArray = decoderStateUpdateGateBuffer,
                            #available(macOS 15.0, iOS 18.0, *),
-                           let state = decoderState {
-                            if statefulCommitPolicy == .emitPrevToken || statefulCommitPolicy == .emitToken {
+                           let state = decoderState,
+                           statefulCommitPolicy.requiresExplicitAdvanceAfterEmit(
+                               canAutoCommitNonBlank: canAutoCommitNonBlank
+                           ) {
                                 let advanceToken: Int
                                 switch statefulCommitPolicy {
                                 case .emitPrevToken:
@@ -988,7 +1821,6 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
                                 let advanceProvider = try MLDictionaryFeatureProvider(dictionary: advanceFeed)
                                 _ = try decoder.prediction(from: advanceProvider, using: state)
                                 try Self.setScalarGate(gateArray, value: 0)
-                            }
                         }
                     } else {
                         if let stateOutput1 = decoderStateOutputByInputName[decoderStateInputNames[0]],
@@ -1011,7 +1843,7 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
                         stderr
                     )
                 }
-                decoderTraceWriter?.write(event: [
+                var traceEvent: [String: Any] = [
                     "source": "swift",
                     "kind": "step",
                     "chunk_index": chunkIndex,
@@ -1020,11 +1852,27 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
                     "t": tBefore,
                     "token_id": tokenID,
                     "duration_idx": durationIdx,
+                    "duration_value": skip,
                     "skip": skip,
                     "prev_token": prevTokenBefore,
+                    "token_piece": Self.traceTokenPiece(tokenID: tokenID, vocab: vocab, blankID: blankID),
                     "emitted": tokenID != blankID,
                     "commit_state": commitState ? 1 : 0
-                ])
+                ]
+                if decoderTraceTopK > 0 {
+                    traceEvent["token_topk"] = Self.traceTokenTopKEntries(
+                        scores: tokenScores,
+                        k: decoderTraceTopK,
+                        vocab: vocab,
+                        blankID: blankID
+                    )
+                    traceEvent["duration_topk"] = Self.traceDurationTopKEntries(
+                        scores: durationScores,
+                        k: decoderTraceTopK,
+                        durations: config.durations
+                    )
+                }
+                decoderTraceWriter?.write(event: traceEvent)
                 traceStepIndex += 1
 
                 symbolsAdded += 1
@@ -1183,6 +2031,306 @@ private final class DecoderTraceWriter {
     }
 }
 
+extension ParakeetCoreMLTDTTranscriptionModel {
+    struct WindowMergeResult {
+        let merged: [Int]
+        let strategy: String
+        let alignmentStart: Int?
+        let matchLength: Int
+    }
+
+    static func mergeWindowHypothesis(base: [Int], next: [Int], maxSearchWindow: Int = 4096) -> [Int] {
+        _mergeWindowHypothesisWithResult(base: base, next: next, maxSearchWindow: maxSearchWindow).merged
+    }
+
+    static func selectDurationIndexForTesting(
+        scores: [Float],
+        tokenID: Int,
+        blankID: Int,
+        durations: [Int],
+        blankTieMargin: Float
+    ) -> Int {
+        selectDurationIndex(
+            scores: scores,
+            tokenID: tokenID,
+            blankID: blankID,
+            durations: durations,
+            blankTieMargin: blankTieMargin
+        )
+    }
+
+    static func rollingAnchorPrefixMatchLength(previous: [Int], current: [Int]) -> Int {
+        let limit = min(previous.count, current.count)
+        var idx = 0
+        while idx < limit && previous[idx] == current[idx] {
+            idx += 1
+        }
+        return idx
+    }
+
+    static func shouldPromoteRollingAnchor(previous: [Int], current: [Int], minTokenCount: Int) -> Bool {
+        guard previous.count >= minTokenCount, current.count >= minTokenCount else {
+            return false
+        }
+        let prefixMatch = rollingAnchorPrefixMatchLength(previous: previous, current: current)
+        let shorter = min(previous.count, current.count)
+        return prefixMatch >= minTokenCount && prefixMatch * 4 >= shorter * 3
+    }
+
+    static func shouldDecodeRewritePrefix(
+        hasPreviousText: Bool,
+        pendingNewSamples: Int,
+        requiredSamples: Int
+    ) -> Bool {
+        !hasPreviousText || pendingNewSamples >= max(1, requiredSamples)
+    }
+
+    static func rewritePrefixRequiredSamples(
+        stableRequiredSamples: Int,
+        onsetStrideSamples: Int,
+        onsetMaxSamples: Int,
+        onsetMinWordCount: Int,
+        currentText: String,
+        bufferedSamples: Int
+    ) -> Int {
+        let stable = max(1, stableRequiredSamples)
+        guard onsetMaxSamples > 0 || onsetMinWordCount > 0 else {
+            return stable
+        }
+
+        let wordCount = tokenizeStreamingText(currentText).count
+        let withinOnsetWindow = onsetMaxSamples > 0 && bufferedSamples <= onsetMaxSamples
+        let belowOnsetWordFloor = onsetMinWordCount > 0 && wordCount < onsetMinWordCount
+        guard withinOnsetWindow || belowOnsetWordFloor else {
+            return stable
+        }
+        return min(stable, max(1, onsetStrideSamples))
+    }
+
+    static func shouldAllowRewritePrefixDecoderResume(
+        currentText: String,
+        bufferedSamples: Int,
+        onsetMaxSamples: Int,
+        minWordCount: Int
+    ) -> Bool {
+        guard onsetMaxSamples > 0 || minWordCount > 0 else {
+            return true
+        }
+        let wordCount = tokenizeStreamingText(currentText).count
+        if minWordCount > 0 && wordCount >= minWordCount {
+            return true
+        }
+        if onsetMaxSamples > 0 && bufferedSamples > onsetMaxSamples {
+            return true
+        }
+        return false
+    }
+
+    static func makeLongformWindowPlans(
+        totalFrames: Int,
+        encoderFrameCount: Int,
+        leftContextFrames: Int,
+        rightContextFrames: Int,
+        allowRightContext: Bool
+    ) -> [LongformWindowPlan] {
+        guard totalFrames > 0 else { return [] }
+        let maxContextTotal = max(0, encoderFrameCount - 1)
+        let leftCtx = min(max(0, leftContextFrames), maxContextTotal)
+        let configuredRightCtx = allowRightContext ? max(0, rightContextFrames) : 0
+        let rightCtx = min(configuredRightCtx, max(0, maxContextTotal - leftCtx))
+        let hopFrames = max(1, encoderFrameCount - leftCtx - rightCtx)
+
+        var plans: [LongformWindowPlan] = []
+        plans.reserveCapacity(max(1, totalFrames / hopFrames + 1))
+        for centerStart in stride(from: 0, to: totalFrames, by: hopFrames) {
+            let inputStart = max(0, centerStart - leftCtx)
+            let actualFrames = max(0, min(encoderFrameCount, totalFrames - inputStart))
+            guard actualFrames > 0 else { continue }
+            let centerFrames = min(hopFrames, totalFrames - centerStart)
+            plans.append(
+                LongformWindowPlan(
+                    key: .init(
+                        centerStart: centerStart,
+                        inputStart: inputStart,
+                        actualFrames: actualFrames,
+                        centerFrames: centerFrames
+                    )
+                )
+            )
+        }
+        return plans
+    }
+
+    static func matchingLongformWindowPrefixCount(
+        previous: [LongformWindowCacheKey],
+        current: [LongformWindowCacheKey]
+    ) -> Int {
+        let limit = min(previous.count, current.count)
+        var idx = 0
+        while idx < limit && previous[idx] == current[idx] {
+            idx += 1
+        }
+        return idx
+    }
+
+    static func resumableLongformWindowPrefixCount(hasCheckpoints: [Bool], reuseCount: Int) -> Int {
+        guard reuseCount > 0 else { return 0 }
+        let limit = min(reuseCount, hasCheckpoints.count)
+        var idx = 0
+        while idx < limit && hasCheckpoints[idx] {
+            idx += 1
+        }
+        return idx
+    }
+
+    static func projectLongformWindowToEncoderSteps(
+        rawSteps: Int,
+        inputStart: Int,
+        centerStart: Int,
+        actualFrames: Int,
+        centerFrames: Int,
+        hopFrames: Int
+    ) -> (start: Int, count: Int) {
+        guard rawSteps > 0, actualFrames > 0 else { return (0, 0) }
+        let leftIn = centerStart - inputStart
+        let scale = Double(rawSteps) / Double(actualFrames)
+        var leftOut = Int((Double(leftIn) * scale).rounded())
+        var centerOut = Int((Double(centerFrames) * scale).rounded())
+
+        leftOut = max(0, min(leftOut, rawSteps))
+        centerOut = max(1, centerOut)
+        let endOut: Int
+        if centerFrames < hopFrames {
+            endOut = rawSteps
+        } else {
+            endOut = max(leftOut, min(rawSteps, leftOut + centerOut))
+        }
+        return (leftOut, max(0, endOut - leftOut))
+    }
+
+    static func mergeRewritePrefixTranscript(
+        previous: String,
+        currentWindow: String,
+        hasTrimmedHistory: Bool
+    ) -> String {
+        guard hasTrimmedHistory else { return currentWindow }
+        let previousWords = tokenizeStreamingText(previous)
+        let currentWords = tokenizeStreamingText(currentWindow)
+        guard !previousWords.isEmpty else { return currentWindow }
+        guard !currentWords.isEmpty else { return previous }
+        let merged = RealtimeTranscriptBuffer.appendWithOverlap(base: previousWords, segment: currentWords)
+        return merged.joined(separator: " ")
+    }
+
+    static func anchoredRollingDecodeFrameCount(
+        encoderSteps: Int,
+        approxNewSteps: Int,
+        baseDecodeFrames: Int,
+        stepMultiplier: Int,
+        minTailFrames: Int
+    ) -> Int {
+        min(
+            encoderSteps,
+            max(minTailFrames, max(baseDecodeFrames, approxNewSteps * stepMultiplier))
+        )
+    }
+
+    static func shouldAcceptRollingTailMerge(
+        result: WindowMergeResult,
+        baseCount: Int,
+        nextCount: Int
+    ) -> Bool {
+        switch result.strategy {
+        case "seed_next":
+            return baseCount == 0 && nextCount > 0
+        case "keep_base",
+             "keep_base_empty_append",
+             "keep_base_word_replay",
+             "defer_short_append",
+             "defer_word_overlap_append",
+             "defer_high_overlap_append",
+             "aligned_replace":
+            return true
+        default:
+            return false
+        }
+    }
+
+    static func refineRollingWindowMergeResult(
+        _ result: WindowMergeResult,
+        base: [Int],
+        next: [Int],
+        vocab: [String]
+    ) -> WindowMergeResult {
+        guard result.strategy == "append_with_overlap" else {
+            return result
+        }
+
+        let baseWords = normalizedStreamingMergeWords(from: Array(base.suffix(128)), vocab: vocab)
+        let nextWords = normalizedStreamingMergeWords(from: Array(next.prefix(128)), vocab: vocab)
+        guard !nextWords.isEmpty else {
+            return WindowMergeResult(
+                merged: base,
+                strategy: "keep_base_empty_append",
+                alignmentStart: nil,
+                matchLength: 0
+            )
+        }
+
+        let shortWordOverlap = suffixPrefixWordOverlap(baseWords, nextWords, maxOverlap: 4)
+        let shortSharedWordCount = sharedNormalizedWordCount(Array(baseWords.suffix(8)), nextWords)
+
+        // Single-word fallback appends are usually unstable. For two-word
+        // tails, only defer if they are already overlapping/replaying recent
+        // suffix words; otherwise let novel short extensions through.
+        if nextWords.count == 1 || (nextWords.count == 2 && (shortWordOverlap > 0 || shortSharedWordCount > 0)) {
+            return WindowMergeResult(
+                merged: base,
+                strategy: "defer_short_append",
+                alignmentStart: nil,
+                matchLength: nextWords.count
+            )
+        }
+
+        if containsSubsequence(haystack: baseWords, needle: nextWords) {
+            return WindowMergeResult(
+                merged: base,
+                strategy: "keep_base_word_replay",
+                alignmentStart: nil,
+                matchLength: nextWords.count
+            )
+        }
+
+        let wordOverlap = suffixPrefixWordOverlap(baseWords, nextWords, maxOverlap: 8)
+        if wordOverlap >= min(3, max(0, nextWords.count - 1)) {
+            return WindowMergeResult(
+                merged: base,
+                strategy: "defer_word_overlap_append",
+                alignmentStart: nil,
+                matchLength: wordOverlap
+            )
+        }
+
+        let commonWordCount = sharedNormalizedWordCount(Array(baseWords.suffix(16)), nextWords)
+        if nextWords.count <= 8 && commonWordCount * 2 >= nextWords.count {
+            return WindowMergeResult(
+                merged: base,
+                strategy: "defer_high_overlap_append",
+                alignmentStart: nil,
+                matchLength: commonWordCount
+            )
+        }
+
+        return result
+    }
+
+    static func tokenizeStreamingText(_ text: String) -> [String] {
+        text
+            .split(whereSeparator: \.isWhitespace)
+            .map(String.init)
+    }
+}
+
 private extension ParakeetCoreMLTDTTranscriptionModel {
     static func loadModel(at url: URL, configuration: MLModelConfiguration) throws -> MLModel {
         let ext = url.pathExtension.lowercased()
@@ -1240,6 +2388,40 @@ private extension ParakeetCoreMLTDTTranscriptionModel {
     static func makeArray(shape: [Int], dataType: MLMultiArrayDataType) throws -> MLMultiArray {
         let nsShape = shape.map { NSNumber(value: $0) }
         return try MLMultiArray(shape: nsShape, dataType: dataType)
+    }
+
+    static func cloneArray(_ source: MLMultiArray) throws -> MLMultiArray {
+        let out = try makeArray(shape: source.intShape, dataType: source.dataType)
+        try copyArrayContents(source: source, destination: out)
+        return out
+    }
+
+    static func copyArrayContents(source: MLMultiArray, destination: MLMultiArray) throws {
+        guard source.dataType == destination.dataType, source.count == destination.count else {
+            throw ParakeetCoreMLTDTError.invalidModelIO("MultiArray copy shape/dtype mismatch.")
+        }
+        let bytesPerElement: Int
+        switch source.dataType {
+        case .float16:
+            bytesPerElement = MemoryLayout<UInt16>.stride
+        case .float32:
+            bytesPerElement = MemoryLayout<Float>.stride
+        case .double:
+            bytesPerElement = MemoryLayout<Double>.stride
+        case .int32:
+            bytesPerElement = MemoryLayout<Int32>.stride
+        case .int8:
+            bytesPerElement = MemoryLayout<Int8>.stride
+        default:
+            bytesPerElement = 0
+        }
+        if bytesPerElement > 0 {
+            memcpy(destination.dataPointer, source.dataPointer, source.count * bytesPerElement)
+            return
+        }
+        for idx in 0..<source.count {
+            destination.setFloatValue(source.floatValue(flatIndex: idx), flatIndex: idx)
+        }
     }
 
     static func fill(array: MLMultiArray, with value: Float) throws {
@@ -1581,6 +2763,19 @@ private extension ParakeetCoreMLTDTTranscriptionModel {
         return bestIndex
     }
 
+    static func topKIndices(_ values: [Float], k: Int) -> [Int] {
+        guard k > 0, !values.isEmpty else { return [] }
+        return values.enumerated()
+            .sorted { lhs, rhs in
+                if lhs.element == rhs.element {
+                    return lhs.offset < rhs.offset
+                }
+                return lhs.element > rhs.element
+            }
+            .prefix(k)
+            .map(\.offset)
+    }
+
     static func logSoftmax(_ values: [Float]) -> [Float] {
         guard !values.isEmpty else { return [] }
         let maxValue = values.max() ?? 0
@@ -1591,6 +2786,75 @@ private extension ParakeetCoreMLTDTTranscriptionModel {
         let logDenom = Foundation.log(expSum)
         return values.map { value in
             Float(Double(value - maxValue) - logDenom)
+        }
+    }
+
+    static func selectDurationIndex(
+        scores: [Float],
+        tokenID: Int,
+        blankID: Int,
+        durations: [Int],
+        blankTieMargin: Float
+    ) -> Int {
+        let bestIndex = argmax(scores)
+        guard tokenID == blankID, blankTieMargin > 0, !scores.isEmpty else {
+            return bestIndex
+        }
+
+        let bestScore = scores[bestIndex]
+        var preferredIndex = bestIndex
+        var preferredDuration = durations.indices.contains(bestIndex) ? durations[bestIndex] : Int.max
+
+        for (index, score) in scores.enumerated() {
+            guard durations.indices.contains(index) else { continue }
+            let durationValue = durations[index]
+            guard durationValue > 0 else { continue }
+            guard bestScore - score <= blankTieMargin else { continue }
+            if preferredDuration <= 0 || durationValue < preferredDuration {
+                preferredIndex = index
+                preferredDuration = durationValue
+            }
+        }
+
+        return preferredIndex
+    }
+
+    static func traceTokenPiece(tokenID: Int, vocab: [String], blankID: Int) -> String {
+        if tokenID == blankID {
+            return "<blank>"
+        }
+        guard tokenID >= 0 && tokenID < vocab.count else {
+            return "<invalid>"
+        }
+        return vocab[tokenID]
+    }
+
+    static func traceTokenTopKEntries(
+        scores: [Float],
+        k: Int,
+        vocab: [String],
+        blankID: Int
+    ) -> [[String: Any]] {
+        topKIndices(scores, k: k).map { index in
+            [
+                "token_id": index,
+                "token_piece": traceTokenPiece(tokenID: index, vocab: vocab, blankID: blankID),
+                "logp": Double(scores[index]),
+            ]
+        }
+    }
+
+    static func traceDurationTopKEntries(
+        scores: [Float],
+        k: Int,
+        durations: [Int]
+    ) -> [[String: Any]] {
+        topKIndices(scores, k: k).map { index in
+            [
+                "duration_idx": index,
+                "duration_value": durations.indices.contains(index) ? durations[index] : 1,
+                "logp": Double(scores[index]),
+            ]
         }
     }
 
@@ -1651,6 +2915,100 @@ private extension ParakeetCoreMLTDTTranscriptionModel {
         return base + next
     }
 
+    static func _mergeWindowHypothesisWithResult(
+        base: [Int],
+        next: [Int],
+        maxSearchWindow: Int = 4096
+    ) -> WindowMergeResult {
+        guard !base.isEmpty else {
+            return WindowMergeResult(merged: next, strategy: "seed_next", alignmentStart: nil, matchLength: 0)
+        }
+        guard !next.isEmpty else {
+            return WindowMergeResult(merged: base, strategy: "keep_base", alignmentStart: nil, matchLength: 0)
+        }
+
+        let searchStart = max(0, base.count - maxSearchWindow)
+        let minRequiredMatch: Int
+        if next.count >= 16 {
+            minRequiredMatch = 4
+        } else if next.count >= 8 {
+            minRequiredMatch = 3
+        } else {
+            minRequiredMatch = 2
+        }
+
+        var bestStart: Int?
+        var bestMatchLength = 0
+        for start in searchStart..<base.count {
+            let limit = min(base.count - start, next.count)
+            guard limit > 0 else { continue }
+            var matchLength = 0
+            while matchLength < limit && base[start + matchLength] == next[matchLength] {
+                matchLength += 1
+            }
+            guard matchLength > 0 else { continue }
+            if matchLength > bestMatchLength ||
+                (matchLength == bestMatchLength && start < (bestStart ?? Int.max)) {
+                bestStart = start
+                bestMatchLength = matchLength
+            }
+        }
+
+        if let bestStart, bestMatchLength >= minRequiredMatch {
+            return WindowMergeResult(
+                merged: Array(base.prefix(bestStart)) + next,
+                strategy: "aligned_replace",
+                alignmentStart: bestStart,
+                matchLength: bestMatchLength
+            )
+        }
+
+        if next.count >= base.count {
+            return WindowMergeResult(
+                merged: next,
+                strategy: "replace_all",
+                alignmentStart: nil,
+                matchLength: 0
+            )
+        }
+        return WindowMergeResult(
+            merged: appendWithOverlap(base: base, next: next),
+            strategy: "append_with_overlap",
+            alignmentStart: nil,
+            matchLength: 0
+        )
+    }
+
+    static func normalizedStreamingMergeWords(from tokenIDs: [Int], vocab: [String]) -> [String] {
+        decodePieces(from: tokenIDs, vocab: vocab)
+            .split(whereSeparator: \.isWhitespace)
+            .map { normalizeStreamingMergeWord(String($0)) }
+            .filter { !$0.isEmpty }
+    }
+
+    static func normalizeStreamingMergeWord(_ word: String) -> String {
+        let scalars = word.lowercased().unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) }
+        return String(String.UnicodeScalarView(scalars))
+    }
+
+    static func suffixPrefixWordOverlap(_ lhs: [String], _ rhs: [String], maxOverlap: Int) -> Int {
+        let limit = min(maxOverlap, min(lhs.count, rhs.count))
+        guard limit > 0 else { return 0 }
+        for candidate in stride(from: limit, through: 1, by: -1) {
+            if Array(lhs.suffix(candidate)) == Array(rhs.prefix(candidate)) {
+                return candidate
+            }
+        }
+        return 0
+    }
+
+    static func sharedNormalizedWordCount(_ lhs: [String], _ rhs: [String]) -> Int {
+        guard !lhs.isEmpty, !rhs.isEmpty else { return 0 }
+        let lhsSet = Set(lhs)
+        let rhsSet = Set(rhs)
+        return lhsSet.intersection(rhsSet).count
+    }
+
     static func containsSubsequence(haystack: [Int], needle: [Int]) -> Bool {
         guard !needle.isEmpty else { return true }
         guard needle.count <= haystack.count else { return false }
@@ -1662,6 +3020,18 @@ private extension ParakeetCoreMLTDTTranscriptionModel {
                 break
             }
             if matched {
+                return true
+            }
+        }
+        return false
+    }
+
+    static func containsSubsequence(haystack: [String], needle: [String]) -> Bool {
+        guard !needle.isEmpty else { return true }
+        guard needle.count <= haystack.count else { return false }
+        let limit = haystack.count - needle.count
+        for i in 0...limit {
+            if Array(haystack[i..<(i + needle.count)]) == needle {
                 return true
             }
         }
@@ -1836,7 +3206,124 @@ private extension MLMultiArray {
     }
 }
 
-private struct MelFeatureExtractor {
+struct StreamingEncoderStepScheduler {
+    private var pendingStepBudget: Double = 0
+
+    var pendingBudget: Double {
+        pendingStepBudget
+    }
+
+    mutating func reset() {
+        pendingStepBudget = 0
+    }
+
+    mutating func consumeStepBudget(
+        newFeatureFrames: Int,
+        encoderSteps: Int,
+        windowFrames: Int,
+        minNewSteps: Int
+    ) -> Int {
+        guard encoderSteps > 0, windowFrames > 0 else {
+            pendingStepBudget = 0
+            return 0
+        }
+
+        let normalizedFeatureFrames = max(0, newFeatureFrames)
+        let stepRatio = Double(encoderSteps) / Double(max(1, windowFrames))
+        pendingStepBudget += Double(normalizedFeatureFrames) * stepRatio
+
+        let wholeSteps = Int(floor(pendingStepBudget + 1e-9))
+        guard wholeSteps > 0 else {
+            return 0
+        }
+
+        let scheduled = max(minNewSteps, wholeSteps)
+        pendingStepBudget = max(0, pendingStepBudget - Double(scheduled))
+        return scheduled
+    }
+}
+
+struct StreamingMelFeatureCache {
+    private let extractor: MelFeatureExtractor
+    private var rawFrames: [[Float]]
+    private var cachedSampleCount: Int
+
+    init(extractor: MelFeatureExtractor) {
+        self.extractor = extractor
+        self.rawFrames = []
+        self.cachedSampleCount = -1
+    }
+
+    mutating func reset() {
+        rawFrames.removeAll(keepingCapacity: true)
+        cachedSampleCount = -1
+    }
+
+    mutating func extract(samples: [Float], droppedSampleCount: Int) -> ([Float], Int) {
+        let targetFrameCount = extractor.frameCount(forSampleCount: samples.count)
+        let previousSampleCount = cachedSampleCount
+        let expectedPreviousFrameCount = previousSampleCount >= 0 ? extractor.frameCount(forSampleCount: previousSampleCount) : 0
+        let canSlideWindow = droppedSampleCount == 0 || droppedSampleCount % extractor.hopLength == 0
+        let droppedFrames = canSlideWindow ? droppedSampleCount / extractor.hopLength : 0
+
+        let needsFullRebuild =
+            rawFrames.isEmpty ||
+            previousSampleCount < 0 ||
+            rawFrames.count != expectedPreviousFrameCount ||
+            !canSlideWindow ||
+            droppedFrames > rawFrames.count
+
+        if needsFullRebuild {
+            rawFrames = extractor.extractRawFrames(samples: samples)
+            cachedSampleCount = samples.count
+            return extractor.normalize(rawFrames: rawFrames)
+        }
+
+        if droppedFrames > 0 {
+            rawFrames.removeFirst(droppedFrames)
+        }
+
+        let preservedFrameCount = rawFrames.count
+        if rawFrames.count > targetFrameCount {
+            rawFrames.removeLast(rawFrames.count - targetFrameCount)
+        } else if rawFrames.count < targetFrameCount {
+            rawFrames.append(
+                contentsOf: Array(
+                    repeating: Array(repeating: 0, count: extractor.melBins),
+                    count: targetFrameCount - rawFrames.count
+                )
+            )
+        }
+
+        if droppedFrames > 0 {
+            recomputeFrames(
+                samples: samples,
+                range: 0..<min(extractor.boundaryRecomputeFrames, targetFrameCount)
+            )
+        }
+        let tailStart = max(0, preservedFrameCount - extractor.boundaryRecomputeFrames)
+        recomputeFrames(samples: samples, range: tailStart..<targetFrameCount)
+
+        cachedSampleCount = samples.count
+        return extractor.normalize(rawFrames: rawFrames)
+    }
+
+    private mutating func recomputeFrames(samples: [Float], range: Range<Int>) {
+        guard !range.isEmpty else { return }
+        var fftBuffer = Array(repeating: Float(0), count: extractor.nFFT)
+        var powerSpectrum = Array(repeating: Float(0), count: extractor.nFFT / 2 + 1)
+        for frameIndex in range {
+            rawFrames[frameIndex] = extractor.rawLogMelFrame(
+                samples: samples,
+                frameIndex: frameIndex,
+                fftBuffer: &fftBuffer,
+                powerSpectrum: &powerSpectrum
+            )
+        }
+    }
+}
+
+struct MelFeatureExtractor {
     let sampleRate: Int
     let nFFT: Int
     let windowLength: Int
@@ -1891,87 +3378,105 @@ private struct MelFeatureExtractor {
     }
 
     func extract(samples: [Float]) -> ([Float], Int) {
-        if samples.isEmpty {
-            return (Array(repeating: 0, count: melBins), 1)
-        }
-        let centerPad = nFFT / 2
-        var padded = Array(repeating: Float(0), count: centerPad + samples.count + centerPad)
-        for i in 0..<samples.count {
-            padded[centerPad + i] = samples[i]
-        }
+        let rawFrames = extractRawFrames(samples: samples)
+        return normalize(rawFrames: rawFrames)
+    }
 
-        let frameCount: Int
-        if padded.count <= nFFT {
-            frameCount = 1
-        } else {
-            frameCount = 1 + ((padded.count - nFFT) / hopLength)
-        }
+    var boundaryRecomputeFrames: Int {
+        max(2, ((nFFT / 2) + hopLength - 1) / hopLength + 2)
+    }
 
-        var logMel = Array(repeating: Float(0), count: melBins * frameCount)
+    func frameCount(forSampleCount sampleCount: Int) -> Int {
+        max(1, 1 + max(0, sampleCount) / hopLength)
+    }
+
+    func extractRawFrames(samples: [Float]) -> [[Float]] {
+        let frameCount = frameCount(forSampleCount: samples.count)
+        var frames = Array(repeating: Array(repeating: Float(0), count: melBins), count: frameCount)
         var fftBuffer = Array(repeating: Float(0), count: nFFT)
         var powerSpectrum = Array(repeating: Float(0), count: spectrumBins)
-        let windowOffset = max(0, (nFFT - windowLength) / 2)
-
         for frameIdx in 0..<frameCount {
-            let start = frameIdx * hopLength
-            for i in 0..<nFFT {
-                fftBuffer[i] = 0
-            }
-            for i in 0..<windowLength {
-                let src = start + i
-                let sample = src < padded.count ? padded[src] : 0
-                let dst = windowOffset + i
-                if dst < nFFT {
-                    fftBuffer[dst] = sample * window[i]
-                }
-            }
-
-            for k in 0..<spectrumBins {
-                var real: Float = 0
-                var imag: Float = 0
-                let cosRow = cosTable[k]
-                let sinRow = sinTable[k]
-                for n in 0..<nFFT {
-                    let x = fftBuffer[n]
-                    real += x * cosRow[n]
-                    imag -= x * sinRow[n]
-                }
-                powerSpectrum[k] = real * real + imag * imag
-            }
-
-            for m in 0..<melBins {
-                var energy: Float = 0
-                let weights = melFilters[m]
-                for k in 0..<spectrumBins {
-                    energy += weights[k] * powerSpectrum[k]
-                }
-                logMel[m * frameCount + frameIdx] = log(max(energy, 1e-6))
-            }
+            frames[frameIdx] = rawLogMelFrame(
+                samples: samples,
+                frameIndex: frameIdx,
+                fftBuffer: &fftBuffer,
+                powerSpectrum: &powerSpectrum
+            )
         }
+        return frames
+    }
 
-        // Per-feature normalization.
+    func normalize(rawFrames: [[Float]]) -> ([Float], Int) {
+        let frameCount = max(1, rawFrames.count)
+        var logMel = Array(repeating: Float(0), count: melBins * frameCount)
+
         for m in 0..<melBins {
-            let base = m * frameCount
             var mean: Float = 0
             for t in 0..<frameCount {
-                mean += logMel[base + t]
+                mean += rawFrames[t][m]
             }
             mean /= Float(frameCount)
 
             var variance: Float = 0
             for t in 0..<frameCount {
-                let d = logMel[base + t] - mean
+                let d = rawFrames[t][m] - mean
                 variance += d * d
             }
             variance /= Float(frameCount)
             let std = sqrt(variance) + 1e-5
 
             for t in 0..<frameCount {
-                logMel[base + t] = (logMel[base + t] - mean) / std
+                logMel[m * frameCount + t] = (rawFrames[t][m] - mean) / std
             }
         }
 
         return (logMel, frameCount)
+    }
+
+    func rawLogMelFrame(
+        samples: [Float],
+        frameIndex: Int,
+        fftBuffer: inout [Float],
+        powerSpectrum: inout [Float]
+    ) -> [Float] {
+        let start = frameIndex * hopLength
+        let centerPad = nFFT / 2
+        let windowOffset = max(0, (nFFT - windowLength) / 2)
+        for i in 0..<nFFT {
+            fftBuffer[i] = 0
+        }
+        for i in 0..<windowLength {
+            let sampleIndex = start + i - centerPad
+            let sample = sampleIndex >= 0 && sampleIndex < samples.count ? samples[sampleIndex] : 0
+            let dst = windowOffset + i
+            if dst < nFFT {
+                fftBuffer[dst] = sample * window[i]
+            }
+        }
+
+        for k in 0..<spectrumBins {
+            var real: Float = 0
+            var imag: Float = 0
+            let cosRow = cosTable[k]
+            let sinRow = sinTable[k]
+            for n in 0..<nFFT {
+                let x = fftBuffer[n]
+                real += x * cosRow[n]
+                imag -= x * sinRow[n]
+            }
+            powerSpectrum[k] = real * real + imag * imag
+        }
+
+        var frame = Array(repeating: Float(0), count: melBins)
+        for m in 0..<melBins {
+            var energy: Float = 0
+            let weights = melFilters[m]
+            for k in 0..<spectrumBins {
+                energy += weights[k] * powerSpectrum[k]
+            }
+            frame[m] = log(max(energy, 1e-6))
+        }
+        return frame
     }
 
     private static func hzToMel(_ hz: Float) -> Float {

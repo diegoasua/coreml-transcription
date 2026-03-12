@@ -6,19 +6,22 @@ public struct StreamingInferenceEvent: Equatable {
     public let isSpeech: Bool
     public let didFlushSegment: Bool
     public let energyDBFS: Float
+    public let rawPartialText: String?
 
     public init(
         transcript: TranscriptState,
         revision: Int = 0,
         isSpeech: Bool,
         didFlushSegment: Bool,
-        energyDBFS: Float
+        energyDBFS: Float,
+        rawPartialText: String? = nil
     ) {
         self.transcript = transcript
         self.revision = revision
         self.isSpeech = isSpeech
         self.didFlushSegment = didFlushSegment
         self.energyDBFS = energyDBFS
+        self.rawPartialText = rawPartialText
     }
 }
 
@@ -95,7 +98,8 @@ public struct StreamingInferenceEngine<Model: TranscriptionModel, VAD: VoiceActi
                         revision: textController.revision,
                         isSpeech: decision.isSpeech,
                         didFlushSegment: false,
-                        energyDBFS: decision.energyDBFS
+                        energyDBFS: decision.energyDBFS,
+                        rawPartialText: partial
                     )
                 )
             }
@@ -177,6 +181,17 @@ public struct StreamingInferenceEngine<Model: TranscriptionModel, VAD: VoiceActi
 
     public mutating func finishStream() -> TranscriptState {
         let final = textController.endSegment()
+        resetRuntimeState()
+        return final
+    }
+
+    public mutating func discardStream(preserveHypothesis: Bool = false) -> TranscriptState {
+        let snapshot = textController.discardCurrentSegment(preserveHypothesis: preserveHypothesis)
+        resetRuntimeState()
+        return snapshot
+    }
+
+    private mutating func resetRuntimeState() {
         model.resetState()
         vad.reset()
         ringBuffer = AudioRingBuffer(capacity: ringBufferCapacity)
@@ -184,6 +199,5 @@ public struct StreamingInferenceEngine<Model: TranscriptionModel, VAD: VoiceActi
         speechChunkRunCount = 0
         stagnantSpeechChunkCount = 0
         lastSpeechFingerprint = ""
-        return final
     }
 }

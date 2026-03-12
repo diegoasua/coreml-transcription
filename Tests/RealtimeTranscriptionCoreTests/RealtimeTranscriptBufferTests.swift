@@ -42,4 +42,24 @@ final class RealtimeTranscriptBufferTests: XCTestCase {
         let second = buffer.finalizeSegment(finalSegmentWords: ["so", "i", "have", "created", "here"])
         XCTAssertEqual(second.confirmedText, "so i have created here")
     }
+
+    func testDiscardCurrentSegmentKeepsStableConfirmedPrefix() {
+        var buffer = RealtimeTranscriptBuffer()
+        _ = buffer.update(confirmedSegmentWords: ["so", "i", "have"], hypothesisWords: ["created"])
+
+        let snapshot = buffer.discardCurrentSegment()
+        XCTAssertEqual(snapshot.confirmedText, "so i have")
+        XCTAssertEqual(snapshot.hypothesisText, "")
+    }
+
+    func testDiscardCurrentSegmentPreserveKeepsStableConfirmedPrefixAndTail() {
+        var buffer = RealtimeTranscriptBuffer()
+        _ = buffer.update(confirmedSegmentWords: ["so", "i", "have"], hypothesisWords: ["created", "here"])
+
+        let snapshot = buffer.discardCurrentSegment(
+            preservingMergedWords: ["so", "i", "have", "created", "here"]
+        )
+        XCTAssertEqual(snapshot.confirmedText, "so i have")
+        XCTAssertEqual(snapshot.hypothesisText, "created here")
+    }
 }

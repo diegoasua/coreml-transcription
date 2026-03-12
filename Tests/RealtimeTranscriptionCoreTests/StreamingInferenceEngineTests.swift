@@ -152,6 +152,57 @@ final class StreamingInferenceEngineTests: XCTestCase {
         XCTAssertEqual(events[5].transcript.confirmed, "hello world how are")
         XCTAssertEqual(events[5].transcript.hypothesis, "")
     }
+
+    func testDiscardStreamDropsInFlightSegmentButKeepsCommittedTranscript() throws {
+        let model = NonResettingMockModel(outputs: ["hello", "hello world", "how"])
+        let vad = MockVAD(decisions: [true, true, false, true], energyDBFS: -20)
+        var engine = StreamingInferenceEngine(
+            model: model,
+            vad: vad,
+            policy: .init(sampleRate: 1000, chunkMs: 100, hopMs: 100),
+            requiredAgreementCount: 2,
+            decodeOnlyWhenSpeech: true,
+            flushOnSpeechEnd: true,
+            ringBufferCapacity: 800
+        )
+
+        let firstSegmentEvents = try engine.process(samples: Array(repeating: Float(0.1), count: 300))
+        XCTAssertEqual(firstSegmentEvents.last?.transcript.confirmed, "hello world")
+
+        let secondSegmentEvents = try engine.process(samples: Array(repeating: Float(0.1), count: 100))
+        XCTAssertEqual(secondSegmentEvents.count, 1)
+        XCTAssertEqual(secondSegmentEvents[0].transcript.confirmed, "hello world")
+        XCTAssertEqual(secondSegmentEvents[0].transcript.hypothesis, "how")
+
+        let snapshot = engine.discardStream()
+        XCTAssertEqual(snapshot.confirmed, "hello world")
+        XCTAssertEqual(snapshot.hypothesis, "")
+    }
+
+    func testDiscardStreamPreserveCarriesMatchingHypothesisAcrossReset() throws {
+        let model = NonResettingMockModel(outputs: ["so i have", "so i have created", "so i have created"])
+        let vad = MockVAD(decisions: [true, true, true], energyDBFS: -20)
+        var engine = StreamingInferenceEngine(
+            model: model,
+            vad: vad,
+            policy: .init(sampleRate: 1000, chunkMs: 100, hopMs: 100),
+            requiredAgreementCount: 2,
+            decodeOnlyWhenSpeech: true,
+            flushOnSpeechEnd: false,
+            ringBufferCapacity: 500
+        )
+
+        let firstEvents = try engine.process(samples: Array(repeating: Float(0.1), count: 100))
+        XCTAssertEqual(firstEvents.last?.transcript.hypothesis, "so i have")
+
+        let snapshot = engine.discardStream(preserveHypothesis: true)
+        XCTAssertEqual(snapshot.confirmed, "")
+        XCTAssertEqual(snapshot.hypothesis, "so i have")
+
+        let resumedEvents = try engine.process(samples: Array(repeating: Float(0.1), count: 200))
+        XCTAssertEqual(resumedEvents.first?.transcript.confirmed, "so i have")
+        XCTAssertEqual(resumedEvents.first?.transcript.hypothesis, "created")
+    }
 }
 
 private struct MockModel: TranscriptionModel {

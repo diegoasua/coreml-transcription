@@ -215,6 +215,9 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
         (MicTranscriptionViewModel.streamModeDefault == "rewrite-prefix" ? 500 : 160)
     private let hopMs = Int(ProcessInfo.processInfo.environment["PARAKEET_STREAM_HOP_MS"] ?? "") ??
         (MicTranscriptionViewModel.streamModeDefault == "rewrite-prefix" ? 250 : 80)
+    private var processingHopSamples: Int {
+        max(1, Int(round(Double(hopMs) * 16_000.0 / 1000.0)))
+    }
     private let agreementCount = Int(ProcessInfo.processInfo.environment["PARAKEET_STREAM_AGREEMENT"] ?? "") ?? 2
     private let draftAgreementCount = Int(ProcessInfo.processInfo.environment["PARAKEET_STREAM_DRAFT_AGREEMENT"] ?? "") ?? 1
     private let decodeOnlyWhenSpeech = (ProcessInfo.processInfo.environment["PARAKEET_DECODE_ONLY_WHEN_SPEECH"] ?? "0") != "0"
@@ -269,6 +272,30 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
         }
         return Int(0.4 * 16_000.0)
     }()
+    private let latestResyncContextSamples: Int = {
+        let env = ProcessInfo.processInfo.environment
+        if let raw = env["PARAKEET_STREAM_LATEST_RESYNC_CONTEXT_SEC"], let sec = Double(raw), sec > 0 {
+            return max(1, Int(sec * 16_000.0))
+        }
+        if MicTranscriptionViewModel.streamModeDefault == "rewrite-prefix" {
+            return Int(0.75 * 16_000.0)
+        }
+        return Int(0.48 * 16_000.0)
+    }()
+    private let latestOnsetProtectSec: Double = {
+        let env = ProcessInfo.processInfo.environment
+        if let raw = env["PARAKEET_STREAM_ONSET_PROTECT_SEC"], let sec = Double(raw), sec >= 0 {
+            return sec
+        }
+        return 0.8
+    }()
+    private let latestOnsetMinConfirmedWords: Int = {
+        let env = ProcessInfo.processInfo.environment
+        if let raw = env["PARAKEET_STREAM_ONSET_MIN_CONFIRMED_WORDS"], let words = Int(raw), words > 0 {
+            return words
+        }
+        return 2
+    }()
     private var resyncAfterDrop = false
     private let maxProcessingBatchSamples: Int = {
         let env = ProcessInfo.processInfo.environment
@@ -285,6 +312,7 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
     private var totalInferenceSec: Double = 0
     private var runStartedAtSec: Double = 0
     private var currentSpeechStartedAtSec: Double?
+    private var currentSpeechStartedAtAudioSec: Double?
     private var currentSpeechBaselineDraft: String = ""
     private var currentSpeechBaselineConfirmed: String = ""
     private var currentSpeechDraftLatencyMs: Double?
@@ -430,6 +458,7 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
         stopModelLoadTicker()
         runStartedAtSec = 0
         currentSpeechStartedAtSec = nil
+        currentSpeechStartedAtAudioSec = nil
         currentSpeechBaselineDraft = ""
         currentSpeechBaselineConfirmed = ""
         currentSpeechDraftLatencyMs = nil
@@ -464,6 +493,7 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
         stopModelLoadTicker()
         runStartedAtSec = 0
         currentSpeechStartedAtSec = nil
+        currentSpeechStartedAtAudioSec = nil
         currentSpeechBaselineDraft = ""
         currentSpeechBaselineConfirmed = ""
         currentSpeechDraftLatencyMs = nil
@@ -703,9 +733,13 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
             pendingSamples.removeFirst(droppedCount)
             resyncAfterDrop = true
         }
-        if backlogSoftLimitSamples > 0,
+        if !latestFirstScheduling,
+           backlogSoftLimitSamples > 0,
            pendingSamples.count > backlogSoftLimitSamples {
-            let target = max(backlogTargetSamples, maxProcessingBatchSamples)
+            var target = max(backlogTargetSamples, maxProcessingBatchSamples)
+            if latestFirstScheduling {
+                target = max(target, latestResyncContextSamples)
+            }
             if pendingSamples.count > target {
                 let extraDrop = pendingSamples.count - target
                 droppedCount += extraDrop
@@ -753,6 +787,7 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
             let queuedAfterPopSec: Double
             let shouldResyncBeforeBatch: Bool
             var droppedForRealtime = 0
+            let protectLatestFirstOnset = shouldProtectLatestFirstOnset()
             pendingLock.lock()
             if pendingSamples.isEmpty {
                 processingScheduled = false
@@ -760,9 +795,19 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
                 return
             }
             if maxProcessingBatchSamples > 0, pendingSamples.count > maxProcessingBatchSamples {
-                if latestFirstScheduling {
-                    // Realtime mode: decode the most recent audio and drop stale backlog.
-                    batch = Array(pendingSamples.suffix(maxProcessingBatchSamples))
+                if latestFirstScheduling && !protectLatestFirstOnset {
+                    // Realtime mode: when stale audio is dropped, restart from a
+                    // bounded contiguous tail instead of concatenating sparse hops.
+                    let batchSampleCount: Int
+                    if pendingSamples.count > maxProcessingBatchSamples {
+                        batchSampleCount = min(
+                            pendingSamples.count,
+                            max(maxProcessingBatchSamples, latestResyncContextSamples)
+                        )
+                    } else {
+                        batchSampleCount = pendingSamples.count
+                    }
+                    batch = Array(pendingSamples.suffix(batchSampleCount))
                     droppedForRealtime = pendingSamples.count - batch.count
                     pendingSamples.removeAll(keepingCapacity: true)
                     if droppedForRealtime > 0 {
@@ -791,21 +836,22 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
 
             guard var engine = inferenceEngine else { return }
             if shouldResyncBeforeBatch {
-                let flushed = engine.finishStream()
-                let flushedConfirmed = flushed.confirmed
-                let flushedHypothesis = flushed.hypothesis
+                let snapshot = engine.discardStream(preserveHypothesis: latestFirstScheduling)
+                let confirmed = snapshot.confirmed
+                let hypothesis = snapshot.hypothesis
                 inferenceEngine = engine
                 currentSpeechStartedAtSec = nil
+                currentSpeechStartedAtAudioSec = nil
                 currentSpeechBaselineDraft = ""
                 currentSpeechBaselineConfirmed = ""
                 currentSpeechDraftLatencyMs = nil
                 currentSpeechConfirmedLatencyMs = nil
                 previousEventWasSpeech = false
-                lastObservedConfirmedText = flushedConfirmed
-                lastObservedHypothesisText = flushedHypothesis
+                lastObservedConfirmedText = confirmed
+                lastObservedHypothesisText = hypothesis
                 DispatchQueue.main.async {
-                    self.confirmedText = flushedConfirmed
-                    self.hypothesisText = flushedHypothesis
+                    self.confirmedText = confirmed
+                    self.hypothesisText = hypothesis
                 }
             }
             let started = CFAbsoluteTimeGetCurrent()
@@ -830,9 +876,11 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
                         // batch processing window to avoid zero-latency artifacts.
                         let progress = Double(eventIndex + 1) / Double(eventCount)
                         let eventWallTime = started + elapsed * progress
+                        let eventAudioCursorSec = totalProcessedAudioSec - batchAudioSec + batchAudioSec * progress
 
                         if event.isSpeech, !previousEventWasSpeech {
                             currentSpeechStartedAtSec = eventWallTime
+                            currentSpeechStartedAtAudioSec = eventAudioCursorSec
                             currentSpeechBaselineDraft = lastObservedHypothesisText
                             currentSpeechBaselineConfirmed = lastObservedConfirmedText
                             currentSpeechDraftLatencyMs = nil
@@ -875,6 +923,7 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
                                 }
                             }
                             currentSpeechStartedAtSec = nil
+                            currentSpeechStartedAtAudioSec = nil
                             currentSpeechBaselineDraft = ""
                             currentSpeechBaselineConfirmed = ""
                             currentSpeechDraftLatencyMs = nil
@@ -979,6 +1028,16 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
             return String(format: "%.0fms", current)
         }
         return "n/a"
+    }
+
+    private func shouldProtectLatestFirstOnset() -> Bool {
+        StreamingSchedulerSupport.shouldProtectLatestFirstOnset(
+            elapsedSec: currentSpeechStartedAtAudioSec.map { max(0.0, totalProcessedAudioSec - $0) },
+            currentConfirmed: lastObservedConfirmedText,
+            baselineConfirmed: currentSpeechBaselineConfirmed,
+            minConfirmedWords: latestOnsetMinConfirmedWords,
+            maxOnsetSec: latestOnsetProtectSec
+        )
     }
 
     private func startModelLoadTicker() {

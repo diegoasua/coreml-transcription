@@ -8,6 +8,8 @@ struct CLIArgs {
     var audioPath: String?
     var modelDir: String?
     var modelSuffix: String = ProcessInfo.processInfo.environment["PARAKEET_COREML_MODEL_SUFFIX"] ?? "odmbp-approx"
+    var encoderModelSuffix: String? = ProcessInfo.processInfo.environment["PARAKEET_COREML_ENCODER_SUFFIX"]
+    var decoderModelSuffix: String? = ProcessInfo.processInfo.environment["PARAKEET_COREML_DECODER_SUFFIX"]
     var chunkSec: Double = Double(ProcessInfo.processInfo.environment["PARAKEET_CLI_CHUNK_SEC"] ?? "") ?? 3.0
     var longformSegmentSec: Double = Double(ProcessInfo.processInfo.environment["PARAKEET_LONGFORM_SEGMENT_SEC"] ?? "") ?? 0.0
     var longformOverlapSec: Double = Double(ProcessInfo.processInfo.environment["PARAKEET_LONGFORM_OVERLAP_SEC"] ?? "") ?? 0.0
@@ -37,6 +39,7 @@ struct CLIArgs {
     var firstTokenPassMs: Double = Double(ProcessInfo.processInfo.environment["PARAKEET_BENCH_FIRST_TOKEN_PASS_MS"] ?? "") ?? 300
     var confirmedPassMs: Double = Double(ProcessInfo.processInfo.environment["PARAKEET_BENCH_CONFIRMED_PASS_MS"] ?? "") ?? 1700
     var metricsOutputPath: String?
+    var traceOutputPath: String? = ProcessInfo.processInfo.environment["PARAKEET_STREAM_TRACE_PATH"]
 }
 
 func parseArgs() -> CLIArgs {
@@ -58,6 +61,16 @@ func parseArgs() -> CLIArgs {
         case "--suffix":
             if i + 1 < argv.count {
                 args.modelSuffix = argv[i + 1]
+                i += 1
+            }
+        case "--encoder-suffix":
+            if i + 1 < argv.count {
+                args.encoderModelSuffix = argv[i + 1]
+                i += 1
+            }
+        case "--decoder-suffix":
+            if i + 1 < argv.count {
+                args.decoderModelSuffix = argv[i + 1]
                 i += 1
             }
         case "--chunk-sec":
@@ -163,6 +176,11 @@ func parseArgs() -> CLIArgs {
                 args.metricsOutputPath = argv[i + 1]
                 i += 1
             }
+        case "--trace-output":
+            if i + 1 < argv.count {
+                args.traceOutputPath = argv[i + 1]
+                i += 1
+            }
         default:
             break
         }
@@ -207,6 +225,40 @@ private final class ConversionInputState: @unchecked Sendable {
 func logProgress(_ message: String) {
     fputs("[transcribe-cli] \(message)\n", stderr)
     fflush(stderr)
+}
+
+private final class JSONLTraceWriter {
+    private let fileHandle: FileHandle
+
+    init?(path: String) {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let url = URL(fileURLWithPath: trimmed)
+        do {
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if FileManager.default.fileExists(atPath: url.path) {
+                try FileManager.default.removeItem(at: url)
+            }
+            FileManager.default.createFile(atPath: url.path, contents: nil)
+            self.fileHandle = try FileHandle(forWritingTo: url)
+        } catch {
+            return nil
+        }
+    }
+
+    deinit {
+        try? fileHandle.close()
+    }
+
+    func write(_ object: [String: Any]) {
+        guard JSONSerialization.isValidJSONObject(object),
+              let data = try? JSONSerialization.data(withJSONObject: object, options: []) else {
+            return
+        }
+        var line = data
+        line.append(0x0A)
+        try? fileHandle.write(contentsOf: line)
+    }
 }
 
 func defaultModelDirectory() -> URL {
@@ -389,10 +441,28 @@ func runRealtimeBenchmark(
     let chunkSamples = max(1, sampleRate * max(20, args.streamChunkMs) / 1000)
     let hopSamples = max(1, min(chunkSamples, sampleRate * max(10, args.streamHopMs) / 1000))
     let maxBatchSamples = max(hopSamples, sampleRate * max(10, args.maxBatchMs) / 1000)
+    let maxBatchChunks = max(1, Int(ceil(Double(maxBatchSamples) / Double(hopSamples))))
     let reportEverySec = Double(max(50, args.reportEveryMs)) / 1000.0
     let totalAudioSec = Double(samples.count) / Double(sampleRate)
     let backlogSoftSamples = max(hopSamples, Int(args.backlogSoftSec * Double(sampleRate)))
     let backlogTargetSamples = max(hopSamples, Int(args.backlogTargetSec * Double(sampleRate)))
+    let latestResyncContextSec = max(
+        0.0,
+        Double(ProcessInfo.processInfo.environment["PARAKEET_STREAM_LATEST_RESYNC_CONTEXT_SEC"] ?? "") ?? 0.48
+    )
+    let latestResyncContextSamples = max(
+        maxBatchSamples,
+        Int(round(latestResyncContextSec * Double(sampleRate)))
+    )
+    let latestResyncContextChunks = max(1, Int(ceil(Double(latestResyncContextSamples) / Double(hopSamples))))
+    let latestOnsetProtectSec = max(
+        0.0,
+        Double(ProcessInfo.processInfo.environment["PARAKEET_STREAM_ONSET_PROTECT_SEC"] ?? "") ?? 0.8
+    )
+    let latestOnsetMinConfirmedWords = max(
+        1,
+        Int(ProcessInfo.processInfo.environment["PARAKEET_STREAM_ONSET_MIN_CONFIRMED_WORDS"] ?? "") ?? 2
+    )
     let debugText = (ProcessInfo.processInfo.environment["PARAKEET_BENCH_DEBUG_TEXT"] ?? "0") == "1"
     let benchVADStart = Float(ProcessInfo.processInfo.environment["PARAKEET_VAD_START_DBFS"] ?? "") ?? -50
     let benchVADEnd = Float(ProcessInfo.processInfo.environment["PARAKEET_VAD_END_DBFS"] ?? "") ?? -58
@@ -400,6 +470,7 @@ func runRealtimeBenchmark(
     let benchVADMinSilence = Int(ProcessInfo.processInfo.environment["PARAKEET_VAD_MIN_SILENCE_MS"] ?? "") ?? 400
     let benchDecodeOnlyWhenSpeech = (ProcessInfo.processInfo.environment["PARAKEET_DECODE_ONLY_WHEN_SPEECH"] ?? "0") != "0"
     let benchFlushOnSpeechEnd = (ProcessInfo.processInfo.environment["PARAKEET_STREAM_FLUSH_ON_SPEECH_END"] ?? "0") != "0"
+    let traceWriter = args.traceOutputPath.flatMap(JSONLTraceWriter.init(path:))
 
     var chunks: [[Float]] = []
     chunks.reserveCapacity(max(1, Int(ceil(Double(samples.count) / Double(hopSamples)))))
@@ -455,6 +526,8 @@ func runRealtimeBenchmark(
     var lastHypothesis = ""
     var lastMerged = ""
     var transcriptCursorSec = 0.0
+    var traceBatchIndex = 0
+    var processedAudioCursorSec = 0.0
 
     let startWall = CFAbsoluteTimeGetCurrent()
     while arrivalIndex < totalChunks || !queue.isEmpty {
@@ -475,10 +548,23 @@ func runRealtimeBenchmark(
             continue
         }
 
+        let protectLatestFirstOnset = StreamingSchedulerSupport.shouldProtectLatestFirstOnset(
+            elapsedSec: speechStartAudioSec.map { max(0.0, processedAudioCursorSec - $0) },
+            currentConfirmed: lastConfirmed,
+            baselineConfirmed: speechBaselineConfirmed,
+            minConfirmedWords: latestOnsetMinConfirmedWords,
+            maxOnsetSec: latestOnsetProtectSec
+        )
+
         // Low-latency policy: drop stale queue beyond configured budget.
+        var shouldResyncBeforeBatch = false
+        var preserveHypothesisOnResync = false
         let queueSamples = queue.count * hopSamples
-        if queueSamples > backlogSoftSamples && queue.count > 1 {
-            let targetChunkCount = max(1, backlogTargetSamples / hopSamples)
+        if !protectLatestFirstOnset && queueSamples > backlogSoftSamples && queue.count > 1 {
+            var targetChunkCount = max(1, Int(ceil(Double(backlogTargetSamples) / Double(hopSamples))))
+            if args.latestFirst {
+                targetChunkCount = max(targetChunkCount, latestResyncContextChunks)
+            }
             if queue.count > targetChunkCount {
                 let keep: [Int]
                 if args.latestFirst {
@@ -488,36 +574,24 @@ func runRealtimeBenchmark(
                 }
                 droppedChunks += max(0, queue.count - keep.count)
                 queue = keep
-                _ = engine.finishStream()
-                prevIsSpeech = false
-                speechStartAudioSec = nil
-                speechBaselineDraft = ""
-                speechBaselineMerged = ""
-                speechBaselineConfirmed = ""
-                speechDraftFirstTokenRecorded = false
-                speechMergedFirstTokenRecorded = false
-                speechConfirmedRecorded = false
+                shouldResyncBeforeBatch = true
+                preserveHypothesisOnResync = args.latestFirst
             }
         }
 
         let batchIndexes: [Int]
-        let maxBatchChunks = max(1, maxBatchSamples / hopSamples)
-        if args.latestFirst {
+        if args.latestFirst && !protectLatestFirstOnset {
             let keepCount = min(maxBatchChunks, queue.count)
-            let dropped = max(0, queue.count - keepCount)
+            let batchChunkCount = queue.count > keepCount
+                ? min(queue.count, max(keepCount, latestResyncContextChunks))
+                : keepCount
+            let dropped = max(0, queue.count - batchChunkCount)
             if dropped > 0 {
                 droppedChunks += dropped
-                _ = engine.finishStream()
-                prevIsSpeech = false
-                speechStartAudioSec = nil
-                speechBaselineDraft = ""
-                speechBaselineMerged = ""
-                speechBaselineConfirmed = ""
-                speechDraftFirstTokenRecorded = false
-                speechMergedFirstTokenRecorded = false
-                speechConfirmedRecorded = false
+                shouldResyncBeforeBatch = true
+                preserveHypothesisOnResync = args.latestFirst
             }
-            batchIndexes = Array(queue.suffix(keepCount))
+            batchIndexes = Array(queue.suffix(batchChunkCount))
             queue.removeAll(keepingCapacity: true)
         } else {
             batchIndexes = Array(queue.prefix(maxBatchChunks))
@@ -530,15 +604,29 @@ func runRealtimeBenchmark(
             batch.append(contentsOf: chunks[idx])
         }
 
+        if shouldResyncBeforeBatch {
+            _ = engine.discardStream(preserveHypothesis: preserveHypothesisOnResync)
+            prevIsSpeech = false
+            speechStartAudioSec = nil
+            speechBaselineDraft = ""
+            speechBaselineMerged = ""
+            speechBaselineConfirmed = ""
+            speechDraftFirstTokenRecorded = false
+            speechMergedFirstTokenRecorded = false
+            speechConfirmedRecorded = false
+        }
+
         let before = CFAbsoluteTimeGetCurrent()
         let events = try engine.process(samples: batch)
         let elapsed = CFAbsoluteTimeGetCurrent() - before
         totalInferSec += elapsed
         currentTimeSec += elapsed
         processedChunks += batchIndexes.count
+        traceBatchIndex += 1
 
         let latestChunk = batchIndexes.last ?? 0
         let latestAudioCursorSec = min(totalAudioSec, Double(latestChunk + 1) * hopSec)
+        processedAudioCursorSec = latestAudioCursorSec
 
         if let event = events.last {
             let preEventConfirmed = lastConfirmed
@@ -606,6 +694,47 @@ func runRealtimeBenchmark(
 
         let queueSec = Double(queue.count * hopSamples) / Double(sampleRate)
         maxQueueSecObserved = max(maxQueueSecObserved, queueSec)
+        if let traceWriter {
+            var traceObject: [String: Any] = [
+                "kind": "realtime_batch",
+                "trace_batch_index": traceBatchIndex,
+                "arrival_index": arrivalIndex,
+                "batch_chunk_count": batchIndexes.count,
+                "batch_first_chunk": batchIndexes.first ?? -1,
+                "batch_last_chunk": latestChunk,
+                "latest_audio_cursor_sec": latestAudioCursorSec,
+                "current_time_sec": currentTimeSec,
+                "infer_elapsed_sec": elapsed,
+                "queue_sec": queueSec,
+                "queue_chunk_count": queue.count,
+                "dropped_chunks_total": droppedChunks,
+                "resync_before_batch": shouldResyncBeforeBatch,
+                "events_count": events.count,
+                "transcript_cursor_sec": transcriptCursorSec,
+                "finalized_confirmed_len": lastConfirmed.count,
+                "finalized_hypothesis_len": lastHypothesis.count,
+                "merged_preview": String(lastMerged.prefix(120)),
+            ]
+            if let event = events.last {
+                traceObject["event_is_speech"] = event.isSpeech
+                traceObject["event_did_flush_segment"] = event.didFlushSegment
+                traceObject["event_energy_dbfs"] = event.energyDBFS
+                traceObject["event_revision"] = event.revision
+                traceObject["event_raw_partial_preview"] = String((event.rawPartialText ?? "").prefix(160))
+                traceObject["event_raw_partial_len"] = event.rawPartialText?.count ?? 0
+            } else {
+                traceObject["event_is_speech"] = NSNull()
+                traceObject["event_did_flush_segment"] = NSNull()
+                traceObject["event_energy_dbfs"] = NSNull()
+                traceObject["event_revision"] = NSNull()
+                traceObject["event_raw_partial_preview"] = ""
+                traceObject["event_raw_partial_len"] = 0
+            }
+            if let diagnostic = model.lastStreamingDiagnostic {
+                traceObject["model"] = diagnostic.jsonObject
+            }
+            traceWriter.write(traceObject)
+        }
         if currentTimeSec >= nextReportSec {
             let ingestedAudioSec = min(totalAudioSec, Double(arrivalIndex) * hopSec)
             let inferRTFx = ingestedAudioSec / max(totalInferSec, 1e-9)
@@ -633,7 +762,15 @@ func runRealtimeBenchmark(
         }
     }
 
-    let finalState = engine.finishStream()
+    let rawFinalState = engine.finishStream()
+    let finalState: TranscriptState
+    if rawFinalState.confirmed.isEmpty,
+       rawFinalState.hypothesis.isEmpty,
+       (!lastConfirmed.isEmpty || !lastHypothesis.isEmpty) {
+        finalState = TranscriptState(confirmed: lastConfirmed, hypothesis: lastHypothesis)
+    } else {
+        finalState = rawFinalState
+    }
     if let pendingStart = speechStartAudioSec {
         let anyText = !finalState.confirmed.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
             !finalState.hypothesis.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -729,10 +866,16 @@ func runAudioTranscription(args: CLIArgs) throws {
     let modelDir = args.modelDir.map { URL(fileURLWithPath: $0) } ?? defaultModelDirectory()
     let startTime = Date()
 
-    logProgress("loading models from \(modelDir.path) (suffix=\(args.modelSuffix))")
+    let resolvedEncoderSuffix = args.encoderModelSuffix ?? args.modelSuffix
+    let resolvedDecoderSuffix = args.decoderModelSuffix ?? args.modelSuffix
+    logProgress(
+        "loading models from \(modelDir.path) (encoder_suffix=\(resolvedEncoderSuffix), decoder_suffix=\(resolvedDecoderSuffix))"
+    )
     let model = try ParakeetCoreMLTDTTranscriptionModel(
         modelDirectory: modelDir,
         modelSuffix: args.modelSuffix,
+        encoderModelSuffix: args.encoderModelSuffix,
+        decoderModelSuffix: args.decoderModelSuffix,
         config: .init(
             maxSymbolsPerStep: args.maxSymbolsPerStep,
             maxTokensPerChunk: args.maxTokensPerChunk,

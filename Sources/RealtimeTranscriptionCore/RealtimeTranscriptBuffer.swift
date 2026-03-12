@@ -86,6 +86,21 @@ public struct RealtimeTranscriptBuffer {
         return snapshot()
     }
 
+    public mutating func discardCurrentSegment() -> TranscriptBufferSnapshot {
+        let confirmedWords = committed.map(\.text)
+        persistedCommittedWords = confirmedWords
+        apply(committedWords: confirmedWords, mutableWords: [])
+        return snapshot()
+    }
+
+    public mutating func discardCurrentSegment(preservingMergedWords mergedWords: [String]) -> TranscriptBufferSnapshot {
+        let confirmedWords = committed.map(\.text)
+        persistedCommittedWords = confirmedWords
+        let mutableWords = Self.mutableTail(committedWords: confirmedWords, mergedWords: mergedWords)
+        apply(committedWords: confirmedWords, mutableWords: mutableWords)
+        return snapshot()
+    }
+
     public mutating func reset() {
         committed.removeAll(keepingCapacity: true)
         mutable.removeAll(keepingCapacity: true)
@@ -175,6 +190,36 @@ public struct RealtimeTranscriptBuffer {
         }
 
         return base + segment
+    }
+
+    private static func mutableTail(committedWords: [String], mergedWords: [String]) -> [String] {
+        guard !mergedWords.isEmpty else { return [] }
+        guard !committedWords.isEmpty else { return mergedWords }
+
+        let prefixCount = longestCommonPrefixLength(committedWords, mergedWords)
+        let overlapCount = suffixPrefixOverlap(committedWords, mergedWords, maxOverlap: 64)
+        let dropCount = max(prefixCount, overlapCount)
+        return Array(mergedWords.dropFirst(min(dropCount, mergedWords.count)))
+    }
+
+    private static func longestCommonPrefixLength(_ lhs: [String], _ rhs: [String]) -> Int {
+        let count = min(lhs.count, rhs.count)
+        var idx = 0
+        while idx < count && lhs[idx] == rhs[idx] {
+            idx += 1
+        }
+        return idx
+    }
+
+    private static func suffixPrefixOverlap(_ lhs: [String], _ rhs: [String], maxOverlap: Int) -> Int {
+        let limit = min(maxOverlap, min(lhs.count, rhs.count))
+        guard limit > 0 else { return 0 }
+        for candidate in stride(from: limit, through: 1, by: -1) {
+            if Array(lhs.suffix(candidate)) == Array(rhs.prefix(candidate)) {
+                return candidate
+            }
+        }
+        return 0
     }
 
     private static func containsSubsequence(haystack: [String], needle: [String]) -> Bool {

@@ -29,17 +29,17 @@ final class LocalAgreementTests: XCTestCase {
         XCTAssertEqual(flushed.hypothesis, "")
     }
 
-    func testRetroactiveEditsDoNotRewriteConfirmedPrefix() {
+    func testUnflushedPrefixCanReviseWhenRecentHypothesesChange() {
         var stabilizer = LocalAgreementStabilizer(config: .init(requiredAgreementCount: 2))
 
         _ = stabilizer.push(partial: "alpha beta")
         _ = stabilizer.push(partial: "alpha beta one")
         let afterFirstAgreement = stabilizer.push(partial: "alpha zeta one two")
-        XCTAssertEqual(afterFirstAgreement.confirmed, "alpha beta one")
-        XCTAssertEqual(afterFirstAgreement.hypothesis, "two")
+        XCTAssertEqual(afterFirstAgreement.confirmed, "alpha")
+        XCTAssertEqual(afterFirstAgreement.hypothesis, "zeta one two")
 
         let afterSecondAgreement = stabilizer.push(partial: "alpha zeta one two three")
-        XCTAssertEqual(afterSecondAgreement.confirmed, "alpha beta one two")
+        XCTAssertEqual(afterSecondAgreement.confirmed, "alpha zeta one two")
         XCTAssertEqual(afterSecondAgreement.hypothesis, "three")
     }
 }

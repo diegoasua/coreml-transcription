@@ -285,6 +285,7 @@ class ParakeetCoreMLTDT:
         self._nemo_preprocessor = self._build_nemo_preprocessor()
         self._trace_path = os.environ.get("PARAKEET_PY_DECODER_TRACE_PATH", "").strip()
         self._trace_max_events = max(1, int(os.environ.get("PARAKEET_PY_DECODER_TRACE_MAX_EVENTS", "200000")))
+        self._trace_topk = max(0, int(os.environ.get("PARAKEET_PY_DECODER_TRACE_TOPK", "0")))
         self._trace_events_written = 0
         self._trace_chunk_index = 0
         self._trace_handle = None
@@ -522,6 +523,33 @@ class ParakeetCoreMLTDT:
             order = part[np.argsort(arr[part])[::-1]]
         return [int(idx) for idx in order]
 
+    def _trace_token_piece(self, token_id: int) -> str:
+        if token_id == self.blank_id:
+            return "<blank>"
+        if 0 <= token_id < len(self.vocab):
+            return str(self.vocab[token_id])
+        return "<invalid>"
+
+    def _trace_token_topk(self, token_logp: np.ndarray) -> list[dict[str, Any]]:
+        return [
+            {
+                "token_id": int(idx),
+                "token_piece": self._trace_token_piece(int(idx)),
+                "logp": float(token_logp[idx]),
+            }
+            for idx in self._topk_indices(token_logp, self._trace_topk)
+        ]
+
+    def _trace_duration_topk(self, duration_logp: np.ndarray) -> list[dict[str, Any]]:
+        return [
+            {
+                "duration_idx": int(idx),
+                "duration_value": int(self._duration_from_index(int(idx))),
+                "logp": float(duration_logp[idx]),
+            }
+            for idx in self._topk_indices(duration_logp, self._trace_topk)
+        ]
+
     def _duration_from_index(self, duration_idx: int) -> int:
         if 0 <= duration_idx < len(self.duration_values):
             return int(self.duration_values[duration_idx])
@@ -713,22 +741,26 @@ class ParakeetCoreMLTDT:
                     state2 = next_state2
                     prev_token = token_id
 
-                self._trace_decoder_event(
-                    {
-                        "source": "python",
-                        "kind": "step",
-                        "chunk_index": int(chunk_index),
-                        "step_index": int(step_index),
-                        "encoder_steps": int(enc_steps),
-                        "t": int(t_before),
-                        "token_id": int(token_id),
-                        "duration_idx": int(duration_idx),
-                        "skip": int(skip),
-                        "prev_token": int(prev_before),
-                        "emitted": bool(token_id != self.blank_id),
-                        "commit_state": 1,
-                    }
-                )
+                event = {
+                    "source": "python",
+                    "kind": "step",
+                    "chunk_index": int(chunk_index),
+                    "step_index": int(step_index),
+                    "encoder_steps": int(enc_steps),
+                    "t": int(t_before),
+                    "token_id": int(token_id),
+                    "token_piece": self._trace_token_piece(int(token_id)),
+                    "duration_idx": int(duration_idx),
+                    "duration_value": int(skip),
+                    "skip": int(skip),
+                    "prev_token": int(prev_before),
+                    "emitted": bool(token_id != self.blank_id),
+                    "commit_state": 1,
+                }
+                if self._trace_topk > 0:
+                    event["token_topk"] = self._trace_token_topk(token_logp)
+                    event["duration_topk"] = self._trace_duration_topk(duration_logp)
+                self._trace_decoder_event(event)
                 step_index += 1
 
                 symbols_added += 1
