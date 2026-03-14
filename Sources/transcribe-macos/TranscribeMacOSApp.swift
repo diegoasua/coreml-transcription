@@ -83,15 +83,47 @@ private func parakeetModelDirectoryCandidates() -> [URL] {
     return candidates
 }
 
-private func hasParakeetArtifacts(at directory: URL, suffix: String) -> Bool {
+private func hasParakeetArtifacts(
+    at directory: URL,
+    suffix: String,
+    encoderSuffix: String? = nil,
+    decoderSuffix: String? = nil
+) -> Bool {
     let fm = FileManager.default
-    let encoder = directory.appendingPathComponent("encoder-model-\(suffix).mlpackage").path
-    let decoder = directory.appendingPathComponent("decoder_joint-model-\(suffix).mlpackage").path
+    let resolvedEncoderSuffix = (encoderSuffix?.isEmpty == false) ? encoderSuffix! : suffix
+    let resolvedDecoderSuffix = preferredParakeetDecoderSuffix(
+        at: directory,
+        suffix: suffix,
+        decoderSuffix: decoderSuffix
+    )
+    let encoder = directory.appendingPathComponent("encoder-model-\(resolvedEncoderSuffix).mlpackage").path
+    let decoder = directory.appendingPathComponent("decoder_joint-model-\(resolvedDecoderSuffix).mlpackage").path
     let vocab = directory.appendingPathComponent("vocab.txt").path
     return fm.fileExists(atPath: encoder) && fm.fileExists(atPath: decoder) && fm.fileExists(atPath: vocab)
 }
 
-private func resolveParakeetModelDirectory(preferred: URL?, suffix: String) -> URL? {
+private func preferredParakeetDecoderSuffix(
+    at directory: URL,
+    suffix: String,
+    decoderSuffix: String? = nil
+) -> String {
+    if let decoderSuffix, !decoderSuffix.isEmpty {
+        return decoderSuffix
+    }
+    let preferred = "\(suffix)-stateful-v2"
+    let preferredPath = directory.appendingPathComponent("decoder_joint-model-\(preferred).mlpackage").path
+    if FileManager.default.fileExists(atPath: preferredPath) {
+        return preferred
+    }
+    return suffix
+}
+
+private func resolveParakeetModelDirectory(
+    preferred: URL?,
+    suffix: String,
+    encoderSuffix: String? = nil,
+    decoderSuffix: String? = nil
+) -> URL? {
     let fm = FileManager.default
     var ordered: [URL] = []
     if let preferred {
@@ -104,7 +136,12 @@ private func resolveParakeetModelDirectory(preferred: URL?, suffix: String) -> U
         if seen.contains(normalized) { continue }
         seen.insert(normalized)
         guard fm.fileExists(atPath: normalized) else { continue }
-        if hasParakeetArtifacts(at: URL(fileURLWithPath: normalized), suffix: suffix) {
+        if hasParakeetArtifacts(
+            at: URL(fileURLWithPath: normalized),
+            suffix: suffix,
+            encoderSuffix: encoderSuffix,
+            decoderSuffix: decoderSuffix
+        ) {
             return URL(fileURLWithPath: normalized)
         }
     }
@@ -113,7 +150,14 @@ private func resolveParakeetModelDirectory(preferred: URL?, suffix: String) -> U
 
 private func defaultParakeetModelDirectoryPath() -> String {
     let defaultSuffix = ProcessInfo.processInfo.environment["PARAKEET_COREML_MODEL_SUFFIX"] ?? "odmbp-approx"
-    if let resolved = resolveParakeetModelDirectory(preferred: nil, suffix: defaultSuffix) {
+    let encoderSuffix = ProcessInfo.processInfo.environment["PARAKEET_COREML_ENCODER_SUFFIX"]
+    let decoderSuffix = ProcessInfo.processInfo.environment["PARAKEET_COREML_DECODER_SUFFIX"]
+    if let resolved = resolveParakeetModelDirectory(
+        preferred: nil,
+        suffix: defaultSuffix,
+        encoderSuffix: encoderSuffix,
+        decoderSuffix: decoderSuffix
+    ) {
         return resolved.path
     }
     return parakeetModelDirectoryCandidates().last?.path ?? ""
@@ -195,11 +239,13 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
     @Published var confirmedText: String = ""
     @Published var hypothesisText: String = ""
     @Published var status: String = "Idle"
-    @Published var metrics: String = "RTFx(inf/wall)=0.0/0.0 | draft=n/a | confirmed=n/a"
+    @Published var metrics: String = "RTFx(inf/live)=0.0/0.0 | draft-vis=n/a | conf-vis=n/a"
     @Published var isRunning: Bool = false
     @Published var isStarting: Bool = false
     @Published var modelDirectory: String = defaultParakeetModelDirectoryPath()
     @Published var modelSuffix: String = ProcessInfo.processInfo.environment["PARAKEET_COREML_MODEL_SUFFIX"] ?? "odmbp-approx"
+    private let encoderModelSuffix = ProcessInfo.processInfo.environment["PARAKEET_COREML_ENCODER_SUFFIX"]
+    private let decoderModelSuffix = ProcessInfo.processInfo.environment["PARAKEET_COREML_DECODER_SUFFIX"]
 
     private static let streamModeDefault = (ProcessInfo.processInfo.environment["PARAKEET_STREAM_MODE"] ?? "rewrite-prefix").lowercased()
 
@@ -312,7 +358,6 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
     private var totalProcessedAudioSec: Double = 0
     private var totalInferenceSec: Double = 0
     private var runStartedAtSec: Double = 0
-    private var currentSpeechStartedAtSec: Double?
     private var currentSpeechStartedAtAudioSec: Double?
     private var currentSpeechBaselineDraft: String = ""
     private var currentSpeechBaselineConfirmed: String = ""
@@ -370,10 +415,26 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
         if isRunning || isStarting { return }
 
         let preferredURL = URL(fileURLWithPath: modelDirectory)
-        guard let dirURL = resolveParakeetModelDirectory(preferred: preferredURL, suffix: modelSuffix) else {
-            status = "Model artifacts not found for suffix '\(modelSuffix)'. Expected encoder/decoder/vocab under: \(preferredURL.path)"
+        let resolvedEncoderSuffix = (encoderModelSuffix?.isEmpty == false) ? encoderModelSuffix! : modelSuffix
+        guard let dirURL = resolveParakeetModelDirectory(
+            preferred: preferredURL,
+            suffix: modelSuffix,
+            encoderSuffix: encoderModelSuffix,
+            decoderSuffix: decoderModelSuffix
+        ) else {
+            let resolvedDecoderSuffix = preferredParakeetDecoderSuffix(
+                at: preferredURL,
+                suffix: modelSuffix,
+                decoderSuffix: decoderModelSuffix
+            )
+            status = "Model artifacts not found for encoder '\(resolvedEncoderSuffix)' and decoder '\(resolvedDecoderSuffix)' under: \(preferredURL.path)"
             return
         }
+        let resolvedDecoderSuffix = preferredParakeetDecoderSuffix(
+            at: dirURL,
+            suffix: modelSuffix,
+            decoderSuffix: decoderModelSuffix
+        )
         if modelDirectory != dirURL.path {
             modelDirectory = dirURL.path
         }
@@ -401,6 +462,8 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
                     let model = try ParakeetCoreMLTDTTranscriptionModel(
                         modelDirectory: dirURL,
                         modelSuffix: self.modelSuffix,
+                        encoderModelSuffix: self.encoderModelSuffix,
+                        decoderModelSuffix: resolvedDecoderSuffix,
                         config: .init(
                             maxSymbolsPerStep: self.maxSymbolsPerStep,
                             maxTokensPerChunk: self.maxTokensPerChunk,
@@ -464,7 +527,6 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
         totalInferenceSec = 0
         stopModelLoadTicker()
         runStartedAtSec = 0
-        currentSpeechStartedAtSec = nil
         currentSpeechStartedAtAudioSec = nil
         currentSpeechBaselineDraft = ""
         currentSpeechBaselineConfirmed = ""
@@ -490,7 +552,7 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
                 DispatchQueue.main.async {
                     self.confirmedText = finalConfirmed
                     self.hypothesisText = finalHypothesis
-                    self.metrics = "RTFx(inf/wall)=0.0/0.0 | draft=n/a | confirmed=n/a"
+                    self.metrics = "RTFx(inf/live)=0.0/0.0 | draft-vis=n/a | conf-vis=n/a"
                 }
             }
         }
@@ -504,7 +566,6 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
         totalInferenceSec = 0
         stopModelLoadTicker()
         runStartedAtSec = 0
-        currentSpeechStartedAtSec = nil
         currentSpeechStartedAtAudioSec = nil
         currentSpeechBaselineDraft = ""
         currentSpeechBaselineConfirmed = ""
@@ -609,6 +670,7 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
             isRunning = true
             isStarting = false
             captureStartedAtSec = CFAbsoluteTimeGetCurrent()
+            runStartedAtSec = captureStartedAtSec
 #if DEBUG
             status = "Listening... (DEBUG build; slower) chunk \(chunkMs)ms / hop \(hopMs)ms | mic \(inputDeviceName) | vp \(activeVoiceProcessing ? "on" : "off")"
 #else
@@ -865,7 +927,6 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
                 let confirmed = snapshot.confirmed
                 let hypothesis = snapshot.hypothesis
                 inferenceEngine = engine
-                currentSpeechStartedAtSec = nil
                 currentSpeechStartedAtAudioSec = nil
                 currentSpeechBaselineDraft = ""
                 currentSpeechBaselineConfirmed = ""
@@ -886,27 +947,22 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
                 let events = try engine.process(samples: batch)
                 let elapsed = CFAbsoluteTimeGetCurrent() - started
                 let batchAudioSec = Double(batch.count) / 16_000.0
+                let batchStartAudioSec = totalProcessedAudioSec
+                let batchCompletedAtSec = started + elapsed
                 totalProcessedAudioSec += batchAudioSec
                 totalInferenceSec += elapsed
                 let inferRTFx = totalProcessedAudioSec / max(totalInferenceSec, 1e-6)
                 if runStartedAtSec == 0 {
-                    runStartedAtSec = started
+                    runStartedAtSec = captureStartedAtSec > 0 ? captureStartedAtSec : started
                 }
-                let wallElapsed = max(CFAbsoluteTimeGetCurrent() - runStartedAtSec, 1e-6)
+                let wallElapsed = max(batchCompletedAtSec - runStartedAtSec, 1e-6)
                 let wallRTFx = totalProcessedAudioSec / wallElapsed
                 inferenceEngine = engine
 
                 if let latest = events.last {
-                    let eventCount = max(1, events.count)
-                    for (eventIndex, event) in events.enumerated() {
-                        // Approximate when this event became available within the
-                        // batch processing window to avoid zero-latency artifacts.
-                        let progress = Double(eventIndex + 1) / Double(eventCount)
-                        let eventWallTime = started + elapsed * progress
-                        let eventAudioCursorSec = totalProcessedAudioSec - batchAudioSec + batchAudioSec * progress
-
+                    for event in events {
+                        let eventAudioCursorSec = min(totalProcessedAudioSec, max(batchStartAudioSec, event.audioCursorSec))
                         if event.isSpeech, !previousEventWasSpeech {
-                            currentSpeechStartedAtSec = eventWallTime
                             currentSpeechStartedAtAudioSec = eventAudioCursorSec
                             currentSpeechBaselineDraft = lastObservedHypothesisText
                             currentSpeechBaselineConfirmed = lastObservedConfirmedText
@@ -914,13 +970,17 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
                             currentSpeechConfirmedLatencyMs = nil
                         }
                         if event.isSpeech,
-                           let startedAt = currentSpeechStartedAtSec,
+                           let startedAtAudioSec = currentSpeechStartedAtAudioSec,
                            currentSpeechDraftLatencyMs == nil,
                            event.transcript.hypothesis != currentSpeechBaselineDraft {
-                            var latencyMs = max(0.0, (eventWallTime - startedAt) * 1000.0)
+                            var latencyMs = Self.visibleTextLatencyMs(
+                                captureStartedAtSec: captureStartedAtSec,
+                                observedAtSec: batchCompletedAtSec,
+                                audioCursorSec: startedAtAudioSec
+                            )
                             if latencyMs < 1.0 {
-                                // Same-event speech start + token emission can look
-                                // like 0ms with batch timestamps; use hop as floor.
+                                // Same-hop speech start + token emission can still
+                                // quantize down to 0ms; use hop as a practical floor.
                                 latencyMs = Double(self.hopMs)
                             }
                             currentSpeechDraftLatencyMs = latencyMs
@@ -932,7 +992,7 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
                         if event.transcript.hypothesis != lastObservedHypothesisText {
                             let latencyMs = Self.visibleTextLatencyMs(
                                 captureStartedAtSec: captureStartedAtSec,
-                                eventWallTime: eventWallTime,
+                                observedAtSec: batchCompletedAtSec,
                                 audioCursorSec: eventAudioCursorSec
                             )
                             currentDraftDisplayLatencyMs = latencyMs
@@ -946,10 +1006,14 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
                             }
                         }
                         if event.isSpeech,
-                           let startedAt = currentSpeechStartedAtSec,
+                           let startedAtAudioSec = currentSpeechStartedAtAudioSec,
                            currentSpeechConfirmedLatencyMs == nil,
                            event.transcript.confirmed != currentSpeechBaselineConfirmed {
-                            let latencyMs = max(0.0, (eventWallTime - startedAt) * 1000.0)
+                            let latencyMs = Self.visibleTextLatencyMs(
+                                captureStartedAtSec: captureStartedAtSec,
+                                observedAtSec: batchCompletedAtSec,
+                                audioCursorSec: startedAtAudioSec
+                            )
                             currentSpeechConfirmedLatencyMs = latencyMs
                             confirmedLatencyMsSamples.append(latencyMs)
                             if metricsLogEnabled {
@@ -959,7 +1023,7 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
                         if event.transcript.confirmed != lastObservedConfirmedText {
                             let latencyMs = Self.visibleTextLatencyMs(
                                 captureStartedAtSec: captureStartedAtSec,
-                                eventWallTime: eventWallTime,
+                                observedAtSec: batchCompletedAtSec,
                                 audioCursorSec: eventAudioCursorSec
                             )
                             currentConfirmedDisplayLatencyMs = latencyMs
@@ -972,16 +1036,19 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
                                 fputs(String(format: "[metrics] confirmed-visible-latency=%.1f ms\n", latencyMs), stderr)
                             }
                         }
-                        if event.didFlushSegment, let startedAt = currentSpeechStartedAtSec {
+                        if event.didFlushSegment, let startedAtAudioSec = currentSpeechStartedAtAudioSec {
                             if currentSpeechConfirmedLatencyMs == nil {
-                                let latencyMs = max(0.0, (eventWallTime - startedAt) * 1000.0)
+                                let latencyMs = Self.visibleTextLatencyMs(
+                                    captureStartedAtSec: captureStartedAtSec,
+                                    observedAtSec: batchCompletedAtSec,
+                                    audioCursorSec: startedAtAudioSec
+                                )
                                 currentSpeechConfirmedLatencyMs = latencyMs
                                 confirmedLatencyMsSamples.append(latencyMs)
                                 if metricsLogEnabled {
                                     fputs(String(format: "[metrics] confirmed-latency-flush=%.1f ms\n", latencyMs), stderr)
                                 }
                             }
-                            currentSpeechStartedAtSec = nil
                             currentSpeechStartedAtAudioSec = nil
                             currentSpeechBaselineDraft = ""
                             currentSpeechBaselineConfirmed = ""
@@ -1000,7 +1067,7 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
                     let confirmedAvg = confirmedDisplayLatencyMsSamples.isEmpty ? nil : confirmedDisplayLatencyMsSamples.reduce(0, +) / Double(confirmedDisplayLatencyMsSamples.count)
                     let confirmedP95 = Self.percentile(confirmedDisplayLatencyMsSamples, q: 0.95)
                     let metricsLine = String(
-                        format: "RTFx(inf/wall)=%.1f/%.1f | draft %@ | confirmed %@",
+                        format: "RTFx(inf/live)=%.1f/%.1f | draft-vis %@ | conf-vis %@",
                         inferRTFx,
                         wallRTFx,
                         Self.formatLatency(current: draftCurrent, avg: draftAvg, p95: draftP95),
@@ -1034,7 +1101,7 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
                     let confirmedAvg = confirmedDisplayLatencyMsSamples.isEmpty ? nil : confirmedDisplayLatencyMsSamples.reduce(0, +) / Double(confirmedDisplayLatencyMsSamples.count)
                     let confirmedP95 = Self.percentile(confirmedDisplayLatencyMsSamples, q: 0.95)
                     let metricsLine = String(
-                        format: "RTFx(inf/wall)=%.1f/%.1f | draft %@ | confirmed %@",
+                        format: "RTFx(inf/live)=%.1f/%.1f | draft-vis %@ | conf-vis %@",
                         inferRTFx,
                         wallRTFx,
                         Self.formatLatency(current: nil, avg: draftAvg, p95: draftP95),
@@ -1086,12 +1153,12 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
 
     private static func visibleTextLatencyMs(
         captureStartedAtSec: Double,
-        eventWallTime: Double,
+        observedAtSec: Double,
         audioCursorSec: Double
     ) -> Double {
         guard captureStartedAtSec > 0 else { return 0 }
         let audioCaptureTime = captureStartedAtSec + max(0, audioCursorSec)
-        return max(0, (eventWallTime - audioCaptureTime) * 1000.0)
+        return max(0, (observedAtSec - audioCaptureTime) * 1000.0)
     }
 
     private static func formatLatency(current: Double?, avg: Double?, p95: Double?) -> String {

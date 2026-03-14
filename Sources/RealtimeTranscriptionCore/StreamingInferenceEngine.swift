@@ -3,6 +3,7 @@ import Foundation
 public struct StreamingInferenceEvent: Equatable {
     public let transcript: TranscriptState
     public let revision: Int
+    public let audioCursorSec: Double
     public let isSpeech: Bool
     public let didFlushSegment: Bool
     public let energyDBFS: Float
@@ -11,6 +12,7 @@ public struct StreamingInferenceEvent: Equatable {
     public init(
         transcript: TranscriptState,
         revision: Int = 0,
+        audioCursorSec: Double = 0,
         isSpeech: Bool,
         didFlushSegment: Bool,
         energyDBFS: Float,
@@ -18,6 +20,7 @@ public struct StreamingInferenceEvent: Equatable {
     ) {
         self.transcript = transcript
         self.revision = revision
+        self.audioCursorSec = audioCursorSec
         self.isSpeech = isSpeech
         self.didFlushSegment = didFlushSegment
         self.energyDBFS = energyDBFS
@@ -40,6 +43,7 @@ public struct StreamingInferenceEngine<Model: TranscriptionModel, VAD: VoiceActi
     private var activeSegmentChunkCount: Int
     private var stagnantSpeechChunkCount: Int
     private var lastSpeechFingerprint: String
+    private var processedAudioSec: Double
 
     public init(
         model: Model,
@@ -71,6 +75,7 @@ public struct StreamingInferenceEngine<Model: TranscriptionModel, VAD: VoiceActi
         self.activeSegmentChunkCount = 0
         self.stagnantSpeechChunkCount = 0
         self.lastSpeechFingerprint = ""
+        self.processedAudioSec = 0
     }
 
     public mutating func process(samples: [Float]) throws -> [StreamingInferenceEvent] {
@@ -79,6 +84,7 @@ public struct StreamingInferenceEngine<Model: TranscriptionModel, VAD: VoiceActi
 
         var events: [StreamingInferenceEvent] = []
         while ringBuffer.availableToRead >= policy.chunkSamples {
+            let nextAudioCursorSec = processedAudioSec + Double(policy.hopSamples) / Double(policy.sampleRate)
             let chunk = ringBuffer.peek(count: policy.chunkSamples)
             let decision = vad.process(samples: chunk, sampleRate: policy.sampleRate)
             var decodedState: TranscriptState?
@@ -96,6 +102,7 @@ public struct StreamingInferenceEngine<Model: TranscriptionModel, VAD: VoiceActi
                     StreamingInferenceEvent(
                         transcript: state,
                         revision: textController.revision,
+                        audioCursorSec: nextAudioCursorSec,
                         isSpeech: decision.isSpeech,
                         didFlushSegment: false,
                         energyDBFS: decision.energyDBFS,
@@ -149,6 +156,7 @@ public struct StreamingInferenceEngine<Model: TranscriptionModel, VAD: VoiceActi
                     StreamingInferenceEvent(
                         transcript: state,
                         revision: textController.revision,
+                        audioCursorSec: nextAudioCursorSec,
                         isSpeech: decision.isSpeech,
                         didFlushSegment: true,
                         energyDBFS: decision.energyDBFS
@@ -166,6 +174,7 @@ public struct StreamingInferenceEngine<Model: TranscriptionModel, VAD: VoiceActi
                     StreamingInferenceEvent(
                         transcript: state,
                         revision: textController.revision,
+                        audioCursorSec: nextAudioCursorSec,
                         isSpeech: false,
                         didFlushSegment: true,
                         energyDBFS: decision.energyDBFS
@@ -174,6 +183,7 @@ public struct StreamingInferenceEngine<Model: TranscriptionModel, VAD: VoiceActi
             }
 
             previouslyInSpeech = decision.isSpeech
+            processedAudioSec = nextAudioCursorSec
             _ = ringBuffer.pop(count: policy.hopSamples)
         }
         return events
@@ -199,5 +209,6 @@ public struct StreamingInferenceEngine<Model: TranscriptionModel, VAD: VoiceActi
         activeSegmentChunkCount = 0
         stagnantSpeechChunkCount = 0
         lastSpeechFingerprint = ""
+        processedAudioSec = 0
     }
 }

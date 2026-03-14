@@ -430,6 +430,99 @@ func percentile(_ values: [Double], q: Double) -> Double? {
     return sorted[lo] * (1.0 - frac) + sorted[hi] * frac
 }
 
+private struct BenchModelProfileAccumulator {
+    var modelCallCount = 0
+    var featureExtractMs = 0.0
+    var encoderPrepareMs = 0.0
+    var encoderPredictMs = 0.0
+    var decodeMs = 0.0
+    var mergeMs = 0.0
+    var totalModelMs = 0.0
+    var encoderWindowCount = 0
+    var encoderWindowReuseCount = 0
+    var encoderWindowComputeCount = 0
+    var encoderReuseStepCount = 0
+    var encoderComputeStepCount = 0
+    var decoderWindowCount = 0
+    var decoderResumeWindowCount = 0
+    var decoderResumeTokenCount = 0
+    var decoderPredictCallCount = 0
+    var decoderAdvanceCallCount = 0
+    var decoderEmittedTokenCount = 0
+    var decoderBlankStepCount = 0
+    var decodeRequestedFrames = 0
+    var decodeCopiedFrames = 0
+
+    mutating func add(_ diagnostic: ParakeetStreamingDiagnostic) {
+        modelCallCount += 1
+        featureExtractMs += diagnostic.featureExtractMs
+        encoderPrepareMs += diagnostic.encoderPrepareMs
+        encoderPredictMs += diagnostic.encoderPredictMs
+        decodeMs += diagnostic.decodeMs
+        mergeMs += diagnostic.mergeMs
+        totalModelMs += diagnostic.totalModelMs
+        encoderWindowCount += diagnostic.encoderWindowCount
+        encoderWindowReuseCount += diagnostic.encoderWindowReuseCount
+        encoderWindowComputeCount += diagnostic.encoderWindowComputeCount
+        encoderReuseStepCount += diagnostic.encoderReuseStepCount
+        encoderComputeStepCount += diagnostic.encoderComputeStepCount
+        decoderWindowCount += diagnostic.decoderWindowCount
+        decoderResumeWindowCount += diagnostic.decoderResumeWindowCount
+        decoderResumeTokenCount += diagnostic.decoderResumeTokenCount
+        decoderPredictCallCount += diagnostic.decoderPredictCallCount
+        decoderAdvanceCallCount += diagnostic.decoderAdvanceCallCount
+        decoderEmittedTokenCount += diagnostic.decoderEmittedTokenCount
+        decoderBlankStepCount += diagnostic.decoderBlankStepCount
+        decodeRequestedFrames += diagnostic.decodeRequestedFrames
+        decodeCopiedFrames += diagnostic.decodeCopiedFrames
+    }
+
+    var jsonObject: [String: Any] {
+        guard modelCallCount > 0 else {
+            return [
+                "model_call_count": 0
+            ]
+        }
+        let callCount = Double(modelCallCount)
+        let totalEncoderSteps = max(0, encoderReuseStepCount + encoderComputeStepCount)
+        return [
+            "model_call_count": modelCallCount,
+            "avg_total_model_ms": totalModelMs / callCount,
+            "avg_feature_extract_ms": featureExtractMs / callCount,
+            "avg_encoder_prepare_ms": encoderPrepareMs / callCount,
+            "avg_encoder_predict_ms": encoderPredictMs / callCount,
+            "avg_decode_ms": decodeMs / callCount,
+            "avg_merge_ms": mergeMs / callCount,
+            "share_feature_extract": featureExtractMs / max(totalModelMs, 1e-9),
+            "share_encoder_prepare": encoderPrepareMs / max(totalModelMs, 1e-9),
+            "share_encoder_predict": encoderPredictMs / max(totalModelMs, 1e-9),
+            "share_decode": decodeMs / max(totalModelMs, 1e-9),
+            "share_merge": mergeMs / max(totalModelMs, 1e-9),
+            "encoder_window_count_total": encoderWindowCount,
+            "encoder_window_reuse_count_total": encoderWindowReuseCount,
+            "encoder_window_compute_count_total": encoderWindowComputeCount,
+            "encoder_window_reuse_ratio": Double(encoderWindowReuseCount) / max(1.0, Double(encoderWindowCount)),
+            "encoder_reuse_step_count_total": encoderReuseStepCount,
+            "encoder_compute_step_count_total": encoderComputeStepCount,
+            "encoder_step_reuse_ratio": Double(encoderReuseStepCount) / max(1.0, Double(totalEncoderSteps)),
+            "avg_decode_requested_frames": Double(decodeRequestedFrames) / callCount,
+            "avg_decode_copied_frames": Double(decodeCopiedFrames) / callCount,
+            "decoder_window_count_total": decoderWindowCount,
+            "decoder_resume_window_count_total": decoderResumeWindowCount,
+            "decoder_resume_token_count_total": decoderResumeTokenCount,
+            "decoder_predict_call_count_total": decoderPredictCallCount,
+            "decoder_advance_call_count_total": decoderAdvanceCallCount,
+            "decoder_emitted_token_count_total": decoderEmittedTokenCount,
+            "decoder_blank_step_count_total": decoderBlankStepCount,
+            "decoder_windows_per_model_call": Double(decoderWindowCount) / callCount,
+            "decoder_predict_calls_per_model_call": Double(decoderPredictCallCount) / callCount,
+            "decoder_predict_calls_per_window": Double(decoderPredictCallCount) / max(1.0, Double(decoderWindowCount)),
+            "decoder_predict_calls_per_emitted_token": Double(decoderPredictCallCount) / max(1.0, Double(decoderEmittedTokenCount)),
+            "decoder_advance_call_ratio": Double(decoderAdvanceCallCount) / max(1.0, Double(decoderPredictCallCount)),
+        ]
+    }
+}
+
 func runRealtimeBenchmark(
     model: ParakeetCoreMLTDTTranscriptionModel,
     samples: [Float],
@@ -534,6 +627,10 @@ func runRealtimeBenchmark(
     var transcriptCursorSec = 0.0
     var traceBatchIndex = 0
     var processedAudioCursorSec = 0.0
+    let tailHalfStartSec = totalAudioSec * 0.5
+    var modelProfileOverall = BenchModelProfileAccumulator()
+    var modelProfileTailHalf = BenchModelProfileAccumulator()
+    var lastModelDiagnosticCallIndexSeen = -1
 
     let startWall = CFAbsoluteTimeGetCurrent()
     while arrivalIndex < totalChunks || !queue.isEmpty {
@@ -636,11 +733,13 @@ func runRealtimeBenchmark(
             speechConfirmedRecorded = false
         }
 
+        let batchStartTimeSec = currentTimeSec
         let before = CFAbsoluteTimeGetCurrent()
         let events = try engine.process(samples: batch)
         let elapsed = CFAbsoluteTimeGetCurrent() - before
+        let batchEndTimeSec = batchStartTimeSec + elapsed
         totalInferSec += elapsed
-        currentTimeSec += elapsed
+        currentTimeSec = batchEndTimeSec
         processedChunks += batchIndexes.count
         traceBatchIndex += 1
 
@@ -648,7 +747,8 @@ func runRealtimeBenchmark(
         let latestAudioCursorSec = min(totalAudioSec, Double(latestChunk + 1) * hopSec)
         processedAudioCursorSec = latestAudioCursorSec
 
-        if let event = events.last {
+        for event in events {
+            let eventAudioCursorSec = min(totalAudioSec, event.audioCursorSec)
             let preEventConfirmed = lastConfirmed
             let preEventDraft = lastHypothesis
             let preEventMerged = lastMerged
@@ -658,7 +758,7 @@ func runRealtimeBenchmark(
                 logProgress("realtime-bench text-change: \(snippet)")
             }
             if event.isSpeech, !prevIsSpeech {
-                speechStartAudioSec = latestAudioCursorSec
+                speechStartAudioSec = eventAudioCursorSec
                 speechBaselineDraft = preEventDraft
                 speechBaselineMerged = preEventMerged
                 speechBaselineConfirmed = preEventConfirmed
@@ -670,29 +770,32 @@ func runRealtimeBenchmark(
                let startAudio = speechStartAudioSec,
                !speechDraftFirstTokenRecorded,
                event.transcript.hypothesis != speechBaselineDraft {
-                draftFirstTokenMs.append(max(0, (currentTimeSec - startAudio) * 1000.0))
+                draftFirstTokenMs.append(max(0, (batchEndTimeSec - startAudio) * 1000.0))
                 speechDraftFirstTokenRecorded = true
             }
             if event.isSpeech,
                let startAudio = speechStartAudioSec,
                !speechMergedFirstTokenRecorded,
                merged != speechBaselineMerged {
-                mergedFirstTokenMs.append(max(0, (currentTimeSec - startAudio) * 1000.0))
+                mergedFirstTokenMs.append(max(0, (batchEndTimeSec - startAudio) * 1000.0))
                 speechMergedFirstTokenRecorded = true
             }
             if event.isSpeech,
                let startAudio = speechStartAudioSec,
                !speechConfirmedRecorded,
                event.transcript.confirmed != speechBaselineConfirmed {
-                confirmedMs.append(max(0, (currentTimeSec - startAudio) * 1000.0))
+                confirmedMs.append(max(0, (batchEndTimeSec - startAudio) * 1000.0))
                 speechConfirmedRecorded = true
+            }
+            if merged != lastMerged || event.transcript.confirmed != lastConfirmed {
+                transcriptCursorSec = max(transcriptCursorSec, eventAudioCursorSec)
             }
             if event.didFlushSegment, let startAudio = speechStartAudioSec {
                 if !speechConfirmedRecorded {
-                    confirmedMs.append(max(0, (currentTimeSec - startAudio) * 1000.0))
+                    confirmedMs.append(max(0, (batchEndTimeSec - startAudio) * 1000.0))
                     speechConfirmedRecorded = true
                 }
-                transcriptCursorSec = max(transcriptCursorSec, latestAudioCursorSec)
+                transcriptCursorSec = max(transcriptCursorSec, eventAudioCursorSec)
                 speechStartAudioSec = nil
                 speechBaselineDraft = ""
                 speechBaselineMerged = ""
@@ -714,6 +817,14 @@ func runRealtimeBenchmark(
 
         let queueSec = Double(queue.count * hopSamples) / Double(sampleRate)
         maxQueueSecObserved = max(maxQueueSecObserved, queueSec)
+        if let diagnostic = model.lastStreamingDiagnostic,
+           diagnostic.callIndex != lastModelDiagnosticCallIndexSeen {
+            lastModelDiagnosticCallIndexSeen = diagnostic.callIndex
+            modelProfileOverall.add(diagnostic)
+            if latestAudioCursorSec >= tailHalfStartSec {
+                modelProfileTailHalf.add(diagnostic)
+            }
+        }
         if let traceWriter {
             var traceObject: [String: Any] = [
                 "kind": "realtime_batch",
@@ -738,6 +849,7 @@ func runRealtimeBenchmark(
             if let event = events.last {
                 traceObject["event_is_speech"] = event.isSpeech
                 traceObject["event_did_flush_segment"] = event.didFlushSegment
+                traceObject["event_audio_cursor_sec"] = event.audioCursorSec
                 traceObject["event_energy_dbfs"] = event.energyDBFS
                 traceObject["event_revision"] = event.revision
                 traceObject["event_raw_partial_preview"] = String((event.rawPartialText ?? "").prefix(160))
@@ -745,6 +857,7 @@ func runRealtimeBenchmark(
             } else {
                 traceObject["event_is_speech"] = NSNull()
                 traceObject["event_did_flush_segment"] = NSNull()
+                traceObject["event_audio_cursor_sec"] = NSNull()
                 traceObject["event_energy_dbfs"] = NSNull()
                 traceObject["event_revision"] = NSNull()
                 traceObject["event_raw_partial_preview"] = ""
@@ -804,6 +917,7 @@ func runRealtimeBenchmark(
     let wallElapsed = CFAbsoluteTimeGetCurrent() - startWall
     let inferRTFx = totalAudioSec / max(totalInferSec, 1e-9)
     let wallRTFx = totalAudioSec / max(currentTimeSec, 1e-9)
+    let actualWallRTFx = totalAudioSec / max(wallElapsed, 1e-9)
 
     let firstTokenSeries = draftFirstTokenMs.isEmpty ? mergedFirstTokenMs : draftFirstTokenMs
     let firstP95 = percentile(firstTokenSeries, q: 0.95) ?? .infinity
@@ -843,7 +957,11 @@ func runRealtimeBenchmark(
         "corrections_per_min": correctionsPerMin,
         "infer_rtfx": inferRTFx,
         "wall_rtfx_virtual": wallRTFx,
+        "wall_rtfx_actual": actualWallRTFx,
         "wall_elapsed_sec": wallElapsed,
+        "model_profile_overall": modelProfileOverall.jsonObject,
+        "model_profile_tail_half_start_sec": tailHalfStartSec,
+        "model_profile_tail_half": modelProfileTailHalf.jsonObject,
         "thresholds": [
             "queue_pass_sec": args.queuePassSec,
             "first_token_pass_ms": args.firstTokenPassMs,

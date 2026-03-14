@@ -133,6 +133,14 @@ python scripts/benchmark_tdt_components.py \
   --compute-units cpu_and_ne
 ```
 
+To inspect per-op device placement with Core ML's compute plan:
+
+```bash
+./.venv/bin/python scripts/analyze_coreml_compute_plan.py \
+  --model artifacts/parakeet-tdt-0.6b-v2/decoder_joint-model-odmbp-approx.mlpackage \
+  --compute-units cpu_and_ne
+```
+
 ### 7) Swift runtime tests
 
 ```bash
@@ -157,6 +165,14 @@ swift run transcribe-macos
 ```
 
 Set `PARAKEET_COREML_MODEL_DIR` (or enter it in the app UI) to point to your model artifacts directory.
+
+For realtime streaming on Apple Silicon, you can keep the `odmbp-approx` encoder and swap only the decoder to the stateful wrapper:
+
+```bash
+PARAKEET_COREML_MODEL_SUFFIX=odmbp-approx \
+PARAKEET_COREML_DECODER_SUFFIX=odmbp-approx-stateful-v2 \
+bash scripts/run_transcribe_macos_release.sh
+```
 
 ### 8) Standardized WER benchmark (OpenBench datasets)
 

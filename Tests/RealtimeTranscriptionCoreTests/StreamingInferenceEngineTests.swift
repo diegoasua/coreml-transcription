@@ -225,6 +225,49 @@ final class StreamingInferenceEngineTests: XCTestCase {
         XCTAssertEqual(resumedEvents.first?.transcript.confirmed, "so i have")
         XCTAssertEqual(resumedEvents.first?.transcript.hypothesis, "created")
     }
+
+    func testEventAudioCursorAdvancesWithEachProcessedHop() throws {
+        let model = MockModel(outputs: ["alpha", "alpha beta"])
+        let vad = MockVAD(decisions: [true, true, false], energyDBFS: -20)
+        var engine = StreamingInferenceEngine(
+            model: model,
+            vad: vad,
+            policy: .init(sampleRate: 1000, chunkMs: 100, hopMs: 100),
+            requiredAgreementCount: 1,
+            decodeOnlyWhenSpeech: true,
+            flushOnSpeechEnd: true,
+            ringBufferCapacity: 400
+        )
+
+        let events = try engine.process(samples: Array(repeating: Float(0.1), count: 300))
+        XCTAssertEqual(events.count, 3)
+        XCTAssertEqual(events[0].audioCursorSec, 0.1, accuracy: 1e-9)
+        XCTAssertEqual(events[1].audioCursorSec, 0.2, accuracy: 1e-9)
+        XCTAssertEqual(events[2].audioCursorSec, 0.3, accuracy: 1e-9)
+    }
+
+    func testForceFlushSharesAudioCursorWithDecodedHop() throws {
+        let model = MockModel(outputs: ["alpha", "alpha beta"])
+        let vad = MockVAD(decisions: [true, true], energyDBFS: -20)
+        var engine = StreamingInferenceEngine(
+            model: model,
+            vad: vad,
+            policy: .init(sampleRate: 1000, chunkMs: 100, hopMs: 100),
+            requiredAgreementCount: 1,
+            decodeOnlyWhenSpeech: true,
+            flushOnSpeechEnd: false,
+            maxSpeechChunkRunBeforeReset: 2,
+            maxStagnantSpeechChunks: nil,
+            ringBufferCapacity: 300
+        )
+
+        let events = try engine.process(samples: Array(repeating: Float(0.1), count: 200))
+        XCTAssertEqual(events.count, 3)
+        XCTAssertFalse(events[1].didFlushSegment)
+        XCTAssertTrue(events[2].didFlushSegment)
+        XCTAssertEqual(events[1].audioCursorSec, 0.2, accuracy: 1e-9)
+        XCTAssertEqual(events[2].audioCursorSec, 0.2, accuracy: 1e-9)
+    }
 }
 
 private struct MockModel: TranscriptionModel {
