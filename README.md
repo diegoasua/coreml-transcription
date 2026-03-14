@@ -103,6 +103,48 @@ python scripts/convert_torchscript_to_coreml.py \
   --compute-units all
 ```
 
+### 3b) Experimental local-attention streaming encoder
+
+NeMo's built-in cache path does not currently work for `rel_pos_local_attn` on
+this checkpoint: it reuses the full-attention cache concatenation path and hits
+the longformer `q.size() == k.size()` assertion once cache is enabled. This repo
+therefore includes a custom export wrapper that carries explicit per-stage
+left-context tensors instead.
+
+To build a local-attention encoder alongside the existing baseline encoder:
+
+```bash
+ENABLE_LOCAL_ATTENTION_ENCODER=1 \
+LOCAL_ATTENTION_LEFT_CONTEXT_STEPS=32 \
+LOCAL_ATTENTION_RIGHT_CONTEXT_STEPS=0 \
+LOCAL_ATTENTION_CHUNK_STEPS=8 \
+LOCAL_ATTENTION_SHIFT_STEPS=8 \
+bash scripts/run_conversion.sh
+```
+
+This emits an additional encoder family:
+
+- `encoder-model-local-streaming.ts`
+- `encoder-model-local-streaming.mlpackage`
+- `encoder-model-local-streaming-<compress-suffix>.mlpackage`
+- matching `*-streaming.json` sidecars used by the Swift runtime
+
+To select it at runtime while keeping the current TDT decoder:
+
+```bash
+PARAKEET_COREML_ENCODER_SUFFIX=local-streaming-odmbp-approx \
+PARAKEET_COREML_DECODER_SUFFIX=odmbp-approx \
+PARAKEET_STREAM_MODE=incremental \
+bash scripts/run_transcribe_macos_release.sh
+```
+
+Notes:
+- The initial runtime path uses explicit encoder cache tensors (`input_cache`,
+  `output_cache`) rather than CoreML encoder `MLState`.
+- Decoder stateful/runtime support is unchanged and still applies independently.
+- The generated `*-streaming.json` sidecar is copied through conversion and
+  compression so the Swift runtime can infer encoder window/shift sizing.
+
 ### 4) Inspect ONNX I/O and create manifest
 
 ```bash

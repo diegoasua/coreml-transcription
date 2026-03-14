@@ -312,6 +312,12 @@ def compress(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     compressed.save(str(output_path))
+
+    source_sidecar = model_path.with_suffix("").with_name(model_path.stem + "-streaming.json")
+    if source_sidecar.exists():
+        target_sidecar = output_path.with_suffix("").with_name(output_path.stem + "-streaming.json")
+        target_sidecar.write_text(source_sidecar.read_text(encoding="utf-8"), encoding="utf-8")
+
     return output_path
 
 

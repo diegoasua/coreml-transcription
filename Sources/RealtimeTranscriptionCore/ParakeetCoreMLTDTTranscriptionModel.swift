@@ -51,6 +51,55 @@ public struct ParakeetCoreMLTDTConfig {
     }
 }
 
+private struct EncoderStreamingSidecar {
+    let kind: String
+    let inputFeatureFrames: Int
+    let shiftFeatureFrames: Int
+    let preEncodeCacheFrames: Int
+    let validOutputSteps: Int
+    let stateInputName: String
+    let timeStateInputName: String?
+    let stateLengthInputName: String
+    let stateOutputName: String
+    let timeStateOutputName: String?
+    let stateLengthOutputName: String
+
+    static func load(from modelURL: URL) -> EncoderStreamingSidecar? {
+        let sidecarURL = modelURL.deletingLastPathComponent()
+            .appendingPathComponent(modelURL.deletingPathExtension().lastPathComponent + "-streaming.json")
+        guard let data = try? Data(contentsOf: sidecarURL),
+              let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        guard let kind = raw["kind"] as? String,
+              let inputFeatureFrames = raw["input_feature_frames"] as? Int,
+              let shiftFeatureFrames = raw["shift_feature_frames"] as? Int,
+              let preEncodeCacheFrames = raw["pre_encode_cache_frames"] as? Int,
+              let validOutputSteps = raw["valid_output_steps"] as? Int,
+              let stateInputName = raw["state_input_name"] as? String,
+              let stateLengthInputName = raw["state_length_input_name"] as? String,
+              let stateOutputName = raw["state_output_name"] as? String,
+              let stateLengthOutputName = raw["state_length_output_name"] as? String else {
+            return nil
+        }
+        let timeStateInputName = raw["time_state_input_name"] as? String
+        let timeStateOutputName = raw["time_state_output_name"] as? String
+        return .init(
+            kind: kind,
+            inputFeatureFrames: inputFeatureFrames,
+            shiftFeatureFrames: shiftFeatureFrames,
+            preEncodeCacheFrames: preEncodeCacheFrames,
+            validOutputSteps: validOutputSteps,
+            stateInputName: stateInputName,
+            timeStateInputName: timeStateInputName,
+            stateLengthInputName: stateLengthInputName,
+            stateOutputName: stateOutputName,
+            timeStateOutputName: timeStateOutputName,
+            stateLengthOutputName: stateLengthOutputName
+        )
+    }
+}
+
 public struct ParakeetStreamingDiagnostic: Sendable {
     public struct MergeDiagnostic: Sendable {
         public let strategy: String
@@ -282,6 +331,7 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
     private let encoderLengthDataType: MLMultiArrayDataType?
     private let encoderAudioDataType: MLMultiArrayDataType
     private let encoderFrameCount: Int
+    private let encoderStreamingSidecar: EncoderStreamingSidecar?
 
     private let decoderEncoderInputName: String
     private let decoderStateInputNames: [String]
@@ -325,6 +375,9 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
     private var state2: MLMultiArray
     private var encoderAudioBuffer: MLMultiArray
     private var encoderLengthBuffer: MLMultiArray?
+    private var encoderStreamingStateBuffer: MLMultiArray?
+    private var encoderStreamingTimeStateBuffer: MLMultiArray?
+    private var encoderStreamingStateLengthBuffer: MLMultiArray?
     private var decoderEncoderBuffer: MLMultiArray
     private var decoderTargetsBuffer: MLMultiArray
     private var decoderTargetLengthBuffer: MLMultiArray
@@ -349,6 +402,8 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
     private var streamingRollingAnchorActive: Bool
     private var streamingDiagnosticCallIndex: Int
     private var streamingFeatureCache: StreamingMelFeatureCache
+    private var streamingEncoderSeenSampleCount: Int
+    private var streamingEncoderProcessedFeatureFrames: Int
     private let decoderTraceWriter: DecoderTraceWriter?
     private let decoderTraceTopK: Int
     private let blankDurationTieMargin: Float
@@ -411,6 +466,7 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
         self.encoderLengthInputName = encoderInputs["length"]?.name
         self.encoderLengthDataType = self.encoderLengthInputName.flatMap { encoderInputs[$0]?.dataType }
         self.encoderFrameCount = max(1, audioInput.shape.last ?? 1200)
+        self.encoderStreamingSidecar = EncoderStreamingSidecar.load(from: encoderURL)
 
         if let encoderInput = decoderInputs["encoder_outputs"] {
             self.decoderEncoderInputName = encoderInput.name
@@ -595,6 +651,34 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
         } else {
             self.encoderLengthBuffer = nil
         }
+        if let sidecar = encoderStreamingSidecar,
+           let cacheSpec = encoderInputs[sidecar.stateInputName],
+           let cacheLengthSpec = encoderInputs[sidecar.stateLengthInputName] {
+            self.encoderStreamingStateBuffer = try Self.makeArray(
+                shape: cacheSpec.shape,
+                dataType: cacheSpec.dataType
+            )
+            self.encoderStreamingStateLengthBuffer = try Self.makeArray(
+                shape: cacheLengthSpec.shape,
+                dataType: cacheLengthSpec.dataType
+            )
+            try Self.fill(array: self.encoderStreamingStateBuffer!, with: 0)
+            try Self.setScalarInt(self.encoderStreamingStateLengthBuffer!, value: 0)
+            if let timeStateInputName = sidecar.timeStateInputName,
+               let timeStateSpec = encoderInputs[timeStateInputName] {
+                self.encoderStreamingTimeStateBuffer = try Self.makeArray(
+                    shape: timeStateSpec.shape,
+                    dataType: timeStateSpec.dataType
+                )
+                try Self.fill(array: self.encoderStreamingTimeStateBuffer!, with: 0)
+            } else {
+                self.encoderStreamingTimeStateBuffer = nil
+            }
+        } else {
+            self.encoderStreamingStateBuffer = nil
+            self.encoderStreamingTimeStateBuffer = nil
+            self.encoderStreamingStateLengthBuffer = nil
+        }
         self.decoderEncoderBuffer = try Self.makeArray(
             shape: decoderEncoderInputShape,
             dataType: decoderEncoderInputDataType
@@ -650,6 +734,8 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
         self.streamingRollingAnchorActive = false
         self.streamingDiagnosticCallIndex = 0
         self.lastStreamingDiagnostic = nil
+        self.streamingEncoderSeenSampleCount = 0
+        self.streamingEncoderProcessedFeatureFrames = 0
 
         self.featureExtractor = MelFeatureExtractor(
             sampleRate: config.expectedSampleRate,
@@ -673,6 +759,12 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
             fputs("[ParakeetSwift] stateful commit policy=\(commitPolicy)\n", stderr)
             let streamMode = streamingMode == .rewritePrefix ? "rewrite-prefix" : "incremental"
             fputs("[ParakeetSwift] streaming mode=\(streamMode)\n", stderr)
+            if let sidecar = encoderStreamingSidecar {
+                fputs(
+                    "[ParakeetSwift] encoder streaming sidecar kind=\(sidecar.kind) input_frames=\(sidecar.inputFeatureFrames) shift_frames=\(sidecar.shiftFeatureFrames)\n",
+                    stderr
+                )
+            }
         }
         progress?("Model ready.")
     }
@@ -701,6 +793,11 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
     public func transcribeChunk(_ samples: [Float], sampleRate: Int) throws -> String {
         guard sampleRate == config.expectedSampleRate else {
             throw ParakeetCoreMLTDTError.sampleRateMismatch(expected: config.expectedSampleRate, actual: sampleRate)
+        }
+        if encoderStreamingSidecar != nil {
+            return try autoreleasepool {
+                try transcribeChunkWithStreamingEncoderCache(samples, sampleRate: sampleRate)
+            }
         }
         if streamingMode == .rewritePrefix {
             return try autoreleasepool {
@@ -1169,6 +1266,217 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
         return Self.decodePieces(from: committedTokenIDs, vocab: vocab)
     }
 
+    private func transcribeChunkWithStreamingEncoderCache(_ samples: [Float], sampleRate: Int) throws -> String {
+        guard sampleRate == config.expectedSampleRate else {
+            throw ParakeetCoreMLTDTError.sampleRateMismatch(expected: config.expectedSampleRate, actual: sampleRate)
+        }
+        guard let sidecar = encoderStreamingSidecar,
+              let initialStateBuffer = encoderStreamingStateBuffer,
+              let initialStateLengthBuffer = encoderStreamingStateLengthBuffer,
+              encoderInputSpecs[sidecar.stateInputName] != nil,
+              encoderInputSpecs[sidecar.stateLengthInputName] != nil else {
+            throw ParakeetCoreMLTDTError.invalidModelIO("Encoder streaming sidecar is present but encoder cache IO is unavailable.")
+        }
+        var stateBuffer = initialStateBuffer
+        var stateLengthBuffer = initialStateLengthBuffer
+        var timeStateBuffer = encoderStreamingTimeStateBuffer
+        if let timeStateInputName = sidecar.timeStateInputName {
+            guard let existingTimeStateBuffer = timeStateBuffer,
+                  encoderInputSpecs[timeStateInputName] != nil else {
+                throw ParakeetCoreMLTDTError.invalidModelIO("Encoder streaming sidecar requires time-cache IO that is unavailable.")
+            }
+            timeStateBuffer = existingTimeStateBuffer
+        }
+
+        let diagnosticCallIndex = streamingDiagnosticCallIndex
+        streamingDiagnosticCallIndex += 1
+        let chunkStartTime = CFAbsoluteTimeGetCurrent()
+        if !samples.isEmpty {
+            streamingSampleHistory.append(contentsOf: samples)
+            streamingEncoderSeenSampleCount += samples.count
+        }
+        if streamingSampleHistory.isEmpty {
+            return Self.decodePieces(from: committedTokenIDs + draftTokenIDs, vocab: vocab)
+        }
+
+        let historyFrameLimit = max(sidecar.inputFeatureFrames, sidecar.inputFeatureFrames + sidecar.shiftFeatureFrames * 4)
+        let historySampleLimit = historyFrameLimit * config.hopLength + config.windowLength
+        let droppedSamples = max(0, streamingSampleHistory.count - historySampleLimit)
+        if droppedSamples > 0 {
+            streamingSampleHistory.removeFirst(droppedSamples)
+        }
+
+        let featureExtractStartTime = CFAbsoluteTimeGetCurrent()
+        let (featureMatrix, frameCount) = streamingFeatureCache.extract(
+            samples: streamingSampleHistory,
+            droppedSampleCount: droppedSamples
+        )
+        let featureExtractMs = (CFAbsoluteTimeGetCurrent() - featureExtractStartTime) * 1000.0
+        let totalFeatureFramesSeen = featureExtractor.frameCount(forSampleCount: streamingEncoderSeenSampleCount)
+        let historyGlobalStartFrame = max(0, totalFeatureFramesSeen - frameCount)
+
+        let committedTokenCountBefore = committedTokenIDs.count
+        var encoderPrepareMs = 0.0
+        var encoderPredictMs = 0.0
+        var decodeMs = 0.0
+        var processedAnyStep = false
+
+        if historyGlobalStartFrame > streamingEncoderProcessedFeatureFrames {
+            try Self.fill(array: stateBuffer, with: 0)
+            try Self.setScalarInt(stateLengthBuffer, value: 0)
+            if let timeStateBuffer {
+                try Self.fill(array: timeStateBuffer, with: 0)
+            }
+            try resetDecoderContextForStreamingWindow()
+            streamingEncoderProcessedFeatureFrames = historyGlobalStartFrame
+        }
+
+        while totalFeatureFramesSeen - streamingEncoderProcessedFeatureFrames >= sidecar.shiftFeatureFrames {
+            let targetEndGlobal = streamingEncoderProcessedFeatureFrames + sidecar.shiftFeatureFrames
+            let targetEndRelative = targetEndGlobal - historyGlobalStartFrame
+            guard targetEndRelative > 0, targetEndRelative <= frameCount else {
+                break
+            }
+
+            let copyFrames = min(sidecar.inputFeatureFrames, targetEndRelative)
+            let sourceStart = max(0, targetEndRelative - copyFrames)
+            let destinationStart = sidecar.inputFeatureFrames - copyFrames
+
+            let encoderPrepareStartTime = CFAbsoluteTimeGetCurrent()
+            try Self.fill(array: encoderAudioBuffer, with: 0)
+            try Self.copyFeatureWindowToEncoderInputRightAligned(
+                featureMatrix: featureMatrix,
+                melBins: config.melBins,
+                totalFrames: frameCount,
+                startFrame: sourceStart,
+                copyFrames: copyFrames,
+                destination: encoderAudioBuffer,
+                destinationStartFrame: destinationStart
+            )
+
+            var encoderFeed: [String: Any] = [encoderAudioInputName: encoderAudioBuffer]
+            if let lengthName = encoderLengthInputName {
+                if let lengthArray = encoderLengthBuffer {
+                    try Self.setScalarInt(lengthArray, value: sidecar.inputFeatureFrames)
+                    encoderFeed[lengthName] = lengthArray
+                } else if let lengthType = encoderLengthDataType {
+                    let lengthArray = try Self.makeArray(shape: [1], dataType: lengthType)
+                    try Self.setScalarInt(lengthArray, value: sidecar.inputFeatureFrames)
+                    encoderFeed[lengthName] = lengthArray
+                }
+            }
+            encoderFeed[sidecar.stateInputName] = stateBuffer
+            encoderFeed[sidecar.stateLengthInputName] = stateLengthBuffer
+            if let timeStateInputName = sidecar.timeStateInputName, let timeStateBuffer {
+                encoderFeed[timeStateInputName] = timeStateBuffer
+            }
+
+            let encoderProvider = try MLDictionaryFeatureProvider(dictionary: encoderFeed)
+            encoderPrepareMs += (CFAbsoluteTimeGetCurrent() - encoderPrepareStartTime) * 1000.0
+
+            let encoderPredictStartTime = CFAbsoluteTimeGetCurrent()
+            let encoderOutput = try encoder.prediction(from: encoderProvider)
+            encoderPredictMs += (CFAbsoluteTimeGetCurrent() - encoderPredictStartTime) * 1000.0
+
+            let pickedOutputs = try Self.pickStreamingEncoderOutputs(
+                from: encoderOutput,
+                expectedStateShape: stateBuffer.intShape,
+                expectedTimeStateShape: timeStateBuffer?.intShape,
+                debug: debugLoggingEnabled
+            )
+            let encoderTensor = pickedOutputs.tensor
+            let availableSteps = encoderTensor.intShape.count >= 3 ? encoderTensor.intShape[2] : 0
+            let steps = max(0, min(sidecar.validOutputSteps, pickedOutputs.length ?? availableSteps, availableSteps, decoderFrameCount))
+
+            if let nextState = encoderOutput.featureValue(for: sidecar.stateOutputName)?.multiArrayValue ?? pickedOutputs.state {
+                if nextState.count == stateBuffer.count, nextState.dataType == stateBuffer.dataType {
+                    try Self.copyArrayContents(source: nextState, destination: stateBuffer)
+                } else {
+                    stateBuffer = try Self.cloneArray(nextState)
+                    encoderStreamingStateBuffer = stateBuffer
+                }
+            }
+            if let nextStateLength = encoderOutput.featureValue(for: sidecar.stateLengthOutputName)?.multiArrayValue {
+                if nextStateLength.count == stateLengthBuffer.count, nextStateLength.dataType == stateLengthBuffer.dataType {
+                    try Self.copyArrayContents(source: nextStateLength, destination: stateLengthBuffer)
+                } else {
+                    stateLengthBuffer = try Self.cloneArray(nextStateLength)
+                    encoderStreamingStateLengthBuffer = stateLengthBuffer
+                }
+            } else if let stateLength = pickedOutputs.stateLength {
+                try Self.setScalarInt(stateLengthBuffer, value: min(max(0, stateLength), stateBuffer.intShape[2]))
+            }
+            if let currentTimeStateBuffer = timeStateBuffer {
+                if let nextTimeState = (sidecar.timeStateOutputName.flatMap { encoderOutput.featureValue(for: $0)?.multiArrayValue })
+                    ?? pickedOutputs.timeState
+                {
+                    if nextTimeState.count == currentTimeStateBuffer.count, nextTimeState.dataType == currentTimeStateBuffer.dataType {
+                        try Self.copyArrayContents(source: nextTimeState, destination: currentTimeStateBuffer)
+                    } else {
+                        let clonedTimeState = try Self.cloneArray(nextTimeState)
+                        timeStateBuffer = clonedTimeState
+                        encoderStreamingTimeStateBuffer = clonedTimeState
+                    }
+                } else {
+                    throw ParakeetCoreMLTDTError.invalidModelIO("Streaming encoder did not return the expected time-cache output.")
+                }
+            }
+
+            if steps > 0 {
+                try Self.fill(array: decoderEncoderBuffer, with: 0)
+                let copiedFrames = try Self.copyTensorWindowToDecoderInput(
+                    source: encoderTensor,
+                    sourceStartFrame: 0,
+                    sourceFrameCount: steps,
+                    destination: decoderEncoderBuffer
+                )
+                if copiedFrames > 0 {
+                    let decodeStartTime = CFAbsoluteTimeGetCurrent()
+                    let chunkTokenIDs = try decodeChunk(
+                        decoderEncoderInput: decoderEncoderBuffer,
+                        encoderSteps: copiedFrames,
+                        commitState: true
+                    )
+                    decodeMs += (CFAbsoluteTimeGetCurrent() - decodeStartTime) * 1000.0
+                    committedTokenIDs.append(contentsOf: chunkTokenIDs)
+                }
+            }
+
+            streamingEncoderProcessedFeatureFrames = targetEndGlobal
+            processedAnyStep = true
+        }
+
+        draftTokenIDs.removeAll(keepingCapacity: true)
+        updateStreamingDiagnostic(
+            callIndex: diagnosticCallIndex,
+            inputSamples: samples.count,
+            historySamples: streamingSampleHistory.count,
+            droppedSamples: droppedSamples,
+            frameCount: frameCount,
+            windowFrames: min(frameCount, sidecar.inputFeatureFrames),
+            windowStartFrame: max(0, frameCount - min(frameCount, sidecar.inputFeatureFrames)),
+            encoderSteps: processedAnyStep ? sidecar.validOutputSteps : 0,
+            approxNewFrames: max(1, Int(round(Double(samples.count) / Double(config.hopLength)))),
+            approxNewSteps: processedAnyStep ? sidecar.validOutputSteps : 0,
+            decodeStrategy: sidecar.kind,
+            decodeSourceStartStep: 0,
+            decodeRequestedFrames: processedAnyStep ? sidecar.validOutputSteps : 0,
+            decodeCopiedFrames: processedAnyStep ? sidecar.validOutputSteps : 0,
+            decodedCursorBefore: 0,
+            decodedCursorAfter: streamingEncoderProcessedFeatureFrames,
+            featureExtractMs: featureExtractMs,
+            encoderPrepareMs: encoderPrepareMs,
+            encoderPredictMs: encoderPredictMs,
+            decodeMs: decodeMs,
+            mergeMs: 0,
+            totalModelMs: (CFAbsoluteTimeGetCurrent() - chunkStartTime) * 1000.0,
+            committedTokenCountBefore: committedTokenCountBefore,
+            committedTokenCountAfter: committedTokenIDs.count,
+            draftTokenCountAfter: draftTokenIDs.count
+        )
+        return Self.decodePieces(from: committedTokenIDs, vocab: vocab)
+    }
+
     private func transcribeChunkRewritePrefix(_ samples: [Float], sampleRate: Int) throws -> String {
         if !samples.isEmpty {
             streamingPrefixSamples.append(contentsOf: samples)
@@ -1457,6 +1765,15 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
             try? Self.fill(array: state1, with: 0)
             try? Self.fill(array: state2, with: 0)
         }
+        if let stateBuffer = encoderStreamingStateBuffer {
+            try? Self.fill(array: stateBuffer, with: 0)
+        }
+        if let timeStateBuffer = encoderStreamingTimeStateBuffer {
+            try? Self.fill(array: timeStateBuffer, with: 0)
+        }
+        if let stateLengthBuffer = encoderStreamingStateLengthBuffer {
+            try? Self.setScalarInt(stateLengthBuffer, value: 0)
+        }
         previousToken = blankID
         committedTokenIDs.removeAll(keepingCapacity: true)
         draftTokenIDs.removeAll(keepingCapacity: true)
@@ -1466,6 +1783,8 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
         streamingRollingAnchorStablePassCount = 0
         streamingRollingAnchorActive = false
         streamingFeatureCache.reset()
+        streamingEncoderSeenSampleCount = 0
+        streamingEncoderProcessedFeatureFrames = 0
         lastStreamingDiagnostic = nil
         decoderTraceChunkIndex = 0
     }
@@ -1479,8 +1798,16 @@ public final class ParakeetCoreMLTDTTranscriptionModel: TranscriptionModel {
     }
 
     private func restoreRewritePrefixDecoderCheckpoint(_ checkpoint: RewritePrefixDecoderCheckpoint) throws {
-        try Self.copyArrayContents(source: checkpoint.state1, destination: state1)
-        try Self.copyArrayContents(source: checkpoint.state2, destination: state2)
+        if checkpoint.state1.intShape == state1.intShape, checkpoint.state1.dataType == state1.dataType {
+            try Self.copyArrayContents(source: checkpoint.state1, destination: state1)
+        } else {
+            state1 = try Self.cloneArray(checkpoint.state1)
+        }
+        if checkpoint.state2.intShape == state2.intShape, checkpoint.state2.dataType == state2.dataType {
+            try Self.copyArrayContents(source: checkpoint.state2, destination: state2)
+        } else {
+            state2 = try Self.cloneArray(checkpoint.state2)
+        }
         previousToken = checkpoint.previousToken
     }
 
@@ -2538,10 +2865,64 @@ private extension ParakeetCoreMLTDTTranscriptionModel {
         }
     }
 
+    static func copyFeatureWindowToEncoderInputRightAligned(
+        featureMatrix: [Float],
+        melBins: Int,
+        totalFrames: Int,
+        startFrame: Int,
+        copyFrames: Int,
+        destination: MLMultiArray,
+        destinationStartFrame: Int
+    ) throws {
+        guard destination.intShape.count == 3 else {
+            throw ParakeetCoreMLTDTError.unsupportedArrayRank(destination.intShape.count)
+        }
+        let shape = destination.intShape
+        guard shape[0] >= 1,
+              shape[1] >= melBins,
+              destinationStartFrame >= 0,
+              destinationStartFrame + copyFrames <= shape[2] else {
+            throw ParakeetCoreMLTDTError.invalidModelIO("Encoder right-aligned input shape mismatch.")
+        }
+        guard totalFrames > 0, copyFrames > 0 else { return }
+
+        let strides = destination.intStrides
+        let dstMelStride = strides[1]
+        let dstFrameStride = strides[2]
+
+        if destination.dataType == .float32 {
+            let dst = destination.dataPointer.bindMemory(to: Float.self, capacity: destination.count)
+            for m in 0..<melBins {
+                let srcBase = m * totalFrames + startFrame
+                let dstBase = m * dstMelStride + destinationStartFrame * dstFrameStride
+                if dstFrameStride == 1 {
+                    for t in 0..<copyFrames {
+                        dst[dstBase + t] = featureMatrix[srcBase + t]
+                    }
+                } else {
+                    for t in 0..<copyFrames {
+                        dst[dstBase + t * dstFrameStride] = featureMatrix[srcBase + t]
+                    }
+                }
+            }
+            return
+        }
+
+        for m in 0..<melBins {
+            let base = m * totalFrames
+            for t in 0..<copyFrames {
+                destination.setFloatValue(
+                    featureMatrix[base + startFrame + t],
+                    indices: [0, m, destinationStartFrame + t]
+                )
+            }
+        }
+    }
+
     static func pickEncoderTensorAndLength(from provider: MLFeatureProvider, debug: Bool = false) throws -> (MLMultiArray, Int?) {
         var length: Int?
         var bestName: String?
-        var bestScore: (Int, Int, Int)?
+        var bestScore: (Int, Int, Int, Int)?
 
         let orderedNames = Array(provider.featureNames).sorted()
         for name in orderedNames {
@@ -2555,9 +2936,15 @@ private extension ParakeetCoreMLTDTTranscriptionModel {
                 continue
             }
             guard arr.isFloatLike, shape.count >= 2 else { continue }
-            let score = (shape.count, shape.last ?? 0, arr.count)
+            // Prefer the actual encoder sequence tensor (rank 3) over higher-rank
+            // cache tensors that can appear in streaming encoder wrappers.
+            let score = (shape.count == 3 ? 1 : 0, shape.count, shape.last ?? 0, arr.count)
             if let b = bestScore {
-                if score.0 > b.0 || (score.0 == b.0 && score.1 > b.1) || (score.0 == b.0 && score.1 == b.1 && score.2 > b.2) {
+                if score.0 > b.0
+                    || (score.0 == b.0 && score.1 > b.1)
+                    || (score.0 == b.0 && score.1 == b.1 && score.2 > b.2)
+                    || (score.0 == b.0 && score.1 == b.1 && score.2 == b.2 && score.3 > b.3)
+                {
                     bestName = name
                     bestScore = score
                 }
@@ -2580,6 +2967,143 @@ private extension ParakeetCoreMLTDTTranscriptionModel {
             }
         }
         return (tensor, length)
+    }
+
+    struct PickedStreamingEncoderOutputs {
+        let tensor: MLMultiArray
+        let length: Int?
+        let state: MLMultiArray?
+        let timeState: MLMultiArray?
+        let stateLength: Int?
+    }
+
+    static func pickStreamingEncoderOutputs(
+        from provider: MLFeatureProvider,
+        expectedStateShape: [Int],
+        expectedTimeStateShape: [Int]? = nil,
+        debug: Bool = false
+    ) throws -> PickedStreamingEncoderOutputs {
+        var scalarValues: [(name: String, value: Int)] = []
+        var floatArrays: [(name: String, array: MLMultiArray)] = []
+
+        let orderedNames = Array(provider.featureNames).sorted()
+        for name in orderedNames {
+            guard let arr = provider.featureValue(for: name)?.multiArrayValue else { continue }
+            let shape = arr.intShape
+            if debug {
+                fputs("[ParakeetSwift] encoder output \(name): dtype=\(arr.dataType.rawValue) shape=\(shape)\n", stderr)
+            }
+            if arr.isIntegerLike, shape.count == 1, arr.count == 1 {
+                scalarValues.append((name: name, value: Int(arr.floatValue(flatIndex: 0))))
+                continue
+            }
+            guard arr.isFloatLike, shape.count >= 2 else { continue }
+            floatArrays.append((name: name, array: arr))
+        }
+
+        let stateCount = expectedStateShape.reduce(1, *)
+        var pickedState: MLMultiArray?
+        var pickedStateName: String?
+        for candidate in floatArrays {
+            let shape = candidate.array.intShape
+            if shape == expectedStateShape || candidate.array.count == stateCount {
+                pickedState = candidate.array
+                pickedStateName = candidate.name
+                break
+            }
+        }
+
+        var pickedTimeState: MLMultiArray?
+        var pickedTimeStateName: String?
+        if let expectedTimeStateShape {
+            let timeStateCount = expectedTimeStateShape.reduce(1, *)
+            for candidate in floatArrays where candidate.name != pickedStateName {
+                let shape = candidate.array.intShape
+                if shape == expectedTimeStateShape || candidate.array.count == timeStateCount {
+                    pickedTimeState = candidate.array
+                    pickedTimeStateName = candidate.name
+                    break
+                }
+            }
+        }
+
+        let tensorCandidates = floatArrays.filter { $0.name != pickedStateName && $0.name != pickedTimeStateName }
+        guard !tensorCandidates.isEmpty else {
+            throw ParakeetCoreMLTDTError.missingOutput("Could not infer encoder tensor output.")
+        }
+
+        let rank3Candidates = tensorCandidates.filter { $0.array.intShape.count == 3 }
+        let preferredTensorPool = rank3Candidates.isEmpty ? tensorCandidates : rank3Candidates
+
+        var pickedTensor: MLMultiArray?
+        var pickedTensorName: String?
+        var bestScore: (Int, Int, Int)?
+        for candidate in preferredTensorPool {
+            let shape = candidate.array.intShape
+            let score = (shape.last ?? 0, shape.count, candidate.array.count)
+            if let currentBest = bestScore {
+                if score.0 > currentBest.0
+                    || (score.0 == currentBest.0 && score.1 > currentBest.1)
+                    || (score.0 == currentBest.0 && score.1 == currentBest.1 && score.2 > currentBest.2)
+                {
+                    pickedTensor = candidate.array
+                    pickedTensorName = candidate.name
+                    bestScore = score
+                }
+            } else {
+                pickedTensor = candidate.array
+                pickedTensorName = candidate.name
+                bestScore = score
+            }
+        }
+
+        guard let tensor = pickedTensor else {
+            throw ParakeetCoreMLTDTError.missingOutput("Could not infer encoder tensor output.")
+        }
+
+        let tensorTimeDim = tensor.intShape.last ?? 0
+        let length = scalarValues
+            .filter { $0.value >= 0 && (tensorTimeDim == 0 || $0.value <= tensorTimeDim) }
+            .map(\.value)
+            .max() ?? scalarValues.map(\.value).max()
+
+        let maxStateLength = expectedStateShape.count >= 3 ? expectedStateShape[2] : 0
+        let stateLength = scalarValues
+            .filter { $0.value >= 0 && (maxStateLength == 0 || $0.value <= maxStateLength) }
+            .map(\.value)
+            .max() ?? length
+
+        if debug {
+            fputs(
+                "[ParakeetSwift] selected encoder tensor \(pickedTensorName ?? "<unknown>") shape=\(tensor.intShape) length=\(length.map(String.init) ?? "nil")\n",
+                stderr
+            )
+            if let state = pickedState {
+                fputs(
+                    "[ParakeetSwift] selected encoder cache \(pickedStateName ?? "<unknown>") shape=\(state.intShape) state_length=\(stateLength.map(String.init) ?? "nil")\n",
+                    stderr
+                )
+            }
+            if let timeState = pickedTimeState {
+                fputs(
+                    "[ParakeetSwift] selected encoder time cache \(pickedTimeStateName ?? "<unknown>") shape=\(timeState.intShape)\n",
+                    stderr
+                )
+            }
+            if tensor.intShape.count == 3, tensor.intShape[0] > 0, tensor.intShape[1] > 0 {
+                let limit = min(10, tensor.intShape[2])
+                let preview = (0..<limit).map { String(format: "%.6f", tensor.floatValue(indices: [0, 0, $0])) }.joined(separator: ", ")
+                fputs("[ParakeetSwift] encoder[0,0,0:\(limit)] = [\(preview)]\n", stderr)
+            }
+        }
+
+        return PickedStreamingEncoderOutputs(
+            tensor: tensor,
+            length: length,
+            state: pickedState,
+            timeState: pickedTimeState,
+            stateLength: stateLength
+        )
     }
 
     static func copyTensorWindowToDecoderInput(

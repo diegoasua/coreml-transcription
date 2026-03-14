@@ -42,6 +42,8 @@ var engine = StreamingInferenceEngine(model: model, vad: vad)
 ## Important
 
 - Parakeet adapter expects split CoreML packages (`encoder-model-*.mlpackage`, `decoder_joint-model-*.mlpackage`) and `vocab.txt`.
+- If the encoder model has a sibling `*-streaming.json` sidecar, Swift will treat it as a
+  cache-aware streaming encoder and drive its explicit cache I/O automatically.
 - Streaming engine supports both policies:
   - `flushOnSpeechEnd=true`: reset on VAD speech->silence transitions.
   - `flushOnSpeechEnd=false` (current low-latency default): preserve decoder/model state across short pauses.

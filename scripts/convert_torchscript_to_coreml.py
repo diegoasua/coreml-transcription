@@ -384,6 +384,13 @@ def convert(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     converted.save(str(output_path))
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    streaming_info = manifest.get("streaming_info")
+    if isinstance(streaming_info, dict) and streaming_info:
+        sidecar_path = output_path.with_suffix("").with_name(output_path.stem + "-streaming.json")
+        sidecar_path.write_text(json.dumps(streaming_info, indent=2), encoding="utf-8")
+
     return output_path
 
 

@@ -97,6 +97,53 @@ for onnx_file in "${onnx_files[@]}"; do
   fi
 done
 
+ENABLE_LOCAL_ATTENTION_ENCODER="${ENABLE_LOCAL_ATTENTION_ENCODER:-0}"
+LOCAL_ATTENTION_ENCODER_BASENAME="${LOCAL_ATTENTION_ENCODER_BASENAME:-encoder-model-local-streaming}"
+LOCAL_ATTENTION_LEFT_CONTEXT_STEPS="${LOCAL_ATTENTION_LEFT_CONTEXT_STEPS:-32}"
+LOCAL_ATTENTION_RIGHT_CONTEXT_STEPS="${LOCAL_ATTENTION_RIGHT_CONTEXT_STEPS:-0}"
+LOCAL_ATTENTION_CHUNK_STEPS="${LOCAL_ATTENTION_CHUNK_STEPS:-10}"
+LOCAL_ATTENTION_SHIFT_STEPS="${LOCAL_ATTENTION_SHIFT_STEPS:-10}"
+LOCAL_ATTENTION_LEFT_CHUNKS="${LOCAL_ATTENTION_LEFT_CHUNKS:-}"
+if [[ "${ENABLE_LOCAL_ATTENTION_ENCODER}" == "1" ]]; then
+  echo "[2b/5] Building local-attention streaming encoder TorchScript wrapper"
+  local_encoder_ts="${ARTIFACT_DIR}/${LOCAL_ATTENTION_ENCODER_BASENAME}.ts"
+  local_encoder_manifest="${ARTIFACT_DIR}/${LOCAL_ATTENTION_ENCODER_BASENAME}-manifest.json"
+  local_encoder_streaming="${ARTIFACT_DIR}/${LOCAL_ATTENTION_ENCODER_BASENAME}-streaming.json"
+  local_encoder_cmd=(
+    "${PYTHON_BIN}" scripts/make_streaming_local_attention_encoder_torchscript.py
+    --model "${MODEL_NAME}"
+    --output-ts "${local_encoder_ts}"
+    --output-manifest "${local_encoder_manifest}"
+    --output-streaming-config "${local_encoder_streaming}"
+    --left-context-steps "${LOCAL_ATTENTION_LEFT_CONTEXT_STEPS}"
+    --right-context-steps "${LOCAL_ATTENTION_RIGHT_CONTEXT_STEPS}"
+    --chunk-steps "${LOCAL_ATTENTION_CHUNK_STEPS}"
+    --shift-steps "${LOCAL_ATTENTION_SHIFT_STEPS}"
+  )
+  if [[ -n "${LOCAL_ATTENTION_LEFT_CHUNKS}" ]]; then
+    local_encoder_cmd+=( --left-chunks "${LOCAL_ATTENTION_LEFT_CHUNKS}" )
+  fi
+  "${local_encoder_cmd[@]}"
+fi
+
+ENABLE_LOCAL_ATTENTION_PREFIX_ENCODER="${ENABLE_LOCAL_ATTENTION_PREFIX_ENCODER:-0}"
+LOCAL_ATTENTION_PREFIX_ENCODER_BASENAME="${LOCAL_ATTENTION_PREFIX_ENCODER_BASENAME:-encoder-model-local-prefix}"
+LOCAL_ATTENTION_PREFIX_LEFT_CONTEXT_STEPS="${LOCAL_ATTENTION_PREFIX_LEFT_CONTEXT_STEPS:-80}"
+LOCAL_ATTENTION_PREFIX_RIGHT_CONTEXT_STEPS="${LOCAL_ATTENTION_PREFIX_RIGHT_CONTEXT_STEPS:-0}"
+LOCAL_ATTENTION_PREFIX_INPUT_FEATURE_FRAMES="${LOCAL_ATTENTION_PREFIX_INPUT_FEATURE_FRAMES:-300}"
+if [[ "${ENABLE_LOCAL_ATTENTION_PREFIX_ENCODER}" == "1" ]]; then
+  echo "[2c/5] Building local-attention prefix encoder TorchScript wrapper"
+  local_prefix_encoder_ts="${ARTIFACT_DIR}/${LOCAL_ATTENTION_PREFIX_ENCODER_BASENAME}.ts"
+  local_prefix_encoder_manifest="${ARTIFACT_DIR}/${LOCAL_ATTENTION_PREFIX_ENCODER_BASENAME}-manifest.json"
+  "${PYTHON_BIN}" scripts/make_local_attention_encoder_torchscript.py \
+    --model "${MODEL_NAME}" \
+    --output-ts "${local_prefix_encoder_ts}" \
+    --output-manifest "${local_prefix_encoder_manifest}" \
+    --left-context-steps "${LOCAL_ATTENTION_PREFIX_LEFT_CONTEXT_STEPS}" \
+    --right-context-steps "${LOCAL_ATTENTION_PREFIX_RIGHT_CONTEXT_STEPS}" \
+    --input-feature-frames "${LOCAL_ATTENTION_PREFIX_INPUT_FEATURE_FRAMES}"
+fi
+
 shopt -s nullglob
 torchscript_files=( "${ARTIFACT_DIR}"/*.ts "${ARTIFACT_DIR}"/*.pt )
 shopt -u nullglob
