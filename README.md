@@ -174,6 +174,39 @@ PARAKEET_COREML_DECODER_SUFFIX=odmbp-approx-stateful-v2 \
 bash scripts/run_transcribe_macos_release.sh
 ```
 
+To specialize rewrite-prefix stride for one device using repeated realtime-bench runs, exact confirmed-transcript matching, and `word-vis` latency as the ranking target while preserving headroom when latency differences are negligible:
+
+```bash
+PARAKEET_COREML_MODEL_SUFFIX=odmbp-approx \
+PARAKEET_COREML_DECODER_SUFFIX=odmbp-approx-stateful-v2 \
+PARAKEET_STREAM_MODE=rewrite-prefix \
+PARAKEET_STREAM_PREFIX_LEFT_CONTEXT_FRAMES=160 \
+PARAKEET_STREAM_PREFIX_RIGHT_CONTEXT_FRAMES=0 \
+PARAKEET_STREAM_PREFIX_ALLOW_RIGHT_CONTEXT=0 \
+PARAKEET_STREAM_PREFIX_ADAPTIVE=0 \
+PARAKEET_STREAM_PREFIX_ENCODER_CACHE=1 \
+PARAKEET_STREAM_LATEST_FIRST=1 \
+PARAKEET_STREAM_CHUNK_MS=500 \
+PARAKEET_STREAM_HOP_MS=250 \
+PARAKEET_STREAM_MAX_BATCH_MS=500 \
+PARAKEET_STREAM_BACKLOG_SOFT_SEC=5.0 \
+PARAKEET_STREAM_BACKLOG_TARGET_SEC=1.5 \
+PARAKEET_DECODE_ONLY_WHEN_SPEECH=0 \
+PARAKEET_STREAM_FLUSH_ON_SPEECH_END=0 \
+python3 scripts/specialize_realtime_prefix_stride.py \
+  --audio artifacts/tmp/recording_60s.wav \
+  --repetitions 3 \
+  --latency-equivalence-ms 5 \
+  --stride 0.60 \
+  --stride 0.55 \
+  --stride 0.50 \
+  --stride 0.48 \
+  --stride 0.45 \
+  --stride 0.40
+```
+
+The script writes a JSON report, candidate summary CSV, and `recommended.env` under `artifacts/realtime-specialization-runs/<run-name>/`. By default, candidates within `5ms` of the best latency mean are treated as equivalent and the recommendation then prefers the one with the highest minimum `infer_rtfx`.
+
 ### 8) Standardized WER benchmark (OpenBench datasets)
 
 ```bash

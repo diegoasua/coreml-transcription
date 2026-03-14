@@ -202,7 +202,7 @@ struct ContentView: View {
             Text("Status: \(vm.status)")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
-            Text("Metrics: \(vm.metrics)")
+            Text("Metrics:\n\(vm.metrics)")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
 
@@ -239,7 +239,7 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
     @Published var confirmedText: String = ""
     @Published var hypothesisText: String = ""
     @Published var status: String = "Idle"
-    @Published var metrics: String = "RTFx(inf/live)=0.0/0.0 | draft-vis=n/a | conf-vis=n/a"
+    @Published var metrics: String = MicTranscriptionViewModel.emptyMetricsLine
     @Published var isRunning: Bool = false
     @Published var isStarting: Bool = false
     @Published var modelDirectory: String = defaultParakeetModelDirectoryPath()
@@ -250,6 +250,21 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
     private static let streamModeDefault = (ProcessInfo.processInfo.environment["PARAKEET_STREAM_MODE"] ?? "rewrite-prefix").lowercased()
 
     private typealias InferenceEngine = StreamingInferenceEngine<ParakeetCoreMLTDTTranscriptionModel, EnergyVAD>
+    private struct LatencyStats {
+        let current: Double?
+        let avg: Double?
+        let p95: Double?
+    }
+
+    private struct MetricsSnapshot {
+        let inferRTFx: Double
+        let wallRTFx: Double
+        let draftWordReady: LatencyStats
+        let confirmedWordReady: LatencyStats
+        let draftOnset: LatencyStats
+        let confirmedOnset: LatencyStats
+    }
+
     private var inferenceEngine: InferenceEngine?
 
     private let queue = DispatchQueue(label: "transcribe.macos.inference")
@@ -369,6 +384,11 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
     private var currentConfirmedDisplayLatencyMs: Double?
     private var draftDisplayLatencyMsSamples: [Double] = []
     private var confirmedDisplayLatencyMsSamples: [Double] = []
+    // Screen-visible latency is tracked on the main thread so it includes app queue/UI publication overhead.
+    private var currentDraftScreenLatencyMs: Double?
+    private var currentConfirmedScreenLatencyMs: Double?
+    private var draftScreenLatencyMsSamples: [Double] = []
+    private var confirmedScreenLatencyMsSamples: [Double] = []
     private let latencyDisplaySampleWindow = 256
     private var previousEventWasSpeech = false
     private var lastObservedConfirmedText = ""
@@ -378,6 +398,8 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
     private let metricsLogEnabled = (ProcessInfo.processInfo.environment["PARAKEET_METRICS_LOG"] ?? "0") != "0"
     private var inputDeviceName: String = "unknown"
     private var selectedInputChannel: Int?
+    private static let emptyMetricsLine =
+        "RTFx(inf/live)=0.0/0.0 | word-ready(d/c) n/a / n/a | screen-vis(d/c) n/a / n/a\nonset(d/c) n/a / n/a"
 
     func toggle() {
         if isRunning {
@@ -538,6 +560,10 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
         currentConfirmedDisplayLatencyMs = nil
         draftDisplayLatencyMsSamples.removeAll(keepingCapacity: false)
         confirmedDisplayLatencyMsSamples.removeAll(keepingCapacity: false)
+        currentDraftScreenLatencyMs = nil
+        currentConfirmedScreenLatencyMs = nil
+        draftScreenLatencyMsSamples.removeAll(keepingCapacity: false)
+        confirmedScreenLatencyMsSamples.removeAll(keepingCapacity: false)
         previousEventWasSpeech = false
         lastObservedConfirmedText = ""
         lastObservedHypothesisText = ""
@@ -552,7 +578,7 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
                 DispatchQueue.main.async {
                     self.confirmedText = finalConfirmed
                     self.hypothesisText = finalHypothesis
-                    self.metrics = "RTFx(inf/live)=0.0/0.0 | draft-vis=n/a | conf-vis=n/a"
+                    self.metrics = Self.emptyMetricsLine
                 }
             }
         }
@@ -577,6 +603,10 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
         currentConfirmedDisplayLatencyMs = nil
         draftDisplayLatencyMsSamples.removeAll(keepingCapacity: false)
         confirmedDisplayLatencyMsSamples.removeAll(keepingCapacity: false)
+        currentDraftScreenLatencyMs = nil
+        currentConfirmedScreenLatencyMs = nil
+        draftScreenLatencyMsSamples.removeAll(keepingCapacity: false)
+        confirmedScreenLatencyMsSamples.removeAll(keepingCapacity: false)
         previousEventWasSpeech = false
         lastObservedConfirmedText = ""
         lastObservedHypothesisText = ""
@@ -934,6 +964,8 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
                 currentSpeechConfirmedLatencyMs = nil
                 currentDraftDisplayLatencyMs = nil
                 currentConfirmedDisplayLatencyMs = nil
+                currentDraftScreenLatencyMs = nil
+                currentConfirmedScreenLatencyMs = nil
                 previousEventWasSpeech = false
                 lastObservedConfirmedText = confirmed
                 lastObservedHypothesisText = hypothesis
@@ -960,6 +992,8 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
                 inferenceEngine = engine
 
                 if let latest = events.last {
+                    var latestDraftScreenAudioCursorSec: Double?
+                    var latestConfirmedScreenAudioCursorSec: Double?
                     for event in events {
                         let eventAudioCursorSec = min(totalProcessedAudioSec, max(batchStartAudioSec, event.audioCursorSec))
                         if event.isSpeech, !previousEventWasSpeech {
@@ -986,7 +1020,7 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
                             currentSpeechDraftLatencyMs = latencyMs
                             draftLatencyMsSamples.append(latencyMs)
                             if metricsLogEnabled {
-                                fputs(String(format: "[metrics] draft-first-token=%.1f ms\n", latencyMs), stderr)
+                                fputs(String(format: "[metrics] draft-onset-latency=%.1f ms\n", latencyMs), stderr)
                             }
                         }
                         if event.transcript.hypothesis != lastObservedHypothesisText {
@@ -1001,8 +1035,9 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
                                 into: &draftDisplayLatencyMsSamples,
                                 maxCount: latencyDisplaySampleWindow
                             )
+                            latestDraftScreenAudioCursorSec = eventAudioCursorSec
                             if metricsLogEnabled {
-                                fputs(String(format: "[metrics] draft-visible-latency=%.1f ms\n", latencyMs), stderr)
+                                fputs(String(format: "[metrics] draft-word-ready-latency=%.1f ms\n", latencyMs), stderr)
                             }
                         }
                         if event.isSpeech,
@@ -1017,7 +1052,7 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
                             currentSpeechConfirmedLatencyMs = latencyMs
                             confirmedLatencyMsSamples.append(latencyMs)
                             if metricsLogEnabled {
-                                fputs(String(format: "[metrics] confirmed-latency=%.1f ms\n", latencyMs), stderr)
+                                fputs(String(format: "[metrics] confirmed-onset-latency=%.1f ms\n", latencyMs), stderr)
                             }
                         }
                         if event.transcript.confirmed != lastObservedConfirmedText {
@@ -1032,8 +1067,9 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
                                 into: &confirmedDisplayLatencyMsSamples,
                                 maxCount: latencyDisplaySampleWindow
                             )
+                            latestConfirmedScreenAudioCursorSec = eventAudioCursorSec
                             if metricsLogEnabled {
-                                fputs(String(format: "[metrics] confirmed-visible-latency=%.1f ms\n", latencyMs), stderr)
+                                fputs(String(format: "[metrics] confirmed-word-ready-latency=%.1f ms\n", latencyMs), stderr)
                             }
                         }
                         if event.didFlushSegment, let startedAtAudioSec = currentSpeechStartedAtAudioSec {
@@ -1046,7 +1082,7 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
                                 currentSpeechConfirmedLatencyMs = latencyMs
                                 confirmedLatencyMsSamples.append(latencyMs)
                                 if metricsLogEnabled {
-                                    fputs(String(format: "[metrics] confirmed-latency-flush=%.1f ms\n", latencyMs), stderr)
+                                    fputs(String(format: "[metrics] confirmed-onset-latency-flush=%.1f ms\n", latencyMs), stderr)
                                 }
                             }
                             currentSpeechStartedAtAudioSec = nil
@@ -1060,19 +1096,10 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
                         lastObservedHypothesisText = event.transcript.hypothesis
                     }
 
-                    let draftCurrent = currentDraftDisplayLatencyMs ?? draftDisplayLatencyMsSamples.last
-                    let draftAvg = draftDisplayLatencyMsSamples.isEmpty ? nil : draftDisplayLatencyMsSamples.reduce(0, +) / Double(draftDisplayLatencyMsSamples.count)
-                    let draftP95 = Self.percentile(draftDisplayLatencyMsSamples, q: 0.95)
-                    let confirmedCurrent = currentConfirmedDisplayLatencyMs ?? confirmedDisplayLatencyMsSamples.last
-                    let confirmedAvg = confirmedDisplayLatencyMsSamples.isEmpty ? nil : confirmedDisplayLatencyMsSamples.reduce(0, +) / Double(confirmedDisplayLatencyMsSamples.count)
-                    let confirmedP95 = Self.percentile(confirmedDisplayLatencyMsSamples, q: 0.95)
-                    let metricsLine = String(
-                        format: "RTFx(inf/live)=%.1f/%.1f | draft-vis %@ | conf-vis %@",
-                        inferRTFx,
-                        wallRTFx,
-                        Self.formatLatency(current: draftCurrent, avg: draftAvg, p95: draftP95),
-                        Self.formatLatency(current: confirmedCurrent, avg: confirmedAvg, p95: confirmedP95)
-                    )
+                    let metricsSnapshot = metricsSnapshot(inferRTFx: inferRTFx, wallRTFx: wallRTFx)
+                    let captureStartedAtSecLocal = captureStartedAtSec
+                    let latestDraftScreenAudioCursorSecLocal = latestDraftScreenAudioCursorSec
+                    let latestConfirmedScreenAudioCursorSecLocal = latestConfirmedScreenAudioCursorSec
 
                     // For UI responsiveness, prefer the newest non-flush event for
                     // display; flush events are still useful for finalization but
@@ -1090,27 +1117,50 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
                         queuedAfterPopSec
                     )
                     DispatchQueue.main.async {
+                        let screenObservedAtSec = CFAbsoluteTimeGetCurrent()
+                        if let audioCursorSec = latestDraftScreenAudioCursorSecLocal {
+                            let latencyMs = Self.visibleTextLatencyMs(
+                                captureStartedAtSec: captureStartedAtSecLocal,
+                                observedAtSec: screenObservedAtSec,
+                                audioCursorSec: audioCursorSec
+                            )
+                            self.currentDraftScreenLatencyMs = latencyMs
+                            Self.appendRollingSample(
+                                latencyMs,
+                                into: &self.draftScreenLatencyMsSamples,
+                                maxCount: self.latencyDisplaySampleWindow
+                            )
+                            if self.metricsLogEnabled {
+                                fputs(String(format: "[metrics] draft-screen-latency=%.1f ms\n", latencyMs), stderr)
+                            }
+                        }
+                        if let audioCursorSec = latestConfirmedScreenAudioCursorSecLocal {
+                            let latencyMs = Self.visibleTextLatencyMs(
+                                captureStartedAtSec: captureStartedAtSecLocal,
+                                observedAtSec: screenObservedAtSec,
+                                audioCursorSec: audioCursorSec
+                            )
+                            self.currentConfirmedScreenLatencyMs = latencyMs
+                            Self.appendRollingSample(
+                                latencyMs,
+                                into: &self.confirmedScreenLatencyMsSamples,
+                                maxCount: self.latencyDisplaySampleWindow
+                            )
+                            if self.metricsLogEnabled {
+                                fputs(String(format: "[metrics] confirmed-screen-latency=%.1f ms\n", latencyMs), stderr)
+                            }
+                        }
                         self.confirmedText = latestConfirmed
                         self.hypothesisText = latestHypothesis
                         self.status = statusLine
-                        self.metrics = metricsLine
+                        self.metrics = self.metricsLine(snapshot: metricsSnapshot)
                     }
                 } else {
-                    let draftAvg = draftDisplayLatencyMsSamples.isEmpty ? nil : draftDisplayLatencyMsSamples.reduce(0, +) / Double(draftDisplayLatencyMsSamples.count)
-                    let draftP95 = Self.percentile(draftDisplayLatencyMsSamples, q: 0.95)
-                    let confirmedAvg = confirmedDisplayLatencyMsSamples.isEmpty ? nil : confirmedDisplayLatencyMsSamples.reduce(0, +) / Double(confirmedDisplayLatencyMsSamples.count)
-                    let confirmedP95 = Self.percentile(confirmedDisplayLatencyMsSamples, q: 0.95)
-                    let metricsLine = String(
-                        format: "RTFx(inf/live)=%.1f/%.1f | draft-vis %@ | conf-vis %@",
-                        inferRTFx,
-                        wallRTFx,
-                        Self.formatLatency(current: nil, avg: draftAvg, p95: draftP95),
-                        Self.formatLatency(current: nil, avg: confirmedAvg, p95: confirmedP95)
-                    )
+                    let metricsSnapshot = metricsSnapshot(inferRTFx: inferRTFx, wallRTFx: wallRTFx)
                     let statusLine = String(format: "Listening... | inf %.1fx | wall %.1fx | queue %.1fs", inferRTFx, wallRTFx, queuedAfterPopSec)
                     DispatchQueue.main.async {
                         self.status = statusLine
-                        self.metrics = metricsLine
+                        self.metrics = self.metricsLine(snapshot: metricsSnapshot)
                     }
                 }
             } catch {
@@ -1159,6 +1209,89 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
         guard captureStartedAtSec > 0 else { return 0 }
         let audioCaptureTime = captureStartedAtSec + max(0, audioCursorSec)
         return max(0, (observedAtSec - audioCaptureTime) * 1000.0)
+    }
+
+    private func metricsSnapshot(inferRTFx: Double, wallRTFx: Double) -> MetricsSnapshot {
+        MetricsSnapshot(
+            inferRTFx: inferRTFx,
+            wallRTFx: wallRTFx,
+            draftWordReady: Self.latencyStats(
+                current: currentDraftDisplayLatencyMs ?? draftDisplayLatencyMsSamples.last,
+                samples: draftDisplayLatencyMsSamples
+            ),
+            confirmedWordReady: Self.latencyStats(
+                current: currentConfirmedDisplayLatencyMs ?? confirmedDisplayLatencyMsSamples.last,
+                samples: confirmedDisplayLatencyMsSamples
+            ),
+            draftOnset: Self.latencyStats(
+                current: currentSpeechDraftLatencyMs ?? draftLatencyMsSamples.last,
+                samples: draftLatencyMsSamples
+            ),
+            confirmedOnset: Self.latencyStats(
+                current: currentSpeechConfirmedLatencyMs ?? confirmedLatencyMsSamples.last,
+                samples: confirmedLatencyMsSamples
+            )
+        )
+    }
+
+    private static func latencyStats(current: Double?, samples: [Double]) -> LatencyStats {
+        LatencyStats(
+            current: current,
+            avg: average(samples),
+            p95: percentile(samples, q: 0.95)
+        )
+    }
+
+    private func metricsLine(snapshot: MetricsSnapshot) -> String {
+        let draftScreen = Self.latencyStats(
+            current: currentDraftScreenLatencyMs ?? draftScreenLatencyMsSamples.last,
+            samples: draftScreenLatencyMsSamples
+        )
+        let confirmedScreen = Self.latencyStats(
+            current: currentConfirmedScreenLatencyMs ?? confirmedScreenLatencyMsSamples.last,
+            samples: confirmedScreenLatencyMsSamples
+        )
+
+        return String(
+            format: "RTFx(inf/live)=%.1f/%.1f | word-ready(d/c) %@ / %@ | screen-vis(d/c) %@ / %@\nonset(d/c) %@ / %@",
+            snapshot.inferRTFx,
+            snapshot.wallRTFx,
+            Self.formatLatency(
+                current: snapshot.draftWordReady.current,
+                avg: snapshot.draftWordReady.avg,
+                p95: snapshot.draftWordReady.p95
+            ),
+            Self.formatLatency(
+                current: snapshot.confirmedWordReady.current,
+                avg: snapshot.confirmedWordReady.avg,
+                p95: snapshot.confirmedWordReady.p95
+            ),
+            Self.formatLatency(
+                current: draftScreen.current,
+                avg: draftScreen.avg,
+                p95: draftScreen.p95
+            ),
+            Self.formatLatency(
+                current: confirmedScreen.current,
+                avg: confirmedScreen.avg,
+                p95: confirmedScreen.p95
+            ),
+            Self.formatLatency(
+                current: snapshot.draftOnset.current,
+                avg: snapshot.draftOnset.avg,
+                p95: snapshot.draftOnset.p95
+            ),
+            Self.formatLatency(
+                current: snapshot.confirmedOnset.current,
+                avg: snapshot.confirmedOnset.avg,
+                p95: snapshot.confirmedOnset.p95
+            )
+        )
+    }
+
+    private static func average(_ values: [Double]) -> Double? {
+        guard !values.isEmpty else { return nil }
+        return values.reduce(0, +) / Double(values.count)
     }
 
     private static func formatLatency(current: Double?, avg: Double?, p95: Double?) -> String {

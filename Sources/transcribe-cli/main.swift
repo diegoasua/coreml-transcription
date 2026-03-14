@@ -620,6 +620,8 @@ func runRealtimeBenchmark(
     var draftFirstTokenMs: [Double] = []
     var mergedFirstTokenMs: [Double] = []
     var confirmedMs: [Double] = []
+    var draftWordVisibleMs: [Double] = []
+    var confirmedWordVisibleMs: [Double] = []
     var corrections = 0
     var lastConfirmed = ""
     var lastHypothesis = ""
@@ -787,6 +789,12 @@ func runRealtimeBenchmark(
                 confirmedMs.append(max(0, (batchEndTimeSec - startAudio) * 1000.0))
                 speechConfirmedRecorded = true
             }
+            if event.transcript.hypothesis != lastHypothesis {
+                draftWordVisibleMs.append(max(0, (batchEndTimeSec - eventAudioCursorSec) * 1000.0))
+            }
+            if event.transcript.confirmed != lastConfirmed {
+                confirmedWordVisibleMs.append(max(0, (batchEndTimeSec - eventAudioCursorSec) * 1000.0))
+            }
             if merged != lastMerged || event.transcript.confirmed != lastConfirmed {
                 transcriptCursorSec = max(transcriptCursorSec, eventAudioCursorSec)
             }
@@ -872,22 +880,27 @@ func runRealtimeBenchmark(
             let ingestedAudioSec = min(totalAudioSec, Double(arrivalIndex) * hopSec)
             let inferRTFx = ingestedAudioSec / max(totalInferSec, 1e-9)
             let wallRTFx = ingestedAudioSec / max(currentTimeSec, 1e-9)
-            let firstSeries = draftFirstTokenMs.isEmpty ? mergedFirstTokenMs : draftFirstTokenMs
-            let firstNow = firstSeries.last ?? -1
-            let firstAvg = firstSeries.isEmpty ? -1 : (firstSeries.reduce(0, +) / Double(firstSeries.count))
-            let firstWorst = firstSeries.max() ?? -1
+            let onsetSeries = draftFirstTokenMs.isEmpty ? mergedFirstTokenMs : draftFirstTokenMs
+            let onsetNow = onsetSeries.last ?? -1
+            let onsetAvg = onsetSeries.isEmpty ? -1 : (onsetSeries.reduce(0, +) / Double(onsetSeries.count))
+            let onsetWorst = onsetSeries.max() ?? -1
+            let wordSeries = draftWordVisibleMs.isEmpty ? confirmedWordVisibleMs : draftWordVisibleMs
+            let wordNow = wordSeries.last ?? -1
+            let wordAvg = wordSeries.isEmpty ? -1 : (wordSeries.reduce(0, +) / Double(wordSeries.count))
             logProgress(
                 String(
-                    format: "realtime-bench t=%.2fs audio=%.2fs transcript=%.2fs queue=%.2fs inf=%.2fx wall=%.2fx first=%.0fms avg=%.0f worst=%.0f drops=%d",
+                    format: "realtime-bench t=%.2fs audio=%.2fs transcript=%.2fs queue=%.2fs inf=%.2fx wall=%.2fx onset=%.0fms avg=%.0f worst=%.0f word=%.0fms avg=%.0f drops=%d",
                     currentTimeSec,
                     ingestedAudioSec,
                     transcriptCursorSec,
                     queueSec,
                     inferRTFx,
                     wallRTFx,
-                    firstNow,
-                    firstAvg,
-                    firstWorst,
+                    onsetNow,
+                    onsetAvg,
+                    onsetWorst,
+                    wordNow,
+                    wordAvg,
                     droppedChunks
                 )
             )
@@ -924,6 +937,8 @@ func runRealtimeBenchmark(
     let draftFirstP95 = percentile(draftFirstTokenMs, q: 0.95)
     let mergedFirstP95 = percentile(mergedFirstTokenMs, q: 0.95)
     let confirmedP95 = percentile(confirmedMs, q: 0.95) ?? .infinity
+    let draftWordVisibleP95 = percentile(draftWordVisibleMs, q: 0.95)
+    let confirmedWordVisibleP95 = percentile(confirmedWordVisibleMs, q: 0.95)
     let correctionsPerMin = totalAudioSec > 0 ? (Double(corrections) / totalAudioSec) * 60.0 : 0.0
 
     let passQueue = maxQueueSecObserved <= args.queuePassSec
@@ -949,10 +964,18 @@ func runRealtimeBenchmark(
         "draft_first_token_ms_p95": (draftFirstP95 != nil && draftFirstP95!.isFinite) ? draftFirstP95! : NSNull(),
         "merged_first_token_ms_p95": (mergedFirstP95 != nil && mergedFirstP95!.isFinite) ? mergedFirstP95! : NSNull(),
         "confirmed_latency_ms_p95": confirmedP95.isFinite ? confirmedP95 : NSNull(),
+        "draft_onset_latency_ms_p95": (draftFirstP95 != nil && draftFirstP95!.isFinite) ? draftFirstP95! : NSNull(),
+        "confirmed_onset_latency_ms_p95": confirmedP95.isFinite ? confirmedP95 : NSNull(),
+        "draft_word_vis_ms_p95": (draftWordVisibleP95 != nil && draftWordVisibleP95!.isFinite) ? draftWordVisibleP95! : NSNull(),
+        "confirmed_word_vis_ms_p95": (confirmedWordVisibleP95 != nil && confirmedWordVisibleP95!.isFinite) ? confirmedWordVisibleP95! : NSNull(),
         "first_token_ms_avg": firstTokenSeries.isEmpty ? NSNull() : (firstTokenSeries.reduce(0, +) / Double(firstTokenSeries.count)),
         "draft_first_token_ms_avg": draftFirstTokenMs.isEmpty ? NSNull() : (draftFirstTokenMs.reduce(0, +) / Double(draftFirstTokenMs.count)),
         "merged_first_token_ms_avg": mergedFirstTokenMs.isEmpty ? NSNull() : (mergedFirstTokenMs.reduce(0, +) / Double(mergedFirstTokenMs.count)),
         "confirmed_latency_ms_avg": confirmedMs.isEmpty ? NSNull() : (confirmedMs.reduce(0, +) / Double(confirmedMs.count)),
+        "draft_onset_latency_ms_avg": draftFirstTokenMs.isEmpty ? NSNull() : (draftFirstTokenMs.reduce(0, +) / Double(draftFirstTokenMs.count)),
+        "confirmed_onset_latency_ms_avg": confirmedMs.isEmpty ? NSNull() : (confirmedMs.reduce(0, +) / Double(confirmedMs.count)),
+        "draft_word_vis_ms_avg": draftWordVisibleMs.isEmpty ? NSNull() : (draftWordVisibleMs.reduce(0, +) / Double(draftWordVisibleMs.count)),
+        "confirmed_word_vis_ms_avg": confirmedWordVisibleMs.isEmpty ? NSNull() : (confirmedWordVisibleMs.reduce(0, +) / Double(confirmedWordVisibleMs.count)),
         "corrections": corrections,
         "corrections_per_min": correctionsPerMin,
         "infer_rtfx": inferRTFx,
