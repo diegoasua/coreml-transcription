@@ -2,6 +2,10 @@
 
 Apple-first real-time transcription playground for Parakeet v2 (starting on macOS, then iOS).
 
+## License
+
+MIT. See [LICENSE](/Users/diegoasua/Developer/coreml-transcription/LICENSE).
+
 This repo is set up to do three things:
 
 1. Export Parakeet from NeMo into ONNX/TorchScript artifacts you control.
