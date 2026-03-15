@@ -207,6 +207,14 @@ python3 scripts/specialize_realtime_prefix_stride.py \
 
 The script writes a JSON report, candidate summary CSV, and `recommended.env` under `artifacts/realtime-specialization-runs/<run-name>/`. By default, candidates within `5ms` of the best latency mean are treated as equivalent and the recommendation then prefers the one with the highest minimum `infer_rtfx`.
 
+Realtime metric contract:
+- Track this in CLI benches: `draft_ready_latency_ms_avg` and `draft_ready_latency_ms_p95`. These are audio ingress -> draft/hypothesis update ready, and are the primary benchmark latency KPIs.
+- Track this in the app for UX: `ingest->screen(d)` avg and p95. This is audio ingress -> published draft text, including app/UI overhead.
+- `ingest->ready(d)` in the app is the app-side equivalent of CLI `draft_ready_latency_ms_*`. Use it when comparing app vs bench without UI overhead mixed in.
+- `ingest->screen(f)` / `final_confirmed_*` mean true final segment finalization only. They are informational, can be sparse, and are not the primary live latency KPI.
+- `draft_onset_latency_ms_*`: speech-start ingress -> first visible draft text for that utterance.
+- Legacy `confirmed_*` keys in `summary.json` are retained as aliases, but now mean true `final_confirmed_*`, not preview-stable text. Do not use them as the primary KPI.
+
 ### 8) Standardized WER benchmark (OpenBench datasets)
 
 ```bash

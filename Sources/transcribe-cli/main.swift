@@ -616,12 +616,12 @@ func runRealtimeBenchmark(
     var speechBaselineConfirmed = ""
     var speechDraftFirstTokenRecorded = false
     var speechMergedFirstTokenRecorded = false
-    var speechConfirmedRecorded = false
+    var speechFinalConfirmedRecorded = false
     var draftFirstTokenMs: [Double] = []
     var mergedFirstTokenMs: [Double] = []
-    var confirmedMs: [Double] = []
+    var finalConfirmedMs: [Double] = []
     var draftReadyLatencyMs: [Double] = []
-    var confirmedReadyLatencyMs: [Double] = []
+    var finalConfirmedReadyLatencyMs: [Double] = []
     var corrections = 0
     var lastConfirmed = ""
     var lastHypothesis = ""
@@ -739,7 +739,7 @@ func runRealtimeBenchmark(
             speechBaselineConfirmed = ""
             speechDraftFirstTokenRecorded = false
             speechMergedFirstTokenRecorded = false
-            speechConfirmedRecorded = false
+            speechFinalConfirmedRecorded = false
         }
 
         let batchStartTimeSec = currentTimeSec
@@ -777,7 +777,7 @@ func runRealtimeBenchmark(
                 speechBaselineConfirmed = preEventConfirmed
                 speechDraftFirstTokenRecorded = false
                 speechMergedFirstTokenRecorded = false
-                speechConfirmedRecorded = false
+                speechFinalConfirmedRecorded = false
             }
             if event.isSpeech,
                let startSampleCursor = speechStartSampleCursor,
@@ -795,30 +795,23 @@ func runRealtimeBenchmark(
                 mergedFirstTokenMs.append(max(0, (batchEndTimeSec - startIngressTimeSec) * 1000.0))
                 speechMergedFirstTokenRecorded = true
             }
-            if event.isSpeech,
-               let startSampleCursor = speechStartSampleCursor,
-               !speechConfirmedRecorded,
-               event.transcript.confirmed != speechBaselineConfirmed,
-               let startIngressTimeSec = ingressTimeline.ingressTime(forSampleCursor: startSampleCursor) {
-                confirmedMs.append(max(0, (batchEndTimeSec - startIngressTimeSec) * 1000.0))
-                speechConfirmedRecorded = true
-            }
             if event.transcript.hypothesis != lastHypothesis,
                let eventIngressTimeSec {
                 draftReadyLatencyMs.append(max(0, (batchEndTimeSec - eventIngressTimeSec) * 1000.0))
-            }
-            if event.transcript.confirmed != lastConfirmed,
-               let eventIngressTimeSec {
-                confirmedReadyLatencyMs.append(max(0, (batchEndTimeSec - eventIngressTimeSec) * 1000.0))
             }
             if merged != lastMerged || event.transcript.confirmed != lastConfirmed {
                 transcriptCursorSec = max(transcriptCursorSec, eventAudioCursorSec)
             }
             if event.didFlushSegment, let startSampleCursor = speechStartSampleCursor {
-                if !speechConfirmedRecorded,
+                if event.transcript.confirmed != lastConfirmed,
+                   let eventIngressTimeSec {
+                    finalConfirmedReadyLatencyMs.append(max(0, (batchEndTimeSec - eventIngressTimeSec) * 1000.0))
+                }
+                if !speechFinalConfirmedRecorded,
+                   event.transcript.confirmed != speechBaselineConfirmed,
                    let startIngressTimeSec = ingressTimeline.ingressTime(forSampleCursor: startSampleCursor) {
-                    confirmedMs.append(max(0, (batchEndTimeSec - startIngressTimeSec) * 1000.0))
-                    speechConfirmedRecorded = true
+                    finalConfirmedMs.append(max(0, (batchEndTimeSec - startIngressTimeSec) * 1000.0))
+                    speechFinalConfirmedRecorded = true
                 }
                 transcriptCursorSec = max(transcriptCursorSec, eventAudioCursorSec)
                 speechStartSampleCursor = nil
@@ -827,7 +820,7 @@ func runRealtimeBenchmark(
                 speechBaselineConfirmed = ""
                 speechDraftFirstTokenRecorded = false
                 speechMergedFirstTokenRecorded = false
-                speechConfirmedRecorded = false
+                speechFinalConfirmedRecorded = false
             }
             if event.transcript.confirmed == lastConfirmed,
                event.transcript.hypothesis != lastHypothesis,
@@ -901,7 +894,7 @@ func runRealtimeBenchmark(
             let onsetNow = onsetSeries.last ?? -1
             let onsetAvg = onsetSeries.isEmpty ? -1 : (onsetSeries.reduce(0, +) / Double(onsetSeries.count))
             let onsetWorst = onsetSeries.max() ?? -1
-            let readySeries = draftReadyLatencyMs.isEmpty ? confirmedReadyLatencyMs : draftReadyLatencyMs
+            let readySeries = draftReadyLatencyMs
             let readyNow = readySeries.last ?? -1
             let readyAvg = readySeries.isEmpty ? -1 : (readySeries.reduce(0, +) / Double(readySeries.count))
             logProgress(
@@ -938,8 +931,13 @@ func runRealtimeBenchmark(
        let pendingStartIngressTimeSec = ingressTimeline.ingressTime(forSampleCursor: pendingStartSampleCursor) {
         let anyText = !finalState.confirmed.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
             !finalState.hypothesis.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        if anyText, !speechConfirmedRecorded {
-            confirmedMs.append(max(0, (currentTimeSec - pendingStartIngressTimeSec) * 1000.0))
+        if anyText, !speechFinalConfirmedRecorded {
+            finalConfirmedMs.append(max(0, (currentTimeSec - pendingStartIngressTimeSec) * 1000.0))
+            if let finalIngressTimeSec = ingressTimeline.ingressTime(
+                forSampleCursor: Int(round(totalAudioSec * Double(sampleRate)))
+            ) {
+                finalConfirmedReadyLatencyMs.append(max(0, (currentTimeSec - finalIngressTimeSec) * 1000.0))
+            }
         }
     }
     if !finalState.confirmed.isEmpty {
@@ -954,15 +952,15 @@ func runRealtimeBenchmark(
     let firstP95 = percentile(firstTokenSeries, q: 0.95) ?? .infinity
     let draftFirstP95 = percentile(draftFirstTokenMs, q: 0.95)
     let mergedFirstP95 = percentile(mergedFirstTokenMs, q: 0.95)
-    let confirmedP95 = percentile(confirmedMs, q: 0.95) ?? .infinity
+    let finalConfirmedP95 = percentile(finalConfirmedMs, q: 0.95) ?? .infinity
     let draftReadyP95 = percentile(draftReadyLatencyMs, q: 0.95)
-    let confirmedReadyP95 = percentile(confirmedReadyLatencyMs, q: 0.95)
+    let finalConfirmedReadyP95 = percentile(finalConfirmedReadyLatencyMs, q: 0.95)
     let correctionsPerMin = totalAudioSec > 0 ? (Double(corrections) / totalAudioSec) * 60.0 : 0.0
 
     let passQueue = maxQueueSecObserved <= args.queuePassSec
     let passFirst = firstP95 <= args.firstTokenPassMs
-    let passConfirmed = confirmedP95 <= args.confirmedPassMs
-    let overallPass = passQueue && passFirst && passConfirmed
+    let passFinalConfirmed = finalConfirmedP95 <= args.confirmedPassMs
+    let overallPass = passQueue && passFirst
 
     let summary: [String: Any] = [
         "mode": "realtime_bench",
@@ -981,23 +979,30 @@ func runRealtimeBenchmark(
         "first_token_ms_p95": firstP95.isFinite ? firstP95 : NSNull(),
         "draft_first_token_ms_p95": (draftFirstP95 != nil && draftFirstP95!.isFinite) ? draftFirstP95! : NSNull(),
         "merged_first_token_ms_p95": (mergedFirstP95 != nil && mergedFirstP95!.isFinite) ? mergedFirstP95! : NSNull(),
-        "confirmed_latency_ms_p95": confirmedP95.isFinite ? confirmedP95 : NSNull(),
+        "final_confirmed_latency_ms_p95": finalConfirmedP95.isFinite ? finalConfirmedP95 : NSNull(),
         "draft_onset_latency_ms_p95": (draftFirstP95 != nil && draftFirstP95!.isFinite) ? draftFirstP95! : NSNull(),
-        "confirmed_onset_latency_ms_p95": confirmedP95.isFinite ? confirmedP95 : NSNull(),
+        "final_confirmed_onset_latency_ms_p95": finalConfirmedP95.isFinite ? finalConfirmedP95 : NSNull(),
         "draft_ready_latency_ms_p95": (draftReadyP95 != nil && draftReadyP95!.isFinite) ? draftReadyP95! : NSNull(),
-        "confirmed_ready_latency_ms_p95": (confirmedReadyP95 != nil && confirmedReadyP95!.isFinite) ? confirmedReadyP95! : NSNull(),
+        "final_confirmed_ready_latency_ms_p95": (finalConfirmedReadyP95 != nil && finalConfirmedReadyP95!.isFinite) ? finalConfirmedReadyP95! : NSNull(),
         "first_token_ms_avg": firstTokenSeries.isEmpty ? NSNull() : (firstTokenSeries.reduce(0, +) / Double(firstTokenSeries.count)),
         "draft_first_token_ms_avg": draftFirstTokenMs.isEmpty ? NSNull() : (draftFirstTokenMs.reduce(0, +) / Double(draftFirstTokenMs.count)),
         "merged_first_token_ms_avg": mergedFirstTokenMs.isEmpty ? NSNull() : (mergedFirstTokenMs.reduce(0, +) / Double(mergedFirstTokenMs.count)),
-        "confirmed_latency_ms_avg": confirmedMs.isEmpty ? NSNull() : (confirmedMs.reduce(0, +) / Double(confirmedMs.count)),
+        "final_confirmed_latency_ms_avg": finalConfirmedMs.isEmpty ? NSNull() : (finalConfirmedMs.reduce(0, +) / Double(finalConfirmedMs.count)),
         "draft_onset_latency_ms_avg": draftFirstTokenMs.isEmpty ? NSNull() : (draftFirstTokenMs.reduce(0, +) / Double(draftFirstTokenMs.count)),
-        "confirmed_onset_latency_ms_avg": confirmedMs.isEmpty ? NSNull() : (confirmedMs.reduce(0, +) / Double(confirmedMs.count)),
+        "final_confirmed_onset_latency_ms_avg": finalConfirmedMs.isEmpty ? NSNull() : (finalConfirmedMs.reduce(0, +) / Double(finalConfirmedMs.count)),
         "draft_ready_latency_ms_avg": draftReadyLatencyMs.isEmpty ? NSNull() : (draftReadyLatencyMs.reduce(0, +) / Double(draftReadyLatencyMs.count)),
-        "confirmed_ready_latency_ms_avg": confirmedReadyLatencyMs.isEmpty ? NSNull() : (confirmedReadyLatencyMs.reduce(0, +) / Double(confirmedReadyLatencyMs.count)),
+        "final_confirmed_ready_latency_ms_avg": finalConfirmedReadyLatencyMs.isEmpty ? NSNull() : (finalConfirmedReadyLatencyMs.reduce(0, +) / Double(finalConfirmedReadyLatencyMs.count)),
+        // Legacy aliases: these now refer to actual final segment finalization only.
+        "confirmed_latency_ms_p95": finalConfirmedP95.isFinite ? finalConfirmedP95 : NSNull(),
+        "confirmed_onset_latency_ms_p95": finalConfirmedP95.isFinite ? finalConfirmedP95 : NSNull(),
+        "confirmed_ready_latency_ms_p95": (finalConfirmedReadyP95 != nil && finalConfirmedReadyP95!.isFinite) ? finalConfirmedReadyP95! : NSNull(),
+        "confirmed_latency_ms_avg": finalConfirmedMs.isEmpty ? NSNull() : (finalConfirmedMs.reduce(0, +) / Double(finalConfirmedMs.count)),
+        "confirmed_onset_latency_ms_avg": finalConfirmedMs.isEmpty ? NSNull() : (finalConfirmedMs.reduce(0, +) / Double(finalConfirmedMs.count)),
+        "confirmed_ready_latency_ms_avg": finalConfirmedReadyLatencyMs.isEmpty ? NSNull() : (finalConfirmedReadyLatencyMs.reduce(0, +) / Double(finalConfirmedReadyLatencyMs.count)),
         "draft_word_vis_ms_p95": (draftReadyP95 != nil && draftReadyP95!.isFinite) ? draftReadyP95! : NSNull(),
-        "confirmed_word_vis_ms_p95": (confirmedReadyP95 != nil && confirmedReadyP95!.isFinite) ? confirmedReadyP95! : NSNull(),
+        "confirmed_word_vis_ms_p95": NSNull(),
         "draft_word_vis_ms_avg": draftReadyLatencyMs.isEmpty ? NSNull() : (draftReadyLatencyMs.reduce(0, +) / Double(draftReadyLatencyMs.count)),
-        "confirmed_word_vis_ms_avg": confirmedReadyLatencyMs.isEmpty ? NSNull() : (confirmedReadyLatencyMs.reduce(0, +) / Double(confirmedReadyLatencyMs.count)),
+        "confirmed_word_vis_ms_avg": NSNull(),
         "corrections": corrections,
         "corrections_per_min": correctionsPerMin,
         "infer_rtfx": inferRTFx,
@@ -1010,13 +1015,26 @@ func runRealtimeBenchmark(
         "thresholds": [
             "queue_pass_sec": args.queuePassSec,
             "first_token_pass_ms": args.firstTokenPassMs,
+            "final_confirmed_pass_ms": args.confirmedPassMs,
             "confirmed_pass_ms": args.confirmedPassMs
+        ],
+        "metric_contract": [
+            "cli_primary_kpi": "draft_ready_latency_ms_avg / p95",
+            "draft_ready": "audio ingress -> draft update ready",
+            "draft_onset": "speech-start ingress -> first draft text",
+            "final_confirmed_ready": "audio ingress -> actual segment finalization ready",
+            "final_confirmed_onset": "speech-start ingress -> actual segment finalization",
+            "app_ready_metric": "ingest->ready(d): audio ingress -> draft update ready",
+            "app_screen_metric": "app-only; audio ingress -> text published to UI",
+            "app_primary_kpi": "ingest->screen(d) avg / p95",
+            "overall_pass": "uses queue + draft latency only; final-confirmed latency is informational"
         ],
         "pass": overallPass,
         "pass_breakdown": [
             "queue": passQueue,
             "first_token": passFirst,
-            "confirmed": passConfirmed
+            "final_confirmed": passFinalConfirmed,
+            "confirmed": passFinalConfirmed
         ],
         "final_confirmed_len": finalState.confirmed.count,
         "final_hypothesis_len": finalState.hypothesis.count,
