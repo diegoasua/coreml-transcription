@@ -2752,10 +2752,13 @@ private extension ParakeetCoreMLTDTTranscriptionModel {
     }
 
     static func compiledModelURL(for sourceURL: URL) throws -> URL {
-        let cacheDir = sourceURL.deletingLastPathComponent().appendingPathComponent(".mlmodelc-cache", isDirectory: true)
+        let cacheDir = try compiledModelCacheDirectory()
         try FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
 
-        let cacheName = sourceURL.lastPathComponent.replacingOccurrences(of: ".", with: "_") + ".mlmodelc"
+        let cacheName = sourceURL.lastPathComponent.replacingOccurrences(of: ".", with: "_")
+            + "-"
+            + stablePathDigest(sourceURL.standardizedFileURL.path)
+            + ".mlmodelc"
         let cachedURL = cacheDir.appendingPathComponent(cacheName, isDirectory: true)
 
         if FileManager.default.fileExists(atPath: cachedURL.path), try isCachedCompiledModelCurrent(cachedURL: cachedURL, sourceURL: sourceURL) {
@@ -2768,6 +2771,29 @@ private extension ParakeetCoreMLTDTTranscriptionModel {
         }
         try FileManager.default.copyItem(at: compiledTempURL, to: cachedURL)
         return cachedURL
+    }
+
+    static func compiledModelCacheDirectory() throws -> URL {
+        let fm = FileManager.default
+        let baseURL: URL
+        if let caches = fm.urls(for: .cachesDirectory, in: .userDomainMask).first {
+            baseURL = caches
+        } else {
+            baseURL = fm.temporaryDirectory
+        }
+        let bundleID = Bundle.main.bundleIdentifier ?? "RealtimeTranscriptionCore"
+        return baseURL
+            .appendingPathComponent(bundleID, isDirectory: true)
+            .appendingPathComponent("CoreMLCompiledModels", isDirectory: true)
+    }
+
+    static func stablePathDigest(_ string: String) -> String {
+        var hash: UInt64 = 0xcbf29ce484222325
+        for byte in string.utf8 {
+            hash ^= UInt64(byte)
+            hash = hash &* 0x100000001b3
+        }
+        return String(format: "%016llx", hash)
     }
 
     static func isCachedCompiledModelCurrent(cachedURL: URL, sourceURL: URL) throws -> Bool {

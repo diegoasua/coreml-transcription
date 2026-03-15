@@ -18,6 +18,15 @@ private final class ConversionInputState: @unchecked Sendable {
     var consumed = false
 }
 
+#if os(macOS)
+private func isAppSandboxed() -> Bool {
+    let env = ProcessInfo.processInfo.environment
+    return env["APP_SANDBOX_CONTAINER_ID"]?.isEmpty == false
+}
+#else
+private func isAppSandboxed() -> Bool { false }
+#endif
+
 #if os(macOS) && canImport(CoreAudio)
 private func defaultInputDeviceName() -> String? {
     var deviceID = AudioDeviceID(0)
@@ -69,9 +78,23 @@ private func defaultImportedParakeetModelDirectory() -> URL? {
     if let docs = fm.urls(for: .documentDirectory, in: .userDomainMask).first {
         return docs.appendingPathComponent("parakeet-tdt-0.6b-v2", isDirectory: true)
     }
+    #elseif os(macOS)
+    if isAppSandboxed(),
+       let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
+        let appID = Bundle.main.bundleIdentifier ?? "TranscribeAppleAppSupport"
+        return appSupport
+            .appendingPathComponent(appID, isDirectory: true)
+            .appendingPathComponent("parakeet-tdt-0.6b-v2", isDirectory: true)
+    }
     #endif
     return nil
 }
+
+#if os(macOS)
+private func isRunningFromAppBundle() -> Bool {
+    Bundle.main.bundleURL.pathExtension.lowercased() == "app"
+}
+#endif
 
 private func parakeetModelDirectoryCandidates() -> [URL] {
     let env = ProcessInfo.processInfo.environment
@@ -183,6 +206,11 @@ private func defaultParakeetModelDirectoryPath() -> String {
     let defaultSuffix = ProcessInfo.processInfo.environment["PARAKEET_COREML_MODEL_SUFFIX"] ?? "odmbp-approx"
     let encoderSuffix = ProcessInfo.processInfo.environment["PARAKEET_COREML_ENCODER_SUFFIX"]
     let decoderSuffix = ProcessInfo.processInfo.environment["PARAKEET_COREML_DECODER_SUFFIX"]
+    #if os(macOS)
+    if isAppSandboxed(), let imported = defaultImportedParakeetModelDirectory() {
+        return imported.path
+    }
+    #endif
     if let resolved = resolveParakeetModelDirectory(
         preferred: nil,
         suffix: defaultSuffix,
@@ -256,7 +284,7 @@ struct ContentView: View {
                 TextField("Path to artifacts/parakeet-tdt-0.6b-v2", text: $vm.modelDirectory)
                     .textFieldStyle(.roundedBorder)
 #if os(macOS)
-                Button("Browse…") {
+                Button(defaultImportedParakeetModelDirectory() == nil ? "Browse…" : "Import…") {
                     vm.chooseModelDirectory()
                 }
 #elseif canImport(UniformTypeIdentifiers)
@@ -562,7 +590,12 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
         panel.prompt = "Use Folder"
         panel.message = "Select the Parakeet artifact directory that contains encoder/decoder .mlpackage files."
         if panel.runModal() == .OK, let url = panel.url {
-            modelDirectory = url.path
+            if defaultImportedParakeetModelDirectory() != nil {
+                status = "Importing model folder..."
+                importModelDirectory(from: url)
+            } else {
+                modelDirectory = url.path
+            }
         }
 #endif
     }
@@ -660,6 +693,14 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
             suffix: modelSuffix,
             decoderSuffix: decoderModelSuffix
         )
+        #if os(macOS)
+        if isAppSandboxed(),
+           let importedURL = defaultImportedParakeetModelDirectory(),
+           dirURL.standardizedFileURL.path != importedURL.standardizedFileURL.path {
+            status = "Sandboxed Mac app cannot use external model folders directly. Use Import… to copy parakeet-tdt-0.6b-v2 into the app."
+            return
+        }
+        #endif
         if modelDirectory != dirURL.path {
             modelDirectory = dirURL.path
         }
@@ -673,7 +714,11 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
                     #if os(iOS)
                     self.status = "Microphone access denied. Enable it in Settings > Privacy & Security > Microphone."
                     #else
-                    self.status = "Microphone access denied. Enable it in System Settings > Privacy & Security > Microphone."
+                    if isRunningFromAppBundle() {
+                        self.status = "Microphone access denied. Enable it in System Settings > Privacy & Security > Microphone."
+                    } else {
+                        self.status = "Microphone access denied. On macOS, launch via scripts/run_transcribe_macos_release.sh or grant mic access to the host terminal app."
+                    }
                     #endif
                     self.isStarting = false
                 }
