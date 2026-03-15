@@ -143,6 +143,75 @@ final class StreamingInferenceEngineTests: XCTestCase {
         XCTAssertTrue(model.seenCounts.allSatisfy { $0 == 50 })
     }
 
+    func testAlwaysDecodeNoFlushAdvancesOnHopWithoutWaitingForFullChunk() throws {
+        let model = MockModel(outputs: ["alpha", "alpha beta", "alpha beta gamma"])
+        let vad = MockVAD(decisions: [false, false, false], energyDBFS: -60)
+        var engine = StreamingInferenceEngine(
+            model: model,
+            vad: vad,
+            policy: .init(sampleRate: 1000, chunkMs: 100, hopMs: 50),
+            requiredAgreementCount: 1,
+            decodeOnlyWhenSpeech: false,
+            flushOnSpeechEnd: false,
+            ringBufferCapacity: 400
+        )
+
+        let events = try engine.process(samples: Array(repeating: Float(0.1), count: 150))
+
+        XCTAssertEqual(events.count, 3)
+        XCTAssertEqual(events.map(\.callAudioCursorSamples), [50, 100, 150])
+        XCTAssertEqual(events[0].transcript.confirmed, "alpha")
+        XCTAssertEqual(events[0].transcript.hypothesis, "")
+        XCTAssertEqual(events[1].transcript.confirmed, "alpha beta")
+        XCTAssertEqual(events[2].transcript.confirmed, "alpha beta gamma")
+    }
+
+    func testSpeechGatedModeStillWaitsForFullChunkWindow() throws {
+        let model = MockModel(outputs: ["alpha", "alpha beta"])
+        let vad = MockVAD(decisions: [true, true], energyDBFS: -20)
+        var engine = StreamingInferenceEngine(
+            model: model,
+            vad: vad,
+            policy: .init(sampleRate: 1000, chunkMs: 100, hopMs: 50),
+            requiredAgreementCount: 1,
+            decodeOnlyWhenSpeech: true,
+            flushOnSpeechEnd: false,
+            ringBufferCapacity: 400
+        )
+
+        let first = try engine.process(samples: Array(repeating: Float(0.1), count: 50))
+        XCTAssertTrue(first.isEmpty)
+
+        let second = try engine.process(samples: Array(repeating: Float(0.1), count: 50))
+        XCTAssertEqual(second.count, 1)
+        XCTAssertEqual(second[0].callAudioCursorSamples, 50)
+    }
+
+    func testAlwaysDecodeNoFlushAccumulatesAcrossSmallProcessCalls() throws {
+        let model = MockModel(outputs: ["alpha", "alpha beta", "alpha beta gamma"])
+        let vad = MockVAD(decisions: [false, false, false], energyDBFS: -60)
+        var engine = StreamingInferenceEngine(
+            model: model,
+            vad: vad,
+            policy: .init(sampleRate: 1000, chunkMs: 100, hopMs: 50),
+            requiredAgreementCount: 1,
+            decodeOnlyWhenSpeech: false,
+            flushOnSpeechEnd: false,
+            ringBufferCapacity: 400
+        )
+
+        XCTAssertTrue(try engine.process(samples: Array(repeating: Float(0.1), count: 20)).isEmpty)
+        XCTAssertTrue(try engine.process(samples: Array(repeating: Float(0.1), count: 20)).isEmpty)
+
+        let first = try engine.process(samples: Array(repeating: Float(0.1), count: 20))
+        XCTAssertEqual(first.map(\.callAudioCursorSamples), [50])
+        XCTAssertEqual(first.last?.transcript.confirmed, "alpha")
+
+        let second = try engine.process(samples: Array(repeating: Float(0.1), count: 40))
+        XCTAssertEqual(second.map(\.callAudioCursorSamples), [50])
+        XCTAssertEqual(second.last?.transcript.confirmed, "alpha beta")
+    }
+
     func testPreservesCommittedTranscriptAcrossSegments() throws {
         let model = NonResettingMockModel(outputs: ["hello", "hello world", "how", "how are"])
         let vad = MockVAD(decisions: [true, true, false, true, true, false], energyDBFS: -20)
@@ -244,6 +313,9 @@ final class StreamingInferenceEngineTests: XCTestCase {
         XCTAssertEqual(events[0].audioCursorSec, 0.1, accuracy: 1e-9)
         XCTAssertEqual(events[1].audioCursorSec, 0.2, accuracy: 1e-9)
         XCTAssertEqual(events[2].audioCursorSec, 0.3, accuracy: 1e-9)
+        XCTAssertEqual(events[0].callAudioCursorSamples, 100)
+        XCTAssertEqual(events[1].callAudioCursorSamples, 200)
+        XCTAssertEqual(events[2].callAudioCursorSamples, 300)
     }
 
     func testForceFlushSharesAudioCursorWithDecodedHop() throws {
@@ -267,6 +339,8 @@ final class StreamingInferenceEngineTests: XCTestCase {
         XCTAssertTrue(events[2].didFlushSegment)
         XCTAssertEqual(events[1].audioCursorSec, 0.2, accuracy: 1e-9)
         XCTAssertEqual(events[2].audioCursorSec, 0.2, accuracy: 1e-9)
+        XCTAssertEqual(events[1].callAudioCursorSamples, 200)
+        XCTAssertEqual(events[2].callAudioCursorSamples, 200)
     }
 }
 

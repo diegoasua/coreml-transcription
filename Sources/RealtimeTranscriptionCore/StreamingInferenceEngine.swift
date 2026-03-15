@@ -4,6 +4,7 @@ public struct StreamingInferenceEvent: Equatable {
     public let transcript: TranscriptState
     public let revision: Int
     public let audioCursorSec: Double
+    public let callAudioCursorSamples: Int
     public let isSpeech: Bool
     public let didFlushSegment: Bool
     public let energyDBFS: Float
@@ -13,6 +14,7 @@ public struct StreamingInferenceEvent: Equatable {
         transcript: TranscriptState,
         revision: Int = 0,
         audioCursorSec: Double = 0,
+        callAudioCursorSamples: Int = 0,
         isSpeech: Bool,
         didFlushSegment: Bool,
         energyDBFS: Float,
@@ -21,6 +23,7 @@ public struct StreamingInferenceEvent: Equatable {
         self.transcript = transcript
         self.revision = revision
         self.audioCursorSec = audioCursorSec
+        self.callAudioCursorSamples = callAudioCursorSamples
         self.isSpeech = isSpeech
         self.didFlushSegment = didFlushSegment
         self.energyDBFS = energyDBFS
@@ -33,6 +36,7 @@ public struct StreamingInferenceEngine<Model: TranscriptionModel, VAD: VoiceActi
     private var vad: VAD
     private var textController: StreamingTextController
     private var ringBuffer: AudioRingBuffer
+    private var vadHistoryBuffer: AudioRingBuffer
     private let ringBufferCapacity: Int
     private(set) public var policy: StreamingPolicy
     private let decodeOnlyWhenSpeech: Bool
@@ -71,6 +75,7 @@ public struct StreamingInferenceEngine<Model: TranscriptionModel, VAD: VoiceActi
         let capacity = ringBufferCapacity ?? max(policy.chunkSamples * 4, policy.chunkSamples + policy.hopSamples)
         self.ringBufferCapacity = capacity
         self.ringBuffer = AudioRingBuffer(capacity: capacity)
+        self.vadHistoryBuffer = AudioRingBuffer(capacity: max(policy.chunkSamples, policy.hopSamples))
         self.previouslyInSpeech = false
         self.activeSegmentChunkCount = 0
         self.stagnantSpeechChunkCount = 0
@@ -81,11 +86,14 @@ public struct StreamingInferenceEngine<Model: TranscriptionModel, VAD: VoiceActi
     public mutating func process(samples: [Float]) throws -> [StreamingInferenceEvent] {
         guard !samples.isEmpty else { return [] }
         ringBuffer.append(samples)
+        vadHistoryBuffer.append(samples)
 
         var events: [StreamingInferenceEvent] = []
-        while ringBuffer.availableToRead >= policy.chunkSamples {
+        var callAudioCursorSamples = 0
+        while ringBuffer.availableToRead >= minimumProcessingSamples {
             let nextAudioCursorSec = processedAudioSec + Double(policy.hopSamples) / Double(policy.sampleRate)
-            let chunk = ringBuffer.peek(count: policy.chunkSamples)
+            let nextCallAudioCursorSamples = callAudioCursorSamples + policy.hopSamples
+            let chunk = vadHistoryBuffer.peekLast(count: min(policy.chunkSamples, vadHistoryBuffer.availableToRead))
             let decision = vad.process(samples: chunk, sampleRate: policy.sampleRate)
             var decodedState: TranscriptState?
             let shouldDecode = decision.isSpeech || !decodeOnlyWhenSpeech
@@ -103,6 +111,7 @@ public struct StreamingInferenceEngine<Model: TranscriptionModel, VAD: VoiceActi
                         transcript: state,
                         revision: textController.revision,
                         audioCursorSec: nextAudioCursorSec,
+                        callAudioCursorSamples: nextCallAudioCursorSamples,
                         isSpeech: decision.isSpeech,
                         didFlushSegment: false,
                         energyDBFS: decision.energyDBFS,
@@ -157,6 +166,7 @@ public struct StreamingInferenceEngine<Model: TranscriptionModel, VAD: VoiceActi
                         transcript: state,
                         revision: textController.revision,
                         audioCursorSec: nextAudioCursorSec,
+                        callAudioCursorSamples: nextCallAudioCursorSamples,
                         isSpeech: decision.isSpeech,
                         didFlushSegment: true,
                         energyDBFS: decision.energyDBFS
@@ -175,6 +185,7 @@ public struct StreamingInferenceEngine<Model: TranscriptionModel, VAD: VoiceActi
                         transcript: state,
                         revision: textController.revision,
                         audioCursorSec: nextAudioCursorSec,
+                        callAudioCursorSamples: nextCallAudioCursorSamples,
                         isSpeech: false,
                         didFlushSegment: true,
                         energyDBFS: decision.energyDBFS
@@ -184,6 +195,7 @@ public struct StreamingInferenceEngine<Model: TranscriptionModel, VAD: VoiceActi
 
             previouslyInSpeech = decision.isSpeech
             processedAudioSec = nextAudioCursorSec
+            callAudioCursorSamples = nextCallAudioCursorSamples
             _ = ringBuffer.pop(count: policy.hopSamples)
         }
         return events
@@ -205,10 +217,20 @@ public struct StreamingInferenceEngine<Model: TranscriptionModel, VAD: VoiceActi
         model.resetState()
         vad.reset()
         ringBuffer = AudioRingBuffer(capacity: ringBufferCapacity)
+        vadHistoryBuffer = AudioRingBuffer(capacity: max(policy.chunkSamples, policy.hopSamples))
         previouslyInSpeech = false
         activeSegmentChunkCount = 0
         stagnantSpeechChunkCount = 0
         lastSpeechFingerprint = ""
         processedAudioSec = 0
+    }
+
+    private var minimumProcessingSamples: Int {
+        // In always-decode / no-flush mode, waiting for a full VAD chunk only adds
+        // scheduling delay; the model still advances one hop at a time.
+        if !decodeOnlyWhenSpeech, !flushOnSpeechEnd {
+            return policy.hopSamples
+        }
+        return policy.chunkSamples
     }
 }

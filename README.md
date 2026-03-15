@@ -174,7 +174,7 @@ PARAKEET_COREML_DECODER_SUFFIX=odmbp-approx-stateful-v2 \
 bash scripts/run_transcribe_macos_release.sh
 ```
 
-To specialize rewrite-prefix stride for one device using repeated realtime-bench runs, exact confirmed-transcript matching, and `word-vis` latency as the ranking target while preserving headroom when latency differences are negligible:
+To specialize rewrite-prefix stride for one device using repeated realtime-bench runs, exact confirmed-transcript matching, and `ingest->ready` latency as the ranking target while preserving headroom when latency differences are negligible:
 
 ```bash
 PARAKEET_COREML_MODEL_SUFFIX=odmbp-approx \

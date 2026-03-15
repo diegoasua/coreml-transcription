@@ -259,8 +259,8 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
     private struct MetricsSnapshot {
         let inferRTFx: Double
         let wallRTFx: Double
-        let draftWordReady: LatencyStats
-        let confirmedWordReady: LatencyStats
+        let draftReady: LatencyStats
+        let confirmedReady: LatencyStats
         let draftOnset: LatencyStats
         let confirmedOnset: LatencyStats
     }
@@ -310,6 +310,8 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
     }()
     private let pendingLock = NSLock()
     private var pendingSamples: [Float] = []
+    private var pendingBaseSampleCursor = 0
+    private var audioIngressTimeline = AudioIngressTimeline(sampleRate: 16_000)
     private var processingScheduled = false
     private let maxBufferedSamples = (Int(ProcessInfo.processInfo.environment["PARAKEET_STREAM_MAX_BUFFER_SEC"] ?? "") ?? 4) * 16_000
     private let latestFirstScheduling = (ProcessInfo.processInfo.environment["PARAKEET_STREAM_LATEST_FIRST"] ?? "1") != "0"
@@ -371,9 +373,13 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
     }()
     private var captureStartedAtSec: Double = 0
     private var totalProcessedAudioSec: Double = 0
+    private var totalProcessedSampleCursor: Int {
+        Int(round(totalProcessedAudioSec * 16_000.0))
+    }
+    private var engineAudioCursorBaseSampleCursor = 0
     private var totalInferenceSec: Double = 0
     private var runStartedAtSec: Double = 0
-    private var currentSpeechStartedAtAudioSec: Double?
+    private var currentSpeechStartedAtSampleCursor: Int?
     private var currentSpeechBaselineDraft: String = ""
     private var currentSpeechBaselineConfirmed: String = ""
     private var currentSpeechDraftLatencyMs: Double?
@@ -390,6 +396,10 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
     private var draftScreenLatencyMsSamples: [Double] = []
     private var confirmedScreenLatencyMsSamples: [Double] = []
     private let latencyDisplaySampleWindow = 256
+    private var audioCallbackCount = 0
+    private var audioCallbackSampleTotal = 0
+    private var engineBatchCount = 0
+    private var emptyEngineBatchCount = 0
     private var previousEventWasSpeech = false
     private var lastObservedConfirmedText = ""
     private var lastObservedHypothesisText = ""
@@ -399,7 +409,7 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
     private var inputDeviceName: String = "unknown"
     private var selectedInputChannel: Int?
     private static let emptyMetricsLine =
-        "RTFx(inf/live)=0.0/0.0 | word-ready(d/c) n/a / n/a | screen-vis(d/c) n/a / n/a\nonset(d/c) n/a / n/a"
+        "RTFx(inf/live)=0.0/0.0\ningest->ready(d/c) n/a / n/a\ningest->screen(d/c) n/a / n/a\nonset(d/c) n/a / n/a"
 
     func toggle() {
         if isRunning {
@@ -543,13 +553,16 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
         isStarting = false
         pendingLock.lock()
         pendingSamples.removeAll(keepingCapacity: false)
+        pendingBaseSampleCursor = 0
+        audioIngressTimeline.reset()
         pendingLock.unlock()
         captureStartedAtSec = 0
         totalProcessedAudioSec = 0
+        engineAudioCursorBaseSampleCursor = 0
         totalInferenceSec = 0
         stopModelLoadTicker()
         runStartedAtSec = 0
-        currentSpeechStartedAtAudioSec = nil
+        currentSpeechStartedAtSampleCursor = nil
         currentSpeechBaselineDraft = ""
         currentSpeechBaselineConfirmed = ""
         currentSpeechDraftLatencyMs = nil
@@ -564,6 +577,10 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
         currentConfirmedScreenLatencyMs = nil
         draftScreenLatencyMsSamples.removeAll(keepingCapacity: false)
         confirmedScreenLatencyMsSamples.removeAll(keepingCapacity: false)
+        audioCallbackCount = 0
+        audioCallbackSampleTotal = 0
+        engineBatchCount = 0
+        emptyEngineBatchCount = 0
         previousEventWasSpeech = false
         lastObservedConfirmedText = ""
         lastObservedHypothesisText = ""
@@ -589,10 +606,11 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
         inferenceEngine = engine
         captureStartedAtSec = 0
         totalProcessedAudioSec = 0
+        engineAudioCursorBaseSampleCursor = 0
         totalInferenceSec = 0
         stopModelLoadTicker()
         runStartedAtSec = 0
-        currentSpeechStartedAtAudioSec = nil
+        currentSpeechStartedAtSampleCursor = nil
         currentSpeechBaselineDraft = ""
         currentSpeechBaselineConfirmed = ""
         currentSpeechDraftLatencyMs = nil
@@ -607,12 +625,18 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
         currentConfirmedScreenLatencyMs = nil
         draftScreenLatencyMsSamples.removeAll(keepingCapacity: false)
         confirmedScreenLatencyMsSamples.removeAll(keepingCapacity: false)
+        audioCallbackCount = 0
+        audioCallbackSampleTotal = 0
+        engineBatchCount = 0
+        emptyEngineBatchCount = 0
         previousEventWasSpeech = false
         lastObservedConfirmedText = ""
         lastObservedHypothesisText = ""
         selectedInputChannel = nil
         pendingLock.lock()
         pendingSamples.removeAll(keepingCapacity: false)
+        pendingBaseSampleCursor = 0
+        audioIngressTimeline.reset()
         processingScheduled = false
         pendingLock.unlock()
 
@@ -717,10 +741,11 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
     }
 
     private func handleAudioBuffer(_ buffer: AVAudioPCMBuffer) {
+        let receivedAtSec = CFAbsoluteTimeGetCurrent()
         if Int(buffer.format.channelCount) > 1,
            let monoSamples = extractPreferredMonoSamples(from: buffer) {
             if !monoSamples.isEmpty {
-                enqueueSamplesForProcessing(monoSamples)
+                enqueueSamplesForProcessing(monoSamples, receivedAtSec: receivedAtSec)
             }
             return
         }
@@ -749,7 +774,7 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
         if frameCount == 0 { return }
 
         let samples = Array(UnsafeBufferPointer(start: channel, count: frameCount))
-        enqueueSamplesForProcessing(samples)
+        enqueueSamplesForProcessing(samples, receivedAtSec: receivedAtSec)
     }
 
     private func extractPreferredMonoSamples(from buffer: AVAudioPCMBuffer) -> [Float]? {
@@ -831,15 +856,19 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
         return output
     }
 
-    private func enqueueSamplesForProcessing(_ samples: [Float]) {
+    private func enqueueSamplesForProcessing(_ samples: [Float], receivedAtSec: Double) {
         var shouldSchedule = false
         var droppedCount = 0
 
         pendingLock.lock()
+        audioCallbackCount += 1
+        audioCallbackSampleTotal += samples.count
+        _ = audioIngressTimeline.recordIngress(sampleCount: samples.count, receivedAtSec: receivedAtSec)
         pendingSamples.append(contentsOf: samples)
         if maxBufferedSamples > 0, pendingSamples.count > maxBufferedSamples {
             droppedCount = pendingSamples.count - maxBufferedSamples
             pendingSamples.removeFirst(droppedCount)
+            pendingBaseSampleCursor += droppedCount
             resyncAfterDrop = true
         }
         if !latestFirstScheduling,
@@ -853,6 +882,7 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
                 let extraDrop = pendingSamples.count - target
                 droppedCount += extraDrop
                 pendingSamples.removeFirst(extraDrop)
+                pendingBaseSampleCursor += extraDrop
                 resyncAfterDrop = true
             }
         }
@@ -861,7 +891,23 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
             shouldSchedule = true
         }
         let queuedSeconds = Double(pendingSamples.count) / 16_000.0
+        let callbackCount = audioCallbackCount
+        let callbackSampleTotal = audioCallbackSampleTotal
+        let queuedSampleCount = pendingSamples.count
         pendingLock.unlock()
+
+        if metricsLogEnabled, (callbackCount <= 3 || callbackCount % 20 == 0) {
+            fputs(
+                String(
+                    format: "[transcribe-macos] audio callbacks=%d total_samples=%d last_batch=%d queued_samples=%d\n",
+                    callbackCount,
+                    callbackSampleTotal,
+                    samples.count,
+                    queuedSampleCount
+                ),
+                stderr
+            )
+        }
 
         if droppedCount > 0 {
             let statusLine = String(format: "Catching up (dropped %.2fs)", Double(droppedCount) / 16_000.0)
@@ -893,6 +939,7 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
             }
 
             let batch: [Float]
+            let batchStartSampleCursor: Int
             let queuedAfterPopSec: Double
             let shouldResyncBeforeBatch: Bool
             var droppedForRealtime = 0
@@ -920,22 +967,30 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
                     if backlogSoftLimitSamples > 0, pendingSamples.count > backlogSoftLimitSamples {
                         // Under real overflow, restart from a bounded contiguous
                         // tail instead of feeding a sparse queue into the model.
+                        batchStartSampleCursor = pendingBaseSampleCursor + pendingSamples.count - batchSampleCount
                         batch = Array(pendingSamples.suffix(batchSampleCount))
                         droppedForRealtime = pendingSamples.count - batch.count
+                        pendingBaseSampleCursor += pendingSamples.count
                         pendingSamples.removeAll(keepingCapacity: true)
                         if droppedForRealtime > 0 {
                             resyncAfterDrop = true
                         }
                     } else {
+                        batchStartSampleCursor = pendingBaseSampleCursor
                         batch = Array(pendingSamples.prefix(batchSampleCount))
+                        pendingBaseSampleCursor += batch.count
                         pendingSamples.removeFirst(batch.count)
                     }
                 } else {
+                    batchStartSampleCursor = pendingBaseSampleCursor
                     batch = Array(pendingSamples.prefix(maxProcessingBatchSamples))
+                    pendingBaseSampleCursor += maxProcessingBatchSamples
                     pendingSamples.removeFirst(maxProcessingBatchSamples)
                 }
             } else {
+                batchStartSampleCursor = pendingBaseSampleCursor
                 batch = pendingSamples
+                pendingBaseSampleCursor += pendingSamples.count
                 pendingSamples.removeAll(keepingCapacity: true)
             }
             shouldResyncBeforeBatch = resyncAfterDrop
@@ -957,7 +1012,8 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
                 let confirmed = snapshot.confirmed
                 let hypothesis = snapshot.hypothesis
                 inferenceEngine = engine
-                currentSpeechStartedAtAudioSec = nil
+                engineAudioCursorBaseSampleCursor = batchStartSampleCursor
+                currentSpeechStartedAtSampleCursor = nil
                 currentSpeechBaselineDraft = ""
                 currentSpeechBaselineConfirmed = ""
                 currentSpeechDraftLatencyMs = nil
@@ -979,7 +1035,6 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
                 let events = try engine.process(samples: batch)
                 let elapsed = CFAbsoluteTimeGetCurrent() - started
                 let batchAudioSec = Double(batch.count) / 16_000.0
-                let batchStartAudioSec = totalProcessedAudioSec
                 let batchCompletedAtSec = started + elapsed
                 totalProcessedAudioSec += batchAudioSec
                 totalInferenceSec += elapsed
@@ -990,31 +1045,60 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
                 let wallElapsed = max(batchCompletedAtSec - runStartedAtSec, 1e-6)
                 let wallRTFx = totalProcessedAudioSec / wallElapsed
                 inferenceEngine = engine
+                engineBatchCount += 1
+                if metricsLogEnabled {
+                    if events.isEmpty {
+                        emptyEngineBatchCount += 1
+                        if emptyEngineBatchCount <= 3 || emptyEngineBatchCount % 20 == 0 {
+                            fputs(
+                                String(
+                                    format: "[transcribe-macos] engine batch=%d samples=%d produced no events (empty_batches=%d)\n",
+                                    engineBatchCount,
+                                    batch.count,
+                                    emptyEngineBatchCount
+                                ),
+                                stderr
+                            )
+                        }
+                    } else if engineBatchCount <= 3 || engineBatchCount % 20 == 0 {
+                        fputs(
+                            String(
+                                format: "[transcribe-macos] engine batch=%d samples=%d events=%d latest_cursor=%.3fs\n",
+                                engineBatchCount,
+                                batch.count,
+                                events.count,
+                                events.last?.audioCursorSec ?? 0
+                            ),
+                            stderr
+                        )
+                    }
+                }
 
                 if let latest = events.last {
-                    var latestDraftScreenAudioCursorSec: Double?
-                    var latestConfirmedScreenAudioCursorSec: Double?
+                    var latestDraftScreenSampleCursor: Int?
+                    var latestConfirmedScreenSampleCursor: Int?
                     for event in events {
-                        let eventAudioCursorSec = min(totalProcessedAudioSec, max(batchStartAudioSec, event.audioCursorSec))
+                        let eventSampleCursor = engineAudioCursorBaseSampleCursor + Int(
+                            round(event.audioCursorSec * 16_000.0)
+                        )
                         if event.isSpeech, !previousEventWasSpeech {
-                            currentSpeechStartedAtAudioSec = eventAudioCursorSec
+                            currentSpeechStartedAtSampleCursor = eventSampleCursor
                             currentSpeechBaselineDraft = lastObservedHypothesisText
                             currentSpeechBaselineConfirmed = lastObservedConfirmedText
                             currentSpeechDraftLatencyMs = nil
                             currentSpeechConfirmedLatencyMs = nil
                         }
                         if event.isSpeech,
-                           let startedAtAudioSec = currentSpeechStartedAtAudioSec,
+                           let startedAtSampleCursor = currentSpeechStartedAtSampleCursor,
                            currentSpeechDraftLatencyMs == nil,
                            event.transcript.hypothesis != currentSpeechBaselineDraft {
-                            var latencyMs = Self.visibleTextLatencyMs(
-                                captureStartedAtSec: captureStartedAtSec,
+                            guard var latencyMs = ingestLatencyMs(
                                 observedAtSec: batchCompletedAtSec,
-                                audioCursorSec: startedAtAudioSec
-                            )
+                                sampleCursor: startedAtSampleCursor
+                            ) else {
+                                continue
+                            }
                             if latencyMs < 1.0 {
-                                // Same-hop speech start + token emission can still
-                                // quantize down to 0ms; use hop as a practical floor.
                                 latencyMs = Double(self.hopMs)
                             }
                             currentSpeechDraftLatencyMs = latencyMs
@@ -1024,31 +1108,33 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
                             }
                         }
                         if event.transcript.hypothesis != lastObservedHypothesisText {
-                            let latencyMs = Self.visibleTextLatencyMs(
-                                captureStartedAtSec: captureStartedAtSec,
+                            guard let latencyMs = ingestLatencyMs(
                                 observedAtSec: batchCompletedAtSec,
-                                audioCursorSec: eventAudioCursorSec
-                            )
+                                sampleCursor: eventSampleCursor
+                            ) else {
+                                continue
+                            }
                             currentDraftDisplayLatencyMs = latencyMs
                             Self.appendRollingSample(
                                 latencyMs,
                                 into: &draftDisplayLatencyMsSamples,
                                 maxCount: latencyDisplaySampleWindow
                             )
-                            latestDraftScreenAudioCursorSec = eventAudioCursorSec
+                            latestDraftScreenSampleCursor = eventSampleCursor
                             if metricsLogEnabled {
-                                fputs(String(format: "[metrics] draft-word-ready-latency=%.1f ms\n", latencyMs), stderr)
+                                fputs(String(format: "[metrics] draft-ingest-ready-latency=%.1f ms\n", latencyMs), stderr)
                             }
                         }
                         if event.isSpeech,
-                           let startedAtAudioSec = currentSpeechStartedAtAudioSec,
+                           let startedAtSampleCursor = currentSpeechStartedAtSampleCursor,
                            currentSpeechConfirmedLatencyMs == nil,
                            event.transcript.confirmed != currentSpeechBaselineConfirmed {
-                            let latencyMs = Self.visibleTextLatencyMs(
-                                captureStartedAtSec: captureStartedAtSec,
+                            guard let latencyMs = ingestLatencyMs(
                                 observedAtSec: batchCompletedAtSec,
-                                audioCursorSec: startedAtAudioSec
-                            )
+                                sampleCursor: startedAtSampleCursor
+                            ) else {
+                                continue
+                            }
                             currentSpeechConfirmedLatencyMs = latencyMs
                             confirmedLatencyMsSamples.append(latencyMs)
                             if metricsLogEnabled {
@@ -1056,36 +1142,37 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
                             }
                         }
                         if event.transcript.confirmed != lastObservedConfirmedText {
-                            let latencyMs = Self.visibleTextLatencyMs(
-                                captureStartedAtSec: captureStartedAtSec,
+                            guard let latencyMs = ingestLatencyMs(
                                 observedAtSec: batchCompletedAtSec,
-                                audioCursorSec: eventAudioCursorSec
-                            )
+                                sampleCursor: eventSampleCursor
+                            ) else {
+                                continue
+                            }
                             currentConfirmedDisplayLatencyMs = latencyMs
                             Self.appendRollingSample(
                                 latencyMs,
                                 into: &confirmedDisplayLatencyMsSamples,
                                 maxCount: latencyDisplaySampleWindow
                             )
-                            latestConfirmedScreenAudioCursorSec = eventAudioCursorSec
+                            latestConfirmedScreenSampleCursor = eventSampleCursor
                             if metricsLogEnabled {
-                                fputs(String(format: "[metrics] confirmed-word-ready-latency=%.1f ms\n", latencyMs), stderr)
+                                fputs(String(format: "[metrics] confirmed-ingest-ready-latency=%.1f ms\n", latencyMs), stderr)
                             }
                         }
-                        if event.didFlushSegment, let startedAtAudioSec = currentSpeechStartedAtAudioSec {
+                        if event.didFlushSegment, let startedAtSampleCursor = currentSpeechStartedAtSampleCursor {
                             if currentSpeechConfirmedLatencyMs == nil {
-                                let latencyMs = Self.visibleTextLatencyMs(
-                                    captureStartedAtSec: captureStartedAtSec,
+                                if let latencyMs = ingestLatencyMs(
                                     observedAtSec: batchCompletedAtSec,
-                                    audioCursorSec: startedAtAudioSec
-                                )
-                                currentSpeechConfirmedLatencyMs = latencyMs
-                                confirmedLatencyMsSamples.append(latencyMs)
-                                if metricsLogEnabled {
-                                    fputs(String(format: "[metrics] confirmed-onset-latency-flush=%.1f ms\n", latencyMs), stderr)
+                                    sampleCursor: startedAtSampleCursor
+                                ) {
+                                    currentSpeechConfirmedLatencyMs = latencyMs
+                                    confirmedLatencyMsSamples.append(latencyMs)
+                                    if metricsLogEnabled {
+                                        fputs(String(format: "[metrics] confirmed-onset-latency-flush=%.1f ms\n", latencyMs), stderr)
+                                    }
                                 }
                             }
-                            currentSpeechStartedAtAudioSec = nil
+                            currentSpeechStartedAtSampleCursor = nil
                             currentSpeechBaselineDraft = ""
                             currentSpeechBaselineConfirmed = ""
                             currentSpeechDraftLatencyMs = nil
@@ -1097,9 +1184,8 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
                     }
 
                     let metricsSnapshot = metricsSnapshot(inferRTFx: inferRTFx, wallRTFx: wallRTFx)
-                    let captureStartedAtSecLocal = captureStartedAtSec
-                    let latestDraftScreenAudioCursorSecLocal = latestDraftScreenAudioCursorSec
-                    let latestConfirmedScreenAudioCursorSecLocal = latestConfirmedScreenAudioCursorSec
+                    let latestDraftScreenSampleCursorLocal = latestDraftScreenSampleCursor
+                    let latestConfirmedScreenSampleCursorLocal = latestConfirmedScreenSampleCursor
 
                     // For UI responsiveness, prefer the newest non-flush event for
                     // display; flush events are still useful for finalization but
@@ -1118,12 +1204,11 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
                     )
                     DispatchQueue.main.async {
                         let screenObservedAtSec = CFAbsoluteTimeGetCurrent()
-                        if let audioCursorSec = latestDraftScreenAudioCursorSecLocal {
-                            let latencyMs = Self.visibleTextLatencyMs(
-                                captureStartedAtSec: captureStartedAtSecLocal,
-                                observedAtSec: screenObservedAtSec,
-                                audioCursorSec: audioCursorSec
-                            )
+                        if let sampleCursor = latestDraftScreenSampleCursorLocal,
+                           let latencyMs = self.ingestLatencyMs(
+                               observedAtSec: screenObservedAtSec,
+                               sampleCursor: sampleCursor
+                           ) {
                             self.currentDraftScreenLatencyMs = latencyMs
                             Self.appendRollingSample(
                                 latencyMs,
@@ -1131,15 +1216,14 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
                                 maxCount: self.latencyDisplaySampleWindow
                             )
                             if self.metricsLogEnabled {
-                                fputs(String(format: "[metrics] draft-screen-latency=%.1f ms\n", latencyMs), stderr)
+                                fputs(String(format: "[metrics] draft-ingest-screen-latency=%.1f ms\n", latencyMs), stderr)
                             }
                         }
-                        if let audioCursorSec = latestConfirmedScreenAudioCursorSecLocal {
-                            let latencyMs = Self.visibleTextLatencyMs(
-                                captureStartedAtSec: captureStartedAtSecLocal,
-                                observedAtSec: screenObservedAtSec,
-                                audioCursorSec: audioCursorSec
-                            )
+                        if let sampleCursor = latestConfirmedScreenSampleCursorLocal,
+                           let latencyMs = self.ingestLatencyMs(
+                               observedAtSec: screenObservedAtSec,
+                               sampleCursor: sampleCursor
+                           ) {
                             self.currentConfirmedScreenLatencyMs = latencyMs
                             Self.appendRollingSample(
                                 latencyMs,
@@ -1147,7 +1231,7 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
                                 maxCount: self.latencyDisplaySampleWindow
                             )
                             if self.metricsLogEnabled {
-                                fputs(String(format: "[metrics] confirmed-screen-latency=%.1f ms\n", latencyMs), stderr)
+                                fputs(String(format: "[metrics] confirmed-ingest-screen-latency=%.1f ms\n", latencyMs), stderr)
                             }
                         }
                         self.confirmedText = latestConfirmed
@@ -1201,25 +1285,23 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
         }
     }
 
-    private static func visibleTextLatencyMs(
-        captureStartedAtSec: Double,
-        observedAtSec: Double,
-        audioCursorSec: Double
-    ) -> Double {
-        guard captureStartedAtSec > 0 else { return 0 }
-        let audioCaptureTime = captureStartedAtSec + max(0, audioCursorSec)
-        return max(0, (observedAtSec - audioCaptureTime) * 1000.0)
+    private func ingestLatencyMs(observedAtSec: Double, sampleCursor: Int) -> Double? {
+        pendingLock.lock()
+        let ingressTimeSec = audioIngressTimeline.ingressTime(forSampleCursor: sampleCursor)
+        pendingLock.unlock()
+        guard let ingressTimeSec else { return nil }
+        return max(0, (observedAtSec - ingressTimeSec) * 1000.0)
     }
 
     private func metricsSnapshot(inferRTFx: Double, wallRTFx: Double) -> MetricsSnapshot {
         MetricsSnapshot(
             inferRTFx: inferRTFx,
             wallRTFx: wallRTFx,
-            draftWordReady: Self.latencyStats(
+            draftReady: Self.latencyStats(
                 current: currentDraftDisplayLatencyMs ?? draftDisplayLatencyMsSamples.last,
                 samples: draftDisplayLatencyMsSamples
             ),
-            confirmedWordReady: Self.latencyStats(
+            confirmedReady: Self.latencyStats(
                 current: currentConfirmedDisplayLatencyMs ?? confirmedDisplayLatencyMsSamples.last,
                 samples: confirmedDisplayLatencyMsSamples
             ),
@@ -1253,18 +1335,18 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
         )
 
         return String(
-            format: "RTFx(inf/live)=%.1f/%.1f | word-ready(d/c) %@ / %@ | screen-vis(d/c) %@ / %@\nonset(d/c) %@ / %@",
+            format: "RTFx(inf/live)=%.1f/%.1f\ningest->ready(d/c) %@ / %@\ningest->screen(d/c) %@ / %@\nonset(d/c) %@ / %@",
             snapshot.inferRTFx,
             snapshot.wallRTFx,
             Self.formatLatency(
-                current: snapshot.draftWordReady.current,
-                avg: snapshot.draftWordReady.avg,
-                p95: snapshot.draftWordReady.p95
+                current: snapshot.draftReady.current,
+                avg: snapshot.draftReady.avg,
+                p95: snapshot.draftReady.p95
             ),
             Self.formatLatency(
-                current: snapshot.confirmedWordReady.current,
-                avg: snapshot.confirmedWordReady.avg,
-                p95: snapshot.confirmedWordReady.p95
+                current: snapshot.confirmedReady.current,
+                avg: snapshot.confirmedReady.avg,
+                p95: snapshot.confirmedReady.p95
             ),
             Self.formatLatency(
                 current: draftScreen.current,
@@ -1309,7 +1391,9 @@ final class MicTranscriptionViewModel: ObservableObject, @unchecked Sendable {
 
     private func shouldProtectLatestFirstOnset() -> Bool {
         StreamingSchedulerSupport.shouldProtectLatestFirstOnset(
-            elapsedSec: currentSpeechStartedAtAudioSec.map { max(0.0, totalProcessedAudioSec - $0) },
+            elapsedSec: currentSpeechStartedAtSampleCursor.map {
+                max(0.0, Double(totalProcessedSampleCursor - $0) / 16_000.0)
+            },
             currentConfirmed: lastObservedConfirmedText,
             baselineConfirmed: currentSpeechBaselineConfirmed,
             minConfirmedWords: latestOnsetMinConfirmedWords,

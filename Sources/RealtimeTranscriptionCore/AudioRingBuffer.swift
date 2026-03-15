@@ -57,4 +57,17 @@ public struct AudioRingBuffer {
         }
         return out
     }
+
+    public func peekLast(count requested: Int) -> [Float] {
+        let n = min(requested, count)
+        guard n > 0 else { return [] }
+
+        var out = Array(repeating: Float(0), count: n)
+        var idx = (writeIndex - n + capacity) % capacity
+        for outIdx in 0..<n {
+            out[outIdx] = storage[idx]
+            idx = (idx + 1) % capacity
+        }
+        return out
+    }
 }

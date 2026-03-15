@@ -610,7 +610,7 @@ func runRealtimeBenchmark(
     var droppedChunks = 0
 
     var prevIsSpeech = false
-    var speechStartAudioSec: Double?
+    var speechStartSampleCursor: Int?
     var speechBaselineDraft = ""
     var speechBaselineMerged = ""
     var speechBaselineConfirmed = ""
@@ -620,8 +620,8 @@ func runRealtimeBenchmark(
     var draftFirstTokenMs: [Double] = []
     var mergedFirstTokenMs: [Double] = []
     var confirmedMs: [Double] = []
-    var draftWordVisibleMs: [Double] = []
-    var confirmedWordVisibleMs: [Double] = []
+    var draftReadyLatencyMs: [Double] = []
+    var confirmedReadyLatencyMs: [Double] = []
     var corrections = 0
     var lastConfirmed = ""
     var lastHypothesis = ""
@@ -629,6 +629,8 @@ func runRealtimeBenchmark(
     var transcriptCursorSec = 0.0
     var traceBatchIndex = 0
     var processedAudioCursorSec = 0.0
+    var ingressTimeline = AudioIngressTimeline(sampleRate: sampleRate)
+    var engineAudioCursorBaseSampleCursor = 0
     let tailHalfStartSec = totalAudioSec * 0.5
     var modelProfileOverall = BenchModelProfileAccumulator()
     var modelProfileTailHalf = BenchModelProfileAccumulator()
@@ -639,6 +641,7 @@ func runRealtimeBenchmark(
         while arrivalIndex < totalChunks {
             let arrivalTime = Double(arrivalIndex) * hopSec
             if arrivalTime <= currentTimeSec {
+                _ = ingressTimeline.recordIngress(sampleCount: chunks[arrivalIndex].count, receivedAtSec: arrivalTime)
                 queue.append(arrivalIndex)
                 arrivalIndex += 1
             } else {
@@ -654,7 +657,9 @@ func runRealtimeBenchmark(
         }
 
         let protectLatestFirstOnset = StreamingSchedulerSupport.shouldProtectLatestFirstOnset(
-            elapsedSec: speechStartAudioSec.map { max(0.0, processedAudioCursorSec - $0) },
+            elapsedSec: speechStartSampleCursor.map {
+                max(0.0, Double(Int(round(processedAudioCursorSec * Double(sampleRate))) - $0) / Double(sampleRate))
+            },
             currentConfirmed: lastConfirmed,
             baselineConfirmed: speechBaselineConfirmed,
             minConfirmedWords: latestOnsetMinConfirmedWords,
@@ -722,11 +727,13 @@ func runRealtimeBenchmark(
         for idx in batchIndexes {
             batch.append(contentsOf: chunks[idx])
         }
+        let batchStartSampleCursor = (batchIndexes.first ?? 0) * hopSamples
 
         if shouldResyncBeforeBatch {
             _ = engine.discardStream(preserveHypothesis: preserveHypothesisOnResync)
+            engineAudioCursorBaseSampleCursor = batchStartSampleCursor
             prevIsSpeech = false
-            speechStartAudioSec = nil
+            speechStartSampleCursor = nil
             speechBaselineDraft = ""
             speechBaselineMerged = ""
             speechBaselineConfirmed = ""
@@ -750,7 +757,11 @@ func runRealtimeBenchmark(
         processedAudioCursorSec = latestAudioCursorSec
 
         for event in events {
-            let eventAudioCursorSec = min(totalAudioSec, event.audioCursorSec)
+            let eventSampleCursor = engineAudioCursorBaseSampleCursor + Int(
+                round(event.audioCursorSec * Double(sampleRate))
+            )
+            let eventAudioCursorSec = min(totalAudioSec, Double(eventSampleCursor) / Double(sampleRate))
+            let eventIngressTimeSec = ingressTimeline.ingressTime(forSampleCursor: eventSampleCursor)
             let preEventConfirmed = lastConfirmed
             let preEventDraft = lastHypothesis
             let preEventMerged = lastMerged
@@ -760,7 +771,7 @@ func runRealtimeBenchmark(
                 logProgress("realtime-bench text-change: \(snippet)")
             }
             if event.isSpeech, !prevIsSpeech {
-                speechStartAudioSec = eventAudioCursorSec
+                speechStartSampleCursor = eventSampleCursor
                 speechBaselineDraft = preEventDraft
                 speechBaselineMerged = preEventMerged
                 speechBaselineConfirmed = preEventConfirmed
@@ -769,42 +780,48 @@ func runRealtimeBenchmark(
                 speechConfirmedRecorded = false
             }
             if event.isSpeech,
-               let startAudio = speechStartAudioSec,
+               let startSampleCursor = speechStartSampleCursor,
                !speechDraftFirstTokenRecorded,
-               event.transcript.hypothesis != speechBaselineDraft {
-                draftFirstTokenMs.append(max(0, (batchEndTimeSec - startAudio) * 1000.0))
+               event.transcript.hypothesis != speechBaselineDraft,
+               let startIngressTimeSec = ingressTimeline.ingressTime(forSampleCursor: startSampleCursor) {
+                draftFirstTokenMs.append(max(0, (batchEndTimeSec - startIngressTimeSec) * 1000.0))
                 speechDraftFirstTokenRecorded = true
             }
             if event.isSpeech,
-               let startAudio = speechStartAudioSec,
+               let startSampleCursor = speechStartSampleCursor,
                !speechMergedFirstTokenRecorded,
-               merged != speechBaselineMerged {
-                mergedFirstTokenMs.append(max(0, (batchEndTimeSec - startAudio) * 1000.0))
+               merged != speechBaselineMerged,
+               let startIngressTimeSec = ingressTimeline.ingressTime(forSampleCursor: startSampleCursor) {
+                mergedFirstTokenMs.append(max(0, (batchEndTimeSec - startIngressTimeSec) * 1000.0))
                 speechMergedFirstTokenRecorded = true
             }
             if event.isSpeech,
-               let startAudio = speechStartAudioSec,
+               let startSampleCursor = speechStartSampleCursor,
                !speechConfirmedRecorded,
-               event.transcript.confirmed != speechBaselineConfirmed {
-                confirmedMs.append(max(0, (batchEndTimeSec - startAudio) * 1000.0))
+               event.transcript.confirmed != speechBaselineConfirmed,
+               let startIngressTimeSec = ingressTimeline.ingressTime(forSampleCursor: startSampleCursor) {
+                confirmedMs.append(max(0, (batchEndTimeSec - startIngressTimeSec) * 1000.0))
                 speechConfirmedRecorded = true
             }
-            if event.transcript.hypothesis != lastHypothesis {
-                draftWordVisibleMs.append(max(0, (batchEndTimeSec - eventAudioCursorSec) * 1000.0))
+            if event.transcript.hypothesis != lastHypothesis,
+               let eventIngressTimeSec {
+                draftReadyLatencyMs.append(max(0, (batchEndTimeSec - eventIngressTimeSec) * 1000.0))
             }
-            if event.transcript.confirmed != lastConfirmed {
-                confirmedWordVisibleMs.append(max(0, (batchEndTimeSec - eventAudioCursorSec) * 1000.0))
+            if event.transcript.confirmed != lastConfirmed,
+               let eventIngressTimeSec {
+                confirmedReadyLatencyMs.append(max(0, (batchEndTimeSec - eventIngressTimeSec) * 1000.0))
             }
             if merged != lastMerged || event.transcript.confirmed != lastConfirmed {
                 transcriptCursorSec = max(transcriptCursorSec, eventAudioCursorSec)
             }
-            if event.didFlushSegment, let startAudio = speechStartAudioSec {
-                if !speechConfirmedRecorded {
-                    confirmedMs.append(max(0, (batchEndTimeSec - startAudio) * 1000.0))
+            if event.didFlushSegment, let startSampleCursor = speechStartSampleCursor {
+                if !speechConfirmedRecorded,
+                   let startIngressTimeSec = ingressTimeline.ingressTime(forSampleCursor: startSampleCursor) {
+                    confirmedMs.append(max(0, (batchEndTimeSec - startIngressTimeSec) * 1000.0))
                     speechConfirmedRecorded = true
                 }
                 transcriptCursorSec = max(transcriptCursorSec, eventAudioCursorSec)
-                speechStartAudioSec = nil
+                speechStartSampleCursor = nil
                 speechBaselineDraft = ""
                 speechBaselineMerged = ""
                 speechBaselineConfirmed = ""
@@ -884,12 +901,12 @@ func runRealtimeBenchmark(
             let onsetNow = onsetSeries.last ?? -1
             let onsetAvg = onsetSeries.isEmpty ? -1 : (onsetSeries.reduce(0, +) / Double(onsetSeries.count))
             let onsetWorst = onsetSeries.max() ?? -1
-            let wordSeries = draftWordVisibleMs.isEmpty ? confirmedWordVisibleMs : draftWordVisibleMs
-            let wordNow = wordSeries.last ?? -1
-            let wordAvg = wordSeries.isEmpty ? -1 : (wordSeries.reduce(0, +) / Double(wordSeries.count))
+            let readySeries = draftReadyLatencyMs.isEmpty ? confirmedReadyLatencyMs : draftReadyLatencyMs
+            let readyNow = readySeries.last ?? -1
+            let readyAvg = readySeries.isEmpty ? -1 : (readySeries.reduce(0, +) / Double(readySeries.count))
             logProgress(
                 String(
-                    format: "realtime-bench t=%.2fs audio=%.2fs transcript=%.2fs queue=%.2fs inf=%.2fx wall=%.2fx onset=%.0fms avg=%.0f worst=%.0f word=%.0fms avg=%.0f drops=%d",
+                    format: "realtime-bench t=%.2fs audio=%.2fs transcript=%.2fs queue=%.2fs inf=%.2fx wall=%.2fx onset=%.0fms avg=%.0f worst=%.0f ready=%.0fms avg=%.0f drops=%d",
                     currentTimeSec,
                     ingestedAudioSec,
                     transcriptCursorSec,
@@ -899,8 +916,8 @@ func runRealtimeBenchmark(
                     onsetNow,
                     onsetAvg,
                     onsetWorst,
-                    wordNow,
-                    wordAvg,
+                    readyNow,
+                    readyAvg,
                     droppedChunks
                 )
             )
@@ -917,11 +934,12 @@ func runRealtimeBenchmark(
     } else {
         finalState = rawFinalState
     }
-    if let pendingStart = speechStartAudioSec {
+    if let pendingStartSampleCursor = speechStartSampleCursor,
+       let pendingStartIngressTimeSec = ingressTimeline.ingressTime(forSampleCursor: pendingStartSampleCursor) {
         let anyText = !finalState.confirmed.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
             !finalState.hypothesis.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         if anyText, !speechConfirmedRecorded {
-            confirmedMs.append(max(0, (currentTimeSec - pendingStart) * 1000.0))
+            confirmedMs.append(max(0, (currentTimeSec - pendingStartIngressTimeSec) * 1000.0))
         }
     }
     if !finalState.confirmed.isEmpty {
@@ -937,8 +955,8 @@ func runRealtimeBenchmark(
     let draftFirstP95 = percentile(draftFirstTokenMs, q: 0.95)
     let mergedFirstP95 = percentile(mergedFirstTokenMs, q: 0.95)
     let confirmedP95 = percentile(confirmedMs, q: 0.95) ?? .infinity
-    let draftWordVisibleP95 = percentile(draftWordVisibleMs, q: 0.95)
-    let confirmedWordVisibleP95 = percentile(confirmedWordVisibleMs, q: 0.95)
+    let draftReadyP95 = percentile(draftReadyLatencyMs, q: 0.95)
+    let confirmedReadyP95 = percentile(confirmedReadyLatencyMs, q: 0.95)
     let correctionsPerMin = totalAudioSec > 0 ? (Double(corrections) / totalAudioSec) * 60.0 : 0.0
 
     let passQueue = maxQueueSecObserved <= args.queuePassSec
@@ -966,16 +984,20 @@ func runRealtimeBenchmark(
         "confirmed_latency_ms_p95": confirmedP95.isFinite ? confirmedP95 : NSNull(),
         "draft_onset_latency_ms_p95": (draftFirstP95 != nil && draftFirstP95!.isFinite) ? draftFirstP95! : NSNull(),
         "confirmed_onset_latency_ms_p95": confirmedP95.isFinite ? confirmedP95 : NSNull(),
-        "draft_word_vis_ms_p95": (draftWordVisibleP95 != nil && draftWordVisibleP95!.isFinite) ? draftWordVisibleP95! : NSNull(),
-        "confirmed_word_vis_ms_p95": (confirmedWordVisibleP95 != nil && confirmedWordVisibleP95!.isFinite) ? confirmedWordVisibleP95! : NSNull(),
+        "draft_ready_latency_ms_p95": (draftReadyP95 != nil && draftReadyP95!.isFinite) ? draftReadyP95! : NSNull(),
+        "confirmed_ready_latency_ms_p95": (confirmedReadyP95 != nil && confirmedReadyP95!.isFinite) ? confirmedReadyP95! : NSNull(),
         "first_token_ms_avg": firstTokenSeries.isEmpty ? NSNull() : (firstTokenSeries.reduce(0, +) / Double(firstTokenSeries.count)),
         "draft_first_token_ms_avg": draftFirstTokenMs.isEmpty ? NSNull() : (draftFirstTokenMs.reduce(0, +) / Double(draftFirstTokenMs.count)),
         "merged_first_token_ms_avg": mergedFirstTokenMs.isEmpty ? NSNull() : (mergedFirstTokenMs.reduce(0, +) / Double(mergedFirstTokenMs.count)),
         "confirmed_latency_ms_avg": confirmedMs.isEmpty ? NSNull() : (confirmedMs.reduce(0, +) / Double(confirmedMs.count)),
         "draft_onset_latency_ms_avg": draftFirstTokenMs.isEmpty ? NSNull() : (draftFirstTokenMs.reduce(0, +) / Double(draftFirstTokenMs.count)),
         "confirmed_onset_latency_ms_avg": confirmedMs.isEmpty ? NSNull() : (confirmedMs.reduce(0, +) / Double(confirmedMs.count)),
-        "draft_word_vis_ms_avg": draftWordVisibleMs.isEmpty ? NSNull() : (draftWordVisibleMs.reduce(0, +) / Double(draftWordVisibleMs.count)),
-        "confirmed_word_vis_ms_avg": confirmedWordVisibleMs.isEmpty ? NSNull() : (confirmedWordVisibleMs.reduce(0, +) / Double(confirmedWordVisibleMs.count)),
+        "draft_ready_latency_ms_avg": draftReadyLatencyMs.isEmpty ? NSNull() : (draftReadyLatencyMs.reduce(0, +) / Double(draftReadyLatencyMs.count)),
+        "confirmed_ready_latency_ms_avg": confirmedReadyLatencyMs.isEmpty ? NSNull() : (confirmedReadyLatencyMs.reduce(0, +) / Double(confirmedReadyLatencyMs.count)),
+        "draft_word_vis_ms_p95": (draftReadyP95 != nil && draftReadyP95!.isFinite) ? draftReadyP95! : NSNull(),
+        "confirmed_word_vis_ms_p95": (confirmedReadyP95 != nil && confirmedReadyP95!.isFinite) ? confirmedReadyP95! : NSNull(),
+        "draft_word_vis_ms_avg": draftReadyLatencyMs.isEmpty ? NSNull() : (draftReadyLatencyMs.reduce(0, +) / Double(draftReadyLatencyMs.count)),
+        "confirmed_word_vis_ms_avg": confirmedReadyLatencyMs.isEmpty ? NSNull() : (confirmedReadyLatencyMs.reduce(0, +) / Double(confirmedReadyLatencyMs.count)),
         "corrections": corrections,
         "corrections_per_min": correctionsPerMin,
         "infer_rtfx": inferRTFx,
