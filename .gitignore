@@ -3,6 +3,10 @@
 .swiftpm/
 .venv/
 artifacts/
+Apps/TranscribeIOSApp/TranscribeIOSApp/Models/parakeet-tdt-0.6b-v2/
+Apps/TranscribeIOSApp.generated-backup/
+Sources/transcribe-ios/Resources/parakeet-tdt-0.6b-v2/
+artifacts/ios-model-import/
 *.pyc
 __pycache__/
 .cache/

@@ -2,10 +2,12 @@ import SwiftUI
 import TranscribeAppleAppSupport
 
 @main
-struct TranscribeMacOSApp: App {
+struct TranscribeIOSAppApp: App {
     var body: some Scene {
         WindowGroup {
-            TranscribeAppleRootView()
+            NavigationStack {
+                TranscribeAppleRootView()
+            }
         }
     }
 }

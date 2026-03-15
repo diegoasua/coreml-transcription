@@ -12,6 +12,10 @@ let package = Package(
             name: "RealtimeTranscriptionCore",
             targets: ["RealtimeTranscriptionCore"]
         ),
+        .library(
+            name: "TranscribeAppleAppSupport",
+            targets: ["TranscribeAppleAppSupport"]
+        ),
         .executable(
             name: "transcribe-cli",
             targets: ["transcribe-cli"]
@@ -20,11 +24,19 @@ let package = Package(
             name: "transcribe-macos",
             targets: ["transcribe-macos"]
         ),
+        .executable(
+            name: "transcribe-ios",
+            targets: ["transcribe-ios"]
+        ),
     ],
     dependencies: [],
     targets: [
         .target(
             name: "RealtimeTranscriptionCore"
+        ),
+        .target(
+            name: "TranscribeAppleAppSupport",
+            dependencies: ["RealtimeTranscriptionCore"]
         ),
         .executableTarget(
             name: "transcribe-cli",
@@ -32,7 +44,11 @@ let package = Package(
         ),
         .executableTarget(
             name: "transcribe-macos",
-            dependencies: ["RealtimeTranscriptionCore"]
+            dependencies: ["TranscribeAppleAppSupport"]
+        ),
+        .executableTarget(
+            name: "transcribe-ios",
+            dependencies: ["TranscribeAppleAppSupport"]
         ),
         .testTarget(
             name: "RealtimeTranscriptionCoreTests",

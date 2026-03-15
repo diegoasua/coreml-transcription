@@ -174,6 +174,54 @@ PARAKEET_COREML_DECODER_SUFFIX=odmbp-approx-stateful-v2 \
 bash scripts/run_transcribe_macos_release.sh
 ```
 
+### 7d) Minimal iPhone app (SwiftUI)
+
+There are two iOS entry points:
+
+- `transcribe-ios` in the Swift package for code-level validation.
+- `Apps/TranscribeIOSApp/TranscribeIOSApp.xcodeproj` for an installable iPhone app target.
+
+The Xcode project is checked in. No Ruby or project-generation step is required.
+
+For the native iPhone app, stage an importable model folder:
+
+```bash
+bash scripts/stage_transcribe_ios_models.sh
+```
+
+This stages the active live runtime bundle into `artifacts/ios-model-import/parakeet-tdt-0.6b-v2`. By default it copies only:
+
+- `encoder-model-odmbp-approx.mlpackage`
+- `decoder_joint-model-odmbp-approx-stateful-v2.mlpackage`
+- `vocab.txt`
+
+Override with `PARAKEET_COREML_MODEL_SUFFIX`, `PARAKEET_COREML_DECODER_SUFFIX`, or `PARAKEET_IOS_IMPORT_DIR` if needed.
+
+Then import the staged folder from the Files picker inside the native iPhone app with the `Import…` button.
+
+The native Xcode iPhone target should currently use `Import…` instead of bundling raw `.mlpackage` files, because Xcode 26 device signing is unreliable for that layout in this repo.
+
+To run on device:
+
+1. Open `Apps/TranscribeIOSApp/TranscribeIOSApp.xcodeproj` in Xcode.
+2. Select the `TranscribeIOSApp` scheme and your iPhone.
+3. If the phone does not appear, unlock it, keep it on the same Wi-Fi as the Mac, or connect it once over USB so Xcode can pair with it.
+4. The app already includes `NSMicrophoneUsageDescription` via project build settings.
+
+For command-line builds, this works once the device is available:
+
+```bash
+xcodebuild -project Apps/TranscribeIOSApp/TranscribeIOSApp.xcodeproj \
+  -scheme TranscribeIOSApp \
+  -destination 'id=<YOUR_DEVICE_ID>' \
+  build
+```
+
+The iOS app looks for models in this order:
+- `PARAKEET_COREML_MODEL_DIR`, if set
+- imported app Documents folder `parakeet-tdt-0.6b-v2`
+- bundled app resources `parakeet-tdt-0.6b-v2` if you explicitly add them yourself
+
 To specialize rewrite-prefix stride for one device using repeated realtime-bench runs, exact confirmed-transcript matching, and `ingest->ready` latency as the ranking target while preserving headroom when latency differences are negligible:
 
 ```bash
